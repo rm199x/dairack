@@ -5,6 +5,7 @@ import argparse
 import base64
 import difflib
 import functools
+import hashlib
 import html
 import json
 import math
@@ -87,7 +88,7 @@ from .permissions import (
 from .permissions import (
     is_read_only_tool_call as _is_read_only_tool_call,
 )
-from .providers.ollama import OllamaProvider
+from .providers.ollama import OllamaError, OllamaProvider
 from .tool_protocol import TOOL_REGISTRY, decode_text_tool_call, strip_tool_protocol
 
 # Compatibility exports for the Textual layer and existing integrations.
@@ -1927,6 +1928,9 @@ def _merge_semantic_assessment(
         if key in {"code", "agent", "research"}:
             grounded = max(existing, referenced_value)
             promotion_margin = 0.24 if grounded >= 0.34 else 0.20
+            # A confident semantic read may promote further than the keyword layer alone allows,
+            # so paraphrased or non-English requests are not capped by English keyword hits.
+            promotion_margin += max(0.0, confidence - 0.60) * 0.55
             semantic_value = min(semantic_value, max(0.18, grounded + promotion_margin))
         if control.get("active") and key in {"agent", "research"}:
             authority_value = float(control_authority_signals.get(key) or 0)
@@ -2254,13 +2258,18 @@ def select_orchestrator_route(
         )
     semantic_assessment = analysis.get("semantic_assessment")
     if isinstance(semantic_assessment, dict) and policy != "efficient":
-        semantic_plan_supported = complexity >= (0.62 if policy == "adaptive" else 0.48) and (
-            signals["agent"] >= 0.42 or signals["reasoning"] >= 0.48
+        # Confident semantic assessments lower — never remove — the deterministic support floors,
+        # so requests the keyword layer cannot see are still eligible for planning and review.
+        semantic_confidence = max(0.0, min(1.0, float(semantic_assessment.get("confidence") or 0)))
+        floor_relax = 0.16 if semantic_confidence >= 0.72 else 0.08 if semantic_confidence >= 0.55 else 0.0
+        signal_relax = floor_relax / 2
+        semantic_plan_supported = complexity >= ((0.62 if policy == "adaptive" else 0.48) - floor_relax) and (
+            signals["agent"] >= 0.42 - signal_relax or signals["reasoning"] >= 0.48 - signal_relax
         )
-        semantic_review_supported = complexity >= (0.64 if policy == "adaptive" else 0.46) and (
-            signals["code"] >= 0.40
-            or signals["reasoning"] >= 0.48
-            or signals["risk"] >= 0.34
+        semantic_review_supported = complexity >= ((0.64 if policy == "adaptive" else 0.46) - floor_relax) and (
+            signals["code"] >= 0.40 - signal_relax
+            or signals["reasoning"] >= 0.48 - signal_relax
+            or signals["risk"] >= 0.34 - signal_relax
             or signals["vision"] >= 0.50
         )
         if (
@@ -2886,14 +2895,22 @@ def orchestrator_plan(
         if message.get("role") == "system":
             continue
         recent.append(f"{str(message.get('role')).upper()}: {truncate(str(message.get('content') or ''), 1800)}")
+    grounding = retrieved_project_context(cwd, task, config, cwd)
+    grounding_block = (
+        f"Indexed project context (may be stale; verify with actions):\n{truncate(grounding, 4200)}\n\n"
+        if grounding
+        else ""
+    )
     prompt = (
         f"Working directory: {cwd}\n"
         f"Task type: {route.get('task_kind')}\n"
         f"User task:\n{task}\n\n"
         f"Recent relevant context:\n{truncate(chr(10).join(recent), 7000)}\n\n"
+        f"{grounding_block}"
         "Produce a compact execution brief for another compute model. Identify the likely intent, constraints, "
-        "verification steps, and failure risks. For code or system work, specify what should be inspected before "
-        "editing. Do not answer the user, request tools, invent file contents, or exceed 220 words."
+        "verification steps, and failure risks. For code or system work, name the specific files or symbols that "
+        "should be inspected before editing, using the indexed context when it is relevant. Do not answer the "
+        "user, request tools, invent file contents, or exceed 220 words."
     )
     planning_messages = [
         {
@@ -2934,7 +2951,8 @@ def orchestrator_review(
         f"Recent tool evidence:\n{truncate(chr(10).join(recent_results), 5000) or '(none)'}\n\n"
         "Check correctness, completeness, unsupported claims, task compliance, and whether reported actions are "
         "actually supported by tool evidence. Reply exactly with VERDICT: PASS when no material correction is "
-        "needed. Otherwise reply with VERDICT: REVISE followed by FEEDBACK: and concise, actionable corrections."
+        "needed. Otherwise reply with VERDICT: REVISE followed by FEEDBACK: and concise, actionable corrections, "
+        "each grounded in the task or the tool evidence shown above. Do not request stylistic rewrites."
     )
     review_messages = [
         {"role": "system", "content": "You are the independent quality gate in a multi-model coordinator."},
@@ -2954,7 +2972,11 @@ def orchestrator_review(
     elif verdict == "revise":
         feedback = truncate(re.sub(r"^.*?VERDICT\s*:\s*REVISE", "", raw, flags=re.IGNORECASE | re.DOTALL).strip(), 2400)
     if verdict == "revise" and not feedback:
-        verdict = "pass"
+        return {
+            "verdict": "pass",
+            "feedback": "",
+            "note": "reviewer requested a revision without usable feedback; verdict was not applied",
+        }
     return {"verdict": verdict, "feedback": feedback}
 
 
@@ -4192,8 +4214,10 @@ class ReadableHTMLParser(HTMLParser):
         self.text_parts: list[str] = []
         self.capture_title = False
 
+    SKIP_TAGS = frozenset({"script", "style", "noscript", "svg", "canvas", "nav", "aside", "form", "button", "footer"})
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"script", "style", "noscript", "svg", "canvas"}:
+        if tag in self.SKIP_TAGS:
             self.skip_depth += 1
             return
         if self.skip_depth:
@@ -4206,7 +4230,6 @@ class ReadableHTMLParser(HTMLParser):
             "section",
             "article",
             "header",
-            "footer",
             "br",
             "li",
             "tr",
@@ -4220,7 +4243,7 @@ class ReadableHTMLParser(HTMLParser):
             self.text_parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style", "noscript", "svg", "canvas"} and self.skip_depth:
+        if tag in self.SKIP_TAGS and self.skip_depth:
             self.skip_depth -= 1
             return
         if tag == "title":
@@ -4293,6 +4316,15 @@ def internet_search(
     display_query = sanitize_terminal_text(query)
     display_url = sanitize_terminal_text(final_url)
     if not results:
+        body_text = raw.decode("utf-8", errors="replace").lower()
+        if "no result" not in body_text:
+            # The backend answered with a page we could not parse: a rate limit, challenge
+            # page, or changed markup — materially different from a genuine empty result set.
+            return 1, (
+                f"search backend unavailable: the response for {display_query} contained no parseable "
+                "results. The backend may be rate-limiting or its format may have changed; retry "
+                "later or use web_open on a known URL."
+            )
         return 1, f"no web results for: {display_query}\nsource: {display_url}"
     lines = [
         f"Internet search: {display_query}",
@@ -4689,6 +4721,82 @@ def truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
 
 
+def truncate_middle(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
+    """Bound long output while keeping its beginning and end, where verdict lines usually live."""
+    if len(text) <= limit:
+        return text
+    head = max(1, int(limit * 0.6))
+    tail = max(1, limit - head)
+    omitted = len(text) - head - tail
+    return (
+        text[:head] + f"\n...[{omitted} chars omitted from the middle; beginning and end retained]...\n" + text[-tail:]
+    )
+
+
+REPEATABLE_READ_TOOLS = frozenset(
+    {"read_file", "list_dir", "find_paths", "hardware_status", "search_project", "web_search", "web_open"}
+)
+STATE_PRESERVING_TOOLS = REPEATABLE_READ_TOOLS | {"consult_specialist", "analyze_image", "index_project"}
+
+
+def tool_call_signature(call: dict[str, str]) -> str:
+    payload = {key: value for key, value in call.items() if key not in {"name", "reason", "_protocol"}}
+    return str(call.get("name") or "") + "\x00" + json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+class ActionLoopGuard:
+    """Detect no-progress repetition of identical read actions within one task turn."""
+
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+        self._digests: dict[str, str] = {}
+        self.repeat_stops = 0
+
+    @property
+    def force_synthesis(self) -> bool:
+        return self.repeat_stops >= 2
+
+    def refusal(self, call: dict[str, str]) -> str:
+        """Return a refusal reason when this exact read already ran twice with no state change since."""
+        name = str(call.get("name") or "")
+        if name not in REPEATABLE_READ_TOOLS:
+            return ""
+        if self._counts.get(tool_call_signature(call), 0) < 2:
+            return ""
+        self.repeat_stops += 1
+        return (
+            "because this exact action already ran twice in this task with identical parameters and no "
+            "state change since; its result is unchanged and shown above. Use that result or take a "
+            "different action."
+        )
+
+    def record(self, call: dict[str, str], result: str) -> str:
+        """Record an executed action; return a note when a repeated read returned identical output."""
+        name = str(call.get("name") or "")
+        if name not in STATE_PRESERVING_TOOLS:
+            self._counts.clear()
+            self._digests.clear()
+            return ""
+        if name not in REPEATABLE_READ_TOOLS:
+            return ""
+        signature = tool_call_signature(call)
+        self._counts[signature] = self._counts.get(signature, 0) + 1
+        digest = hashlib.sha256(result.encode("utf-8", "replace")).hexdigest()
+        note = ""
+        if self._counts[signature] >= 2 and self._digests.get(signature) == digest:
+            note = "\n[unchanged from the previous run of this exact action]"
+        self._digests[signature] = digest
+        return note
+
+
+def transient_stream_error(exc: BaseException) -> bool:
+    """Recognize connection hiccups worth one silent in-turn retry, as opposed to real request errors."""
+    if isinstance(exc, OllamaError):
+        text = str(exc).lower()
+        return any(marker in text for marker in ("stalled", "disconnect", "could not reach", "malformed stream"))
+    return isinstance(exc, (TimeoutError, ConnectionError))
+
+
 def strip_tool_markup(text: str) -> str:
     return strip_tool_protocol(text)
 
@@ -4712,10 +4820,9 @@ def response_incomplete_reason(text: str, stats: dict[str, Any] | None = None) -
     fence_markers = re.findall(r"(?m)^\s*(?:```|~~~)", visible)
     if len(fence_markers) % 2:
         return "response ended with an unclosed Markdown code fence"
+    # Trailing commas, semicolons, and colons are common in legitimate complete answers
+    # ("Here are the steps:"), so only unambiguous structural danglers force a retry.
     dangling = {
-        ",": "response ended after a comma",
-        ";": "response ended after a semicolon",
-        ":": "response ended after an unfinished introduction",
         "\\": "response ended after an escape character",
         "(": "response ended after an opening parenthesis",
         "[": "response ended after an opening bracket",
@@ -5919,14 +6026,19 @@ def request_context_messages(
     chat: dict[str, Any],
     config: dict[str, Any],
     cwd: Path,
+    include_retrieval: bool = True,
 ) -> list[dict[str, str]]:
     active = active_context_messages(messages, chat.get("summary", ""), config)
     project_root = project_scope_for_chat(chat, cwd)
-    retrieved = retrieved_project_context(
-        cwd,
-        latest_user_prompt(messages),
-        config,
-        project_root,
+    retrieved = (
+        retrieved_project_context(
+            cwd,
+            latest_user_prompt(messages),
+            config,
+            project_root,
+        )
+        if include_retrieval
+        else ""
     )
     context_parts: list[str] = []
     if project_root != cwd.resolve():
@@ -5939,6 +6051,16 @@ def request_context_messages(
             "Retrieved local project memory. Treat these snippets as potentially relevant context; "
             "open files or search again when exact current contents matter.\n\n"
             f"{retrieved}"
+        )
+    elif (
+        include_retrieval
+        and config_bool(config, "project_retrieval", True)
+        and (project_root / ".git").exists()
+        and indexed_project_for_cwd(cwd) is None
+    ):
+        context_parts.append(
+            "Project retrieval is inactive because no local index exists for this project yet. File contents "
+            "must be read with actions; the user can enable automatic retrieval with /index."
         )
     if not context_parts:
         return active
@@ -6671,7 +6793,9 @@ class DairackTui:
         self._active_route: dict[str, Any] | None = None
         self._route_config: dict[str, Any] | None = None
         self._route_plan = ""
+        self._route_review_rounds = 0
         self._agent_steps_used = 0
+        self._loop_guard = ActionLoopGuard()
 
         HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
@@ -7492,7 +7616,9 @@ class DairackTui:
         self._active_route = None
         self._route_config = None
         self._route_plan = ""
+        self._route_review_rounds = 0
         self._agent_steps_used = 0
+        self._loop_guard = ActionLoopGuard()
         if str(self.config.get("model_mode") or "direct") == "orchestrator":
             label = f"routing / {self.config.get('orchestrator_policy', 'adaptive')}"
         self.interrupt_requested = False
@@ -7579,6 +7705,7 @@ class DairackTui:
             completion_repair_attempted = False
             completion_feedback = ""
             action_feedback = ""
+            revision_feedback = ""
             synthesis_attempts = 0
             while True:
                 if self.cancel_event.is_set():
@@ -7586,7 +7713,7 @@ class DairackTui:
                     self.save_current_chat()
                     return
                 action_limit = agent_action_limit(self.config)
-                finalizing = self._agent_steps_used >= action_limit
+                finalizing = self._agent_steps_used >= action_limit or self._loop_guard.force_synthesis
                 if finalizing:
                     synthesis_attempts += 1
                     if synthesis_attempts > 2:
@@ -7623,6 +7750,12 @@ class DairackTui:
                 if action_feedback:
                     directives.append(action_feedback)
                     action_feedback = ""
+                if revision_feedback:
+                    directives.append(
+                        "Produce a complete corrected replacement answer. Do not discuss internal review or retry "
+                        "state, and do not call the answer a revision. Required corrections:\n" + revision_feedback
+                    )
+                    revision_feedback = ""
                 if finalizing:
                     directives.append(
                         agent_synthesis_directive(
@@ -7639,30 +7772,58 @@ class DairackTui:
                     if finalizing
                     else native_tools_for(self.provider, executor, bool(self.config.get("agent")), route)
                 )
-                request_messages, native_tools = fit_agent_request_context_messages(
-                    request_messages,
-                    runtime,
-                    native_tools,
-                )
+                try:
+                    request_messages, native_tools = fit_agent_request_context_messages(
+                        request_messages,
+                        runtime,
+                        native_tools,
+                    )
+                except RequestContextError:
+                    reduced = request_context_messages(
+                        self.messages,
+                        self.chat,
+                        runtime,
+                        self.cwd,
+                        include_retrieval=False,
+                    )
+                    request_messages, native_tools = fit_agent_request_context_messages(
+                        canonicalize_messages(reduced, directives),
+                        runtime,
+                        native_tools,
+                    )
+                    route["context_degraded"] = "project retrieval omitted to fit the context window"
                 if finalizing:
                     self.set_busy(True, f"synthesizing / {executor}")
-                for chunk in self.provider.chat_stream(
-                    executor,
-                    request_messages,
-                    think=bool(runtime.get("think")),
-                    num_ctx=int(runtime.get("num_ctx") or 4096),
-                    cancel_event=self.cancel_event,
-                    extra_options=ollama_options(runtime),
-                    tools=native_tools or None,
-                    tool_call_sink=native_calls.append,
-                ):
-                    if self.cancel_event.is_set():
+                stream_retry_used = False
+                while True:
+                    try:
+                        for chunk in self.provider.chat_stream(
+                            executor,
+                            request_messages,
+                            think=bool(runtime.get("think")),
+                            num_ctx=int(runtime.get("num_ctx") or 4096),
+                            cancel_event=self.cancel_event,
+                            extra_options=ollama_options(runtime),
+                            tools=native_tools or None,
+                            tool_call_sink=native_calls.append,
+                        ):
+                            if self.cancel_event.is_set():
+                                break
+                            if first_chunk:
+                                self.set_busy(True, "synthesizing response" if finalizing else "streaming response")
+                                first_chunk = False
+                            assistant_text += chunk
+                            self.append_assistant_chunk(chunk)
                         break
-                    if first_chunk:
-                        self.set_busy(True, "synthesizing response" if finalizing else "streaming response")
-                        first_chunk = False
-                    assistant_text += chunk
-                    self.append_assistant_chunk(chunk)
+                    except Exception as exc:
+                        if stream_retry_used or self.cancel_event.is_set() or not transient_stream_error(exc):
+                            raise
+                        stream_retry_used = True
+                        assistant_text = ""
+                        native_calls.clear()
+                        first_chunk = True
+                        self.replace_last_assistant_text("")
+                        self.set_busy(True, f"reconnecting / {executor}")
                 call, parse_error = resolve_tool_request(assistant_text, native_calls)
                 visible_text = strip_tool_markup(assistant_text)
                 internal_call = bool(call and is_internal_coordinator_call(normalize_coordinator_tool_call(call)))
@@ -7834,8 +7995,23 @@ class DairackTui:
                         self.set_busy(True, "correcting action request")
                         self.save_current_chat()
                         continue
-                    self.replace_last_assistant_text("Action request blocked")
-                    self.append_system(f"No action was run.\n{parse_error}")
+                    route["action_parse_error"] = parse_error
+                    self.replace_last_assistant_text(
+                        "I could not format that action correctly, so nothing was run. Rephrasing the request may help."
+                    )
+                    self.append_system(
+                        "The requested action stayed malformed after a correction attempt; no action was run. "
+                        "Details are available with /route."
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "No action was run because the action request stayed malformed. Do not describe "
+                                "results of actions that did not run."
+                            ),
+                        }
+                    )
                     observe_route_outcome(
                         self.config,
                         route,
@@ -7846,6 +8022,55 @@ class DairackTui:
                     self.save_current_chat()
                     return
                 if not call:
+                    reviewer = str(route.get("reviewer") or "")
+                    if reviewer and self._route_review_rounds < 2 and assistant_text.strip():
+                        self._route_review_rounds += 1
+                        review_round = self._route_review_rounds
+                        self.set_busy(True, f"reviewing / {reviewer}")
+                        try:
+                            review = orchestrator_review(
+                                self.provider,
+                                route,
+                                self.messages,
+                                assistant_text,
+                                self.config,
+                                self.cancel_event,
+                            )
+                        except Exception as exc:
+                            review = {"verdict": "error", "feedback": "", "error": str(exc)}
+                        review["round"] = review_round
+                        route["review"] = review
+                        if review.get("verdict") in {"pass", "revise"}:
+                            observe_route_outcome(
+                                self.config,
+                                route,
+                                1.0 if review["verdict"] == "pass" else -1.0,
+                                weight=0.75,
+                                source="independent-review",
+                            )
+                        self.chat["last_route"] = route
+                        if self.cancel_event.is_set():
+                            self.append_system("Quality review interrupted; retained the completed response.")
+                            self.save_current_chat()
+                            return
+                        if review.get("verdict") == "revise" and review.get("feedback"):
+                            if review_round >= 2:
+                                review["unresolved"] = True
+                                self.append_system(
+                                    "Independent review still requests changes after one revision; kept the "
+                                    "revised answer. Details are available with /route."
+                                )
+                                self.save_current_chat()
+                                return
+                            if self.messages and self.messages[-1].get("role") == "assistant":
+                                self.messages.pop()
+                            revision_feedback = str(review["feedback"])
+                            repairing_action = True
+                            self.append_system("Independent review requested corrections; revising.")
+                            self.set_busy(True, f"revising / {executor}")
+                            self.save_current_chat()
+                            continue
+                        self.save_current_chat()
                     return
                 if not self.config.get("agent"):
                     self.append_system(
@@ -7902,6 +8127,17 @@ class DairackTui:
 
     def run_tool_call(self, call: dict[str, str], approved_by: str) -> None:
         call = normalize_coordinator_tool_call(call)
+        repeat_refusal = self._loop_guard.refusal(call)
+        if repeat_refusal:
+            self.messages.append(denied_tool_history_message(call, repeat_refusal))
+            display = tool_denied_display(call, "identical action already ran; result unchanged", "NOT RUN")
+            append_action = getattr(self, "append_action", None)
+            if callable(append_action):
+                append_action(display)
+            else:
+                self.append_system(display)
+            self.save_current_chat()
+            return
         if not self.reserve_agent_action():
             self.messages.append(denied_tool_history_message(call, "because the task action budget is exhausted"))
             display = tool_denied_display(
@@ -7963,7 +8199,8 @@ class DairackTui:
                     remember_indexed_project(self.chat, self.cwd, call, code, project_root)
             except Exception as exc:
                 code, output = 1, f"action failed: {exc}"
-            result = truncate(output) if output else "(no output)"
+            result = truncate_middle(output) if output else "(no output)"
+            result += self._loop_guard.record(call, result)
             elapsed = time.monotonic() - started
             if call.get("name") == "consult_specialist":
                 # Delegation is internal evidence. Live model/phase feedback belongs in
@@ -9272,7 +9509,6 @@ def chat_turn(
         finalizing: bool = False,
         synthesis_retry: bool = False,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        selected = request_context_messages(messages, chat, runtime, cwd)
         directives: list[str] = []
         directive = coordinator_executor_directive(route, config)
         if directive:
@@ -9291,8 +9527,19 @@ def chat_turn(
                     retry=synthesis_retry,
                 )
             )
-        request = canonicalize_messages(selected, directives)
-        return fit_agent_request_context_messages(request, runtime, [] if finalizing else native_tools)
+        request_tools = [] if finalizing else native_tools
+        selected = request_context_messages(messages, chat, runtime, cwd)
+        try:
+            return fit_agent_request_context_messages(
+                canonicalize_messages(selected, directives), runtime, request_tools
+            )
+        except RequestContextError:
+            reduced = request_context_messages(messages, chat, runtime, cwd, include_retrieval=False)
+            fitted = fit_agent_request_context_messages(
+                canonicalize_messages(reduced, directives), runtime, request_tools
+            )
+            route["context_degraded"] = "project retrieval omitted to fit the context window"
+            return fitted
 
     request_messages, _request_tools = routed_messages()
     if not config.get("agent"):
@@ -9310,7 +9557,7 @@ def chat_turn(
         messages.append({"role": "assistant", "content": response})
         return
 
-    reviewed = False
+    review_rounds = 0
     revision_feedback = ""
     completion_repair_attempted = False
     action_contract_repair_attempted = False
@@ -9318,8 +9565,9 @@ def chat_turn(
     action_limit = agent_action_limit(config)
     action_steps = 0
     synthesis_attempts = 0
+    loop_guard = ActionLoopGuard()
     while True:
-        finalizing = action_steps >= action_limit
+        finalizing = action_steps >= action_limit or loop_guard.force_synthesis
         if finalizing:
             synthesis_attempts += 1
             if synthesis_attempts > 2:
@@ -9445,12 +9693,23 @@ def chat_turn(
         if parse_error:
             messages.append(assistant_message)
             observe_route_outcome(config, route, -1.0, weight=1.0, source="tool-protocol")
-            print(f"Action request blocked: {parse_error}. No action was run.")
+            route["action_parse_error"] = parse_error
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "No action was run because the action request stayed malformed. Do not describe "
+                        "results of actions that did not run."
+                    ),
+                }
+            )
+            print("The requested action stayed malformed after a correction attempt; no action was run.")
             return
         if not call:
-            if route.get("reviewer") and not reviewed:
-                reviewed = True
+            if route.get("reviewer") and review_rounds < 2:
+                review_rounds += 1
                 review = orchestrator_review(provider, route, messages, response, config)
+                review["round"] = review_rounds
                 route["review"] = review
                 if review.get("verdict") in {"pass", "revise"}:
                     observe_route_outcome(
@@ -9461,8 +9720,13 @@ def chat_turn(
                         source="independent-review",
                     )
                 if review.get("verdict") == "revise" and review.get("feedback"):
-                    revision_feedback = str(review["feedback"])
-                    continue
+                    if review_rounds >= 2:
+                        review["unresolved"] = True
+                        print("[review still requests changes; kept the revised answer]")
+                    else:
+                        revision_feedback = str(review["feedback"])
+                        print("[review requested corrections; revising]")
+                        continue
             print(response)
             messages.append(assistant_message)
             return
@@ -9486,6 +9750,12 @@ def chat_turn(
             messages.append(denied_tool_history_message(call, "by user"))
             print("denied")
             return
+
+        repeat_refusal = loop_guard.refusal(call)
+        if repeat_refusal:
+            messages.append(denied_tool_history_message(call, repeat_refusal))
+            print(f"skipped repeat action: {tool_summary(call)}")
+            continue
 
         action_steps += 1
         route["tool_steps"] = action_steps
@@ -9513,7 +9783,8 @@ def chat_turn(
                 enforce_project_scope=mode == "read-auto" and auto_approved,
             )
             remember_indexed_project(chat, cwd, call, code, project_root)
-        result = truncate(output) if output else "(no output)"
+        result = truncate_middle(output) if output else "(no output)"
+        result += loop_guard.record(call, result)
         print(f"\n{tool_summary(call)}")
         print(result)
         print(f"[exit {code}]")

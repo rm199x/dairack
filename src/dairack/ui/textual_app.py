@@ -1546,8 +1546,9 @@ class DairackTextualBase(App[None]):
         self._route_action_feedback = ""
         self._route_original_answer = ""
         self._route_planned = False
-        self._route_reviewed = False
+        self._route_review_rounds = 0
         self._agent_steps_used = 0
+        self._loop_guard = self.core.ActionLoopGuard()
         self._history = [
             str(message.get("content") or "")
             for message in self.messages
@@ -4407,7 +4408,7 @@ class DairackTextualBase(App[None]):
         self._route_feedback = ""
         self._route_action_feedback = ""
         self._route_planned = False
-        self._route_reviewed = False
+        self._route_review_rounds = 0
         self._route_original_answer = ""
         self._executor_stats = {}
         if self._orchestrator_enabled():
@@ -4471,12 +4472,14 @@ class DairackTextualBase(App[None]):
         runtime: dict[str, Any],
         revision_feedback: str = "",
         action_feedback: str = "",
+        include_retrieval: bool = True,
     ) -> list[dict[str, str]]:
         request_messages = self.core.request_context_messages(
             self.messages,
             self.chat,
             runtime,
             self.cwd,
+            include_retrieval=include_retrieval,
         )
         route = self._active_route or {}
         directives: list[str] = []
@@ -4517,7 +4520,7 @@ class DairackTextualBase(App[None]):
                     self.save_current_chat()
                     return
                 action_limit = self.core.agent_action_limit(self.config)
-                finalizing = self._agent_steps_used >= action_limit
+                finalizing = self._agent_steps_used >= action_limit or self._loop_guard.force_synthesis
                 if finalizing:
                     synthesis_attempts += 1
                     if synthesis_attempts > 2:
@@ -4540,22 +4543,35 @@ class DairackTextualBase(App[None]):
                     self.replace_last_assistant_text("")
                 else:
                     self.append_assistant_start()
-                request_messages = self._orchestrated_request_messages(
-                    runtime,
-                    revision_feedback,
-                    action_feedback,
-                )
-                if finalizing:
-                    request_messages = self.core.canonicalize_messages(
-                        request_messages,
-                        [
-                            self.core.agent_synthesis_directive(
-                                self._agent_steps_used,
-                                action_limit,
-                                retry=synthesis_attempts > 1,
-                            )
-                        ],
+
+                def build_request(
+                    include_retrieval: bool = True,
+                    revision_feedback: str = revision_feedback,
+                    action_feedback: str = action_feedback,
+                    finalizing: bool = finalizing,
+                    action_limit: int = action_limit,
+                    synthesis_attempts: int = synthesis_attempts,
+                ) -> list[dict[str, str]]:
+                    built = self._orchestrated_request_messages(
+                        runtime,
+                        revision_feedback,
+                        action_feedback,
+                        include_retrieval,
                     )
+                    if finalizing:
+                        built = self.core.canonicalize_messages(
+                            built,
+                            [
+                                self.core.agent_synthesis_directive(
+                                    self._agent_steps_used,
+                                    action_limit,
+                                    retry=synthesis_attempts > 1,
+                                )
+                            ],
+                        )
+                    return built
+
+                request_messages = build_request()
                 executor = str(route["executor"])
                 native_calls: list[dict[str, Any]] = []
                 native_tools = (
@@ -4568,35 +4584,56 @@ class DairackTextualBase(App[None]):
                         route,
                     )
                 )
-                request_messages, native_tools = self.core.fit_agent_request_context_messages(
-                    request_messages,
-                    runtime,
-                    native_tools,
-                )
+                try:
+                    request_messages, native_tools = self.core.fit_agent_request_context_messages(
+                        request_messages,
+                        runtime,
+                        native_tools,
+                    )
+                except self.core.RequestContextError:
+                    request_messages, native_tools = self.core.fit_agent_request_context_messages(
+                        build_request(include_retrieval=False),
+                        runtime,
+                        native_tools,
+                    )
+                    route["context_degraded"] = "project retrieval omitted to fit the context window"
                 self.set_busy(
                     True,
                     f"synthesizing / {executor}" if finalizing else self._request_start_label(executor),
                 )
                 execution_started = time.monotonic()
-                for chunk in self.provider.chat_stream(
-                    executor,
-                    request_messages,
-                    think=bool(runtime.get("think")),
-                    num_ctx=int(runtime.get("num_ctx") or 4096),
-                    cancel_event=self.cancel_event,
-                    extra_options=self.core.ollama_options(runtime),
-                    tools=native_tools or None,
-                    tool_call_sink=native_calls.append,
-                ):
-                    if self.cancel_event.is_set():
+                stream_retry_used = False
+                while True:
+                    try:
+                        for chunk in self.provider.chat_stream(
+                            executor,
+                            request_messages,
+                            think=bool(runtime.get("think")),
+                            num_ctx=int(runtime.get("num_ctx") or 4096),
+                            cancel_event=self.cancel_event,
+                            extra_options=self.core.ollama_options(runtime),
+                            tools=native_tools or None,
+                            tool_call_sink=native_calls.append,
+                        ):
+                            if self.cancel_event.is_set():
+                                break
+                            if first_chunk:
+                                phase = "synthesizing" if finalizing else "revising" if revising else "executing"
+                                self.set_busy(True, f"{phase} / {executor}")
+                                first_chunk = False
+                            assistant_text += chunk
+                            self._stream_chars = len(assistant_text)
+                            self.replace_last_assistant_text(self._visible_stream_text(assistant_text))
                         break
-                    if first_chunk:
-                        phase = "synthesizing" if finalizing else "revising" if revising else "executing"
-                        self.set_busy(True, f"{phase} / {executor}")
-                        first_chunk = False
-                    assistant_text += chunk
-                    self._stream_chars = len(assistant_text)
-                    self.replace_last_assistant_text(self._visible_stream_text(assistant_text))
+                    except Exception as exc:
+                        if stream_retry_used or self.cancel_event.is_set() or not self.core.transient_stream_error(exc):
+                            raise
+                        stream_retry_used = True
+                        assistant_text = ""
+                        native_calls.clear()
+                        first_chunk = True
+                        self.replace_last_assistant_text("")
+                        self.set_busy(True, f"reconnecting / {executor}")
                 timings = route.setdefault("timings", {})
                 timings["execute"] = round(float(timings.get("execute") or 0) + time.monotonic() - execution_started, 3)
                 route["passes"] = int(route.get("passes") or 0) + 1
@@ -4735,8 +4772,23 @@ class DairackTextualBase(App[None]):
                         self.set_busy(True, "correcting action request")
                         self.save_current_chat()
                         continue
-                    self.replace_last_assistant_text("Action request blocked")
-                    self.append_system(f"No action was run.\n{parse_error}")
+                    route["action_parse_error"] = parse_error
+                    self.replace_last_assistant_text(
+                        "I could not format that action correctly, so nothing was run. Rephrasing the request may help."
+                    )
+                    self.append_system(
+                        "The requested action stayed malformed after a correction attempt; no action was run. "
+                        "Details are available with /route."
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "No action was run because the action request stayed malformed. Do not describe "
+                                "results of actions that did not run."
+                            ),
+                        }
+                    )
                     self.core.observe_route_outcome(
                         self.config,
                         route,
@@ -4748,9 +4800,11 @@ class DairackTextualBase(App[None]):
                     return
                 if not call:
                     reviewer = str(route.get("reviewer") or "")
-                    if reviewer and not self._route_reviewed and assistant_text.strip():
-                        self._route_reviewed = True
-                        self._route_original_answer = assistant_text
+                    if reviewer and self._route_review_rounds < 2 and assistant_text.strip():
+                        self._route_review_rounds += 1
+                        review_round = self._route_review_rounds
+                        if review_round == 1:
+                            self._route_original_answer = assistant_text
                         self.set_busy(True, f"reviewing / {reviewer}")
                         review_started = time.monotonic()
                         try:
@@ -4764,7 +4818,11 @@ class DairackTextualBase(App[None]):
                             )
                         except Exception as exc:
                             review = {"verdict": "error", "feedback": "", "error": str(exc)}
-                        route.setdefault("timings", {})["review"] = round(time.monotonic() - review_started, 3)
+                        timings = route.setdefault("timings", {})
+                        timings["review"] = round(
+                            float(timings.get("review") or 0) + time.monotonic() - review_started, 3
+                        )
+                        review["round"] = review_round
                         route["review"] = review
                         if review.get("verdict") in {"pass", "revise"}:
                             self.core.observe_route_outcome(
@@ -4780,11 +4838,24 @@ class DairackTextualBase(App[None]):
                             self.save_current_chat()
                             return
                         if review.get("verdict") == "revise" and review.get("feedback"):
+                            if review_round >= 2:
+                                review["unresolved"] = True
+                                self.append_system(
+                                    "Independent review still requests changes after one revision; "
+                                    "kept the revised answer. Details are available with /route."
+                                )
+                                self.save_current_chat()
+                                return
                             if self.messages and self.messages[-1].get("role") == "assistant":
                                 self.messages.pop()
                             self._route_feedback = str(review["feedback"])
+                            self.append_system("Independent review requested corrections; revising.")
                             self.set_busy(True, f"revising / {executor}")
                             continue
+                        if review_round >= 2 and review.get("verdict") == "pass":
+                            retry_record = route.get("review")
+                            if isinstance(retry_record, dict):
+                                retry_record["revision_confirmed"] = True
                         self.save_current_chat()
                     return
                 if not self.config.get("agent"):

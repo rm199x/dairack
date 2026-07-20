@@ -1696,9 +1696,14 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIn(
             "token limit", CORE.response_incomplete_reason("A complete-looking sentence.", {"done_reason": "length"})
         )
-        self.assertIn("comma", CORE.response_incomplete_reason("I was checking,"))
         self.assertIn("code fence", CORE.response_incomplete_reason("```python\nprint('unfinished')"))
+        self.assertIn("parenthesis", CORE.response_incomplete_reason("The relevant call is shown in ("))
         self.assertEqual(CORE.response_incomplete_reason("A concise complete response."), "")
+        # Ordinary trailing punctuation is a normal way for complete answers to end and
+        # must not force a silent full regeneration.
+        self.assertEqual(CORE.response_incomplete_reason("Here are the steps:"), "")
+        self.assertEqual(CORE.response_incomplete_reason("I was checking,"), "")
+        self.assertEqual(CORE.response_incomplete_reason("first; second;"), "")
 
     def test_compaction_rebuilds_grounded_memory_without_calling_a_model(self) -> None:
         class NoCompactionModel:
@@ -1781,6 +1786,48 @@ class CoordinatorRoutingTests(unittest.TestCase):
         summary = CORE.grounded_memory_summary(messages, len(messages), config, {"cwd": "/tmp"})
 
         self.assertIn("Action result [13]: read_file critical.py", summary)
+
+
+class LoopResilienceTests(unittest.TestCase):
+    def test_truncate_middle_retains_head_and_tail(self) -> None:
+        text = "start-" + "x" * 50000 + "-end"
+        bounded = CORE.truncate_middle(text, 2000)
+        self.assertLess(len(bounded), 2200)
+        self.assertTrue(bounded.startswith("start-"))
+        self.assertTrue(bounded.endswith("-end"))
+        self.assertIn("omitted from the middle", bounded)
+        self.assertEqual(CORE.truncate_middle("short", 100), "short")
+
+    def test_action_loop_guard_blocks_the_third_identical_read(self) -> None:
+        guard = CORE.ActionLoopGuard()
+        call = {"name": "read_file", "path": "src/app.py", "reason": ""}
+        self.assertEqual(guard.refusal(call), "")
+        self.assertEqual(guard.record(call, "content"), "")
+        self.assertEqual(guard.refusal(call), "")
+        self.assertIn("unchanged", guard.record(call, "content"))
+        self.assertIn("already ran twice", guard.refusal(call))
+        self.assertFalse(guard.force_synthesis)
+        self.assertTrue(guard.refusal(call))
+        self.assertTrue(guard.force_synthesis)
+
+    def test_action_loop_guard_resets_after_state_changing_actions(self) -> None:
+        guard = CORE.ActionLoopGuard()
+        read = {"name": "read_file", "path": "src/app.py", "reason": ""}
+        guard.record(read, "one")
+        guard.record(read, "one")
+        guard.record({"name": "shell", "command": "pytest", "reason": ""}, "output")
+        self.assertEqual(guard.refusal(read), "")
+        self.assertEqual(guard.record(read, "two"), "")
+        # Different parameters are always a fresh action.
+        other = {"name": "read_file", "path": "src/other.py", "reason": ""}
+        self.assertEqual(guard.refusal(other), "")
+
+    def test_transient_stream_errors_are_distinguished_from_request_errors(self) -> None:
+        self.assertTrue(CORE.transient_stream_error(CORE.OllamaError("Ollama stream stalled or disconnected")))
+        self.assertTrue(CORE.transient_stream_error(CORE.OllamaError("could not reach Ollama at host: refused")))
+        self.assertTrue(CORE.transient_stream_error(TimeoutError()))
+        self.assertFalse(CORE.transient_stream_error(CORE.OllamaError("Ollama returned HTTP 404: no such model")))
+        self.assertFalse(CORE.transient_stream_error(ValueError("unrelated")))
 
 
 class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
@@ -2068,7 +2115,10 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
         class SequencedProvider(FakeProvider):
             def __init__(self) -> None:
                 super().__init__(response="")
-                self.responses = ["I was checking,", "I was checking the project and found no blocking issue."]
+                self.responses = [
+                    "```python\nprint('unfinished')",
+                    "I was checking the project and found no blocking issue.",
+                ]
 
             def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
                 self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
@@ -2115,7 +2165,61 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(retry["recovered"])
                 transcript = app.render_transcript_text()
                 self.assertIn("found no blocking issue", transcript)
-                self.assertNotIn("I was checking,", transcript)
+                self.assertNotIn("unfinished", transcript)
+
+    async def test_transient_stream_error_is_retried_once_without_a_visible_failure(self) -> None:
+        class FlakyProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.attempts = 0
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.attempts += 1
+                self.last_stats = {"done_reason": "stop"}
+                if self.attempts == 1:
+                    yield "partial half-ans"
+                    raise CORE.OllamaError("Ollama stream stalled or disconnected")
+                yield "The full recovered answer."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config()
+            config.update(
+                {
+                    "model_mode": "direct",
+                    "model": "qwen3.5:9b",
+                    "auto_compact": False,
+                }
+            )
+            provider = FlakyProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(80, 26)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text("Summarize the project")
+                await pilot.press("enter")
+                for _ in range(200):
+                    await pilot.pause(0.025)
+                    if not app.busy and provider.attempts == 2:
+                        break
+
+                self.assertFalse(app.busy)
+                self.assertEqual(provider.attempts, 2)
+                assistant_messages = [message for message in app.messages if message.get("role") == "assistant"]
+                self.assertEqual(
+                    [message["content"] for message in assistant_messages],
+                    ["The full recovered answer."],
+                )
+                transcript = app.render_transcript_text()
+                self.assertIn("The full recovered answer.", transcript)
+                self.assertNotIn("half-ans", transcript)
+                self.assertNotIn("stalled", transcript)
 
     async def test_bare_tool_request_approval_executes_and_resumes(self) -> None:
         class SequencedProvider(FakeProvider):

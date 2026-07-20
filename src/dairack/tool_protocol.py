@@ -133,7 +133,7 @@ class ToolRegistry:
         arguments = payload.pop("arguments", None)
         if isinstance(arguments, str):
             try:
-                arguments = json.loads(arguments)
+                arguments = _loads_tool_json(arguments)
             except (ValueError, RecursionError) as exc:
                 return {}, f"action request arguments contain invalid JSON: {getattr(exc, 'msg', str(exc))}"
         if arguments is not None and not isinstance(arguments, Mapping):
@@ -350,6 +350,90 @@ TOOL_REGISTRY = ToolRegistry(
 TOOL_TAG_PATTERN = r"(?:tool|DAIRACK_TOOL|ASUSAI_TOOL|tool_call)"
 
 
+def _loads_tool_json(candidate: str) -> Any:
+    """Parse action JSON, tolerating the unescaped path backslashes models commonly emit on Windows."""
+    try:
+        return json.loads(candidate)
+    except RecursionError:
+        raise
+    except ValueError as exc:
+        repaired = re.sub(r'\\(?!["\\/])', r"\\\\", candidate)
+        if repaired != candidate:
+            try:
+                return json.loads(repaired)
+            except ValueError:
+                raise exc from None
+        raise
+
+
+def _call_style_arguments(raw: str) -> dict[str, str]:
+    arguments: dict[str, str] = {}
+    pattern = re.compile(
+        r"([A-Za-z_][\w-]*)\s*=\s*(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|[^,]*)",
+        re.DOTALL,
+    )
+    for match in pattern.finditer(raw):
+        value = match.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            quote = value[0]
+            value = value[1:-1].replace("\\" + quote, quote)
+        arguments[match.group(1).lower()] = html.unescape(value)
+    return arguments
+
+
+def _decode_call_style(
+    candidate: str,
+    registry: ToolRegistry,
+) -> tuple[dict[str, str] | None, str, bool]:
+    """Decode `tool(field=value, ...)` and `<tool(field=value, ...)>` near-miss action syntax."""
+    unwrapped = candidate
+    angle = re.fullmatch(r"<\s*(.+?)\s*/?\s*>", candidate, re.DOTALL)
+    if angle:
+        unwrapped = angle.group(1).strip()
+    paren = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*)\s*\((.*)\)\s*;?", unwrapped, re.DOTALL)
+    if paren:
+        raw_name = paren.group(1).lower()
+        if registry.canonical_name(raw_name) not in registry.known_names:
+            return None, "", False
+        inner = paren.group(2).strip()
+        if inner.startswith("{"):
+            try:
+                nested = _loads_tool_json(inner)
+            except (ValueError, RecursionError) as exc:
+                return None, f"action request contains invalid JSON: {getattr(exc, 'msg', str(exc))}", True
+            if not isinstance(nested, Mapping):
+                return None, "action request JSON must be an object", True
+            call, error = registry.validate({"name": raw_name, "arguments": dict(nested)})
+            return call, error, True
+        call, error = registry.validate({"name": raw_name, "arguments": _call_style_arguments(inner)})
+        return call, error, True
+    if not angle:
+        return None, "", False
+    tag_match = re.match(r"([A-Za-z_][A-Za-z0-9_-]*)\b(.*)", unwrapped, re.DOTALL)
+    if not tag_match:
+        return None, "", False
+    raw_name = tag_match.group(1).lower()
+    if registry.canonical_name(raw_name) not in registry.known_names:
+        return None, "", False
+    attributes = _tool_attributes(tag_match.group(2))
+    call, error = registry.validate({"name": raw_name, "arguments": attributes})
+    return call, error, True
+
+
+def _known_call_style_tail(text: str, registry: ToolRegistry) -> str:
+    """Return a trailing angle-wrapped near-miss action expression, if one ends the text."""
+    tail = re.search(r"<\s*[A-Za-z_][A-Za-z0-9_-]*[^<]*>\s*$", text, re.DOTALL)
+    if not tail:
+        return ""
+    candidate = tail.group(0).strip()
+    name_match = re.match(r"<\s*([A-Za-z_][A-Za-z0-9_-]*)", candidate)
+    if not name_match:
+        return ""
+    if registry.canonical_name(name_match.group(1).lower()) not in registry.known_names:
+        return ""
+    return candidate
+
+
 def _tool_attributes(raw: str) -> dict[str, str]:
     attrs: dict[str, str] = {}
     pattern = re.compile(
@@ -419,7 +503,7 @@ def _decode_shorthand(
 
     if candidate.startswith("{"):
         try:
-            data = json.loads(candidate)
+            data = _loads_tool_json(candidate)
         except (ValueError, RecursionError) as exc:
             looks_explicit = bool(re.search(r'"(?:name|tool|function)"\s*:', candidate))
             error = (
@@ -452,6 +536,10 @@ def _decode_shorthand(
         call, error = registry.validate({"name": raw_name})
         return call, error, True
 
+    call, error, recognized = _decode_call_style(candidate, registry)
+    if recognized:
+        return call, error, True
+
     call_match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*)\s*(\{.*)", candidate, re.DOTALL)
     if not call_match:
         if candidate.upper().startswith("[TOOL_CALLS]"):
@@ -480,14 +568,20 @@ def decode_text_tool_call(
     if envelope_error:
         return None, envelope_error, True
     if raw_attrs is None:
-        return _decode_shorthand(text, registry)
+        call, error, recognized = _decode_shorthand(text, registry)
+        if recognized:
+            return call, error, True
+        tail = _known_call_style_tail(text, registry)
+        if tail:
+            return _decode_call_style(tail, registry)
+        return None, "", False
 
     attrs = _tool_attributes(raw_attrs)
     if attrs.get("name"):
         data: dict[str, Any] = dict(attrs)
         if body.startswith("{"):
             try:
-                nested = json.loads(body)
+                nested = _loads_tool_json(body)
             except (ValueError, RecursionError) as exc:
                 return None, f"action request contains invalid JSON: {getattr(exc, 'msg', str(exc))}", True
             if not isinstance(nested, Mapping):
@@ -500,7 +594,7 @@ def decode_text_tool_call(
     if not body:
         return None, "action request has no payload", True
     try:
-        data = json.loads(body)
+        data = _loads_tool_json(body)
     except (ValueError, RecursionError) as exc:
         return None, f"action request contains invalid JSON: {getattr(exc, 'msg', str(exc))}", True
     if not isinstance(data, Mapping):
@@ -545,5 +639,36 @@ def strip_tool_protocol(text: str, registry: ToolRegistry = TOOL_REGISTRY) -> st
     _call, _error, recognized = _decode_shorthand(cleaned, registry)
     if recognized:
         return ""
+    cleaned = _strip_near_miss_markup(cleaned, registry)
     marker = re.search(rf"<{TOOL_TAG_PATTERN}\b", cleaned, re.IGNORECASE)
     return cleaned[: marker.start()].rstrip() if marker else cleaned
+
+
+def _strip_near_miss_markup(text: str, registry: ToolRegistry) -> str:
+    """Excise angle-wrapped action expressions for known tools that missed the protocol grammar."""
+    if "<" not in text:
+        return text
+    names = "|".join(sorted(re.escape(name) for name in registry.known_names))
+    pattern = re.compile(rf"<\s*(?:{names})\b", re.IGNORECASE)
+    parts: list[str] = []
+    cursor = 0
+    while match := pattern.search(text, cursor):
+        parts.append(text[cursor : match.start()])
+        quote = ""
+        end = -1
+        for index in range(match.end(), len(text)):
+            char = text[index]
+            if quote:
+                if char == quote and text[index - 1] != "\\":
+                    quote = ""
+            elif char in {'"', "'"}:
+                quote = char
+            elif char == ">":
+                end = index
+                break
+        if end < 0:
+            cursor = len(text)
+            break
+        cursor = end + 1
+    parts.append(text[cursor:])
+    return "".join(parts).strip()

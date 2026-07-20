@@ -110,6 +110,64 @@ class ToolRegistryTests(unittest.TestCase):
         payload = "Visible\n" + "<tool>a</tool>" * 20000
         self.assertEqual(strip_tool_protocol(payload), "Visible")
 
+    def test_call_style_near_miss_syntax_decodes_for_known_tools(self) -> None:
+        call, error, recognized = decode_text_tool_call(
+            r'<search_project(query="lockout project", scope=C:\Users\example\dairack)>'
+        )
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(call["name"], "search_project")
+        self.assertEqual(call["query"], "lockout project")
+
+        call, error, recognized = decode_text_tool_call('<web_open(url="https://example.com/page")>')
+        self.assertTrue(recognized)
+        self.assertEqual(call["name"], "web_open")
+        self.assertEqual(call["url"], "https://example.com/page")
+
+        call, error, recognized = decode_text_tool_call('search_project(query="lockout")')
+        self.assertTrue(recognized)
+        self.assertEqual(call["query"], "lockout")
+
+        # Unknown names stay prose so ordinary writing about functions is unaffected.
+        call, error, recognized = decode_text_tool_call('some_function(argument="value")')
+        self.assertIsNone(call)
+        self.assertFalse(recognized)
+
+    def test_trailing_call_style_after_prose_is_recognized_as_the_action(self) -> None:
+        text = 'Let me inspect that folder for you.\n<list_dir(path="C:\\Users\\example\\project")>'
+        call, error, recognized = decode_text_tool_call(text)
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(call["name"], "list_dir")
+        self.assertEqual(call["path"], "C:\\Users\\example\\project")
+
+    def test_windows_path_backslashes_do_not_poison_action_json(self) -> None:
+        call, error, recognized = decode_text_tool_call(
+            r'<tool name="read_file">{"path": "C:\Users\example\notes.txt"}</tool>'
+        )
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(call["path"], "C:\\Users\\example\\notes.txt")
+
+        call, error = TOOL_REGISTRY.validate(
+            {"name": "read_file", "arguments": r'{"path": "C:\Users\example\notes.txt"}'}
+        )
+        self.assertFalse(error)
+        self.assertEqual(call["path"], "C:\\Users\\example\\notes.txt")
+
+        # Valid JSON is never rewritten by the tolerant retry.
+        call, error, recognized = decode_text_tool_call('<tool name="shell">{"command": "printf \'a\\nb\'"}</tool>')
+        self.assertFalse(error)
+        self.assertEqual(call["cmd"], "printf 'a\nb'")
+
+    def test_near_miss_markup_never_reaches_visible_text(self) -> None:
+        prose = 'However, there is a hidden folder:\n<list_dir(path="C:\\Users\\example\\.hidden")>'
+        self.assertEqual(strip_tool_protocol(prose), "However, there is a hidden folder:")
+        self.assertEqual(strip_tool_protocol('<web_open(url="https://example.com")>'), "")
+        self.assertEqual(
+            strip_tool_protocol("Plain prose about search_project stays."), "Plain prose about search_project stays."
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
