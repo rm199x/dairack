@@ -60,6 +60,7 @@ change.
 | `coordinator/tuning.py` | Small validated baseline tuning vector |
 | `coordinator/calibration.py` | Bounded per-machine model/role outcome residuals |
 | `ui/textual_app.py` | Textual presentation and interaction layer |
+| `turn.py` | Frontend-agnostic turn decision ladder (repair, completion, review, finalization) as pure functions |
 | `runtime.py` | Compatibility application core pending further domain extraction |
 | `bootstrap.py` | First-run initialization and environment diagnostics |
 | `updates.py` | Cached release discovery and install-owner-aware update commands |
