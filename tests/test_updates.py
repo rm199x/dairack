@@ -121,36 +121,33 @@ class UpdateTests(unittest.TestCase):
                 )
 
     def test_update_command_matches_install_owner(self) -> None:
-        uv = update_command(
-            "0.2.0",
-            executable="/home/test/.local/share/uv/tools/dairack/bin/python",
-            which=lambda name: f"/usr/bin/{name}" if name == "uv" else None,
-        )
-        pipx = update_command(
-            "0.2.0",
-            executable="/home/test/.local/share/pipx/venvs/dairack/bin/python",
-            which=lambda name: f"/usr/bin/{name}" if name == "pipx" else None,
-        )
-        managed = update_command(
-            "0.2.0",
-            executable="/home/test/.local/share/dairack/runtime-venv/bin/python",
-            which=lambda _name: None,
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            uv_binary = str(root / "bin" / "uv")
+            pipx_binary = str(root / "bin" / "pipx")
+            binaries = {"uv": uv_binary, "pipx": pipx_binary}
+            uv_python = root / "uv" / "tools" / "dairack" / "bin" / "python"
+            pipx_python = root / "pipx" / "venvs" / "dairack" / "bin" / "python"
+            managed_python = root / "dairack" / "runtime-venv" / "bin" / "python"
 
-        self.assertEqual(uv, ["/usr/bin/uv", "tool", "install", "--force", "dairack==0.2.0"])
-        self.assertEqual(pipx, ["/usr/bin/pipx", "install", "--force", "dairack==0.2.0"])
-        self.assertEqual(
-            managed,
-            [
-                "/home/test/.local/share/dairack/runtime-venv/bin/python",
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
-                "dairack==0.2.0",
-            ],
-        )
-        self.assertIn("dairack==0.2.0", format_update_command(managed))
+            uv = update_command("0.2.0", executable=uv_python, which=binaries.get)
+            pipx = update_command("0.2.0", executable=pipx_python, which=binaries.get)
+            managed = update_command("0.2.0", executable=managed_python, which=lambda _name: None)
+
+            self.assertEqual(uv, [uv_binary, "tool", "install", "--force", "dairack==0.2.0"])
+            self.assertEqual(pipx, [pipx_binary, "install", "--force", "dairack==0.2.0"])
+            self.assertEqual(
+                managed,
+                [
+                    str(managed_python.resolve()),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--upgrade",
+                    "dairack==0.2.0",
+                ],
+            )
+            self.assertIn("dairack==0.2.0", format_update_command(managed))
 
     def test_untrusted_manifest_fields_and_terminal_controls_are_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

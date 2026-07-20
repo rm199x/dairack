@@ -8,6 +8,10 @@ Dairack is a local-first terminal agent with local or remote Ollama compute. It 
 resumable chats, project indexing, explicit action approvals, code diffs and checkpoints, web tools, image handoffs,
 automatic context compaction, and multi-model coordination.
 
+<p align="center">
+  <img src="docs/assets/dairack-terminal.png" alt="Dairack terminal interface in a new local intelligence session" width="100%">
+</p>
+
 The agent runtime always lives on the client: files, shell actions, approvals, chats, project indexes, and checkpoints
 stay on the machine where the interface is open. Model inference can run there or on another Dairack machine. The
 coordinator treats models at the active compute endpoint as one capability pool and profiles them against that
@@ -132,11 +136,19 @@ lower-confidence inferred profiles. Local evaluation can override those priors w
 - **Coordinator / efficient:** favors a resident or smaller capable model and avoids semantic arbitration.
 - **Direct model:** uses the selected model without routing.
 
+<p align="center">
+  <img src="docs/assets/model-selector.png" alt="Dairack operating mode and model selector" width="670">
+</p>
+
 The active executor, planning/review stages, specialist handoffs, timing, and route rationale are represented in the
 interface. Press `Esc` to close dialogs or interrupt work that supports cancellation. Atomic operations say
 `FINISHING SAFELY` instead of presenting a stop control that cannot work.
 
 Coordinator configuration is optional and available in `/coordinator` or from the command line:
+
+<p align="center">
+  <img src="docs/assets/coordinator-policy.png" alt="Dairack coordinator operating policy selector" width="614">
+</p>
 
 ```bash
 dairack coordinator policy adaptive

@@ -43,10 +43,13 @@ class PathAndConfigTests(unittest.TestCase):
         self.assertEqual(paths.data_dir, Path(environment["LOCALAPPDATA"]) / "Dairack" / "Data")
 
     def test_relative_xdg_directories_are_ignored(self) -> None:
-        with patch.dict(
-            os.environ,
-            {"DAIRACK_HOME": "", "XDG_CONFIG_HOME": "relative-config"},
-            clear=False,
+        with (
+            patch.object(paths_module, "_is_windows", return_value=False),
+            patch.dict(
+                os.environ,
+                {"DAIRACK_HOME": "", "XDG_CONFIG_HOME": "relative-config"},
+                clear=False,
+            ),
         ):
             paths = AppPaths.discover()
         self.assertEqual(paths.config_dir, Path.home() / ".config" / "dairack")

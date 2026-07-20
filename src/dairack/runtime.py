@@ -5746,6 +5746,12 @@ _DIFF_C_ESCAPES = {
 }
 
 
+def _validated_diff_header_path(value: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("patch file header contains a control character")
+    return value
+
+
 def diff_header_path(line: str) -> str:
     """Decode one unified-diff path using Git/GNU patch C-quoting rules."""
     raw = line[4:].strip()
@@ -5753,9 +5759,7 @@ def diff_header_path(line: str) -> str:
         raise ValueError("patch contains an empty file header")
     if not raw.startswith('"'):
         value = raw.split("\t", 1)[0]
-        if "\x00" in value:
-            raise ValueError("patch file header contains a null byte")
-        return value
+        return _validated_diff_header_path(value)
 
     decoded = bytearray()
     index = 1
@@ -5766,9 +5770,7 @@ def diff_header_path(line: str) -> str:
             if suffix and not suffix.startswith("\t"):
                 raise ValueError("patch contains trailing data after a quoted file header")
             value = os.fsdecode(bytes(decoded))
-            if "\x00" in value:
-                raise ValueError("patch file header contains a null byte")
-            return value
+            return _validated_diff_header_path(value)
         if character != "\\":
             decoded.extend(os.fsencode(character))
             index += 1
@@ -5989,41 +5991,60 @@ def apply_unified_patch(patch_text: str, cwd: Path) -> tuple[int, str]:
             handle.write(patch_text.rstrip() + "\n")
             temp_path = handle.name
 
-        patch_binary = shutil.which("patch")
         git_binary = shutil.which("git")
+        patch_binary = shutil.which("patch")
         if not patch_binary and not git_binary:
             return 127, "applying edits requires `patch` or `git` on PATH"
-        last_output = ""
+
+        backends: list[tuple[str, str]] = []
+        if git_binary:
+            backends.append(("git", git_binary))
+        if patch_binary:
+            backends.append(("patch", patch_binary))
+        attempts: list[str] = []
         for strip in (1, 0):
-            if patch_binary:
-                dry_cmd = [patch_binary, "--batch", "--forward", "--dry-run", f"-p{strip}", "-i", temp_path]
-                apply_cmd = [patch_binary, "--batch", "--forward", f"-p{strip}", "-i", temp_path]
-            else:
-                dry_cmd = [str(git_binary), "apply", "--check", f"-p{strip}", temp_path]
-                apply_cmd = [str(git_binary), "apply", f"-p{strip}", temp_path]
-            dry = subprocess.run(dry_cmd, cwd=str(cwd), text=True, capture_output=True, timeout=DEFAULT_TIMEOUT)
-            dry_output = (dry.stdout or "") + (dry.stderr or "")
-            last_output = f"$ {' '.join(shlex.quote(part) for part in dry_cmd[:-1])} <patch>\n{dry_output}"
-            if dry.returncode != 0:
-                continue
+            for backend, binary in backends:
+                if backend == "git":
+                    dry_cmd = [binary, "apply", "--check", f"-p{strip}", temp_path]
+                    apply_cmd = [binary, "apply", f"-p{strip}", temp_path]
+                else:
+                    dry_cmd = [binary, "--batch", "--forward", "--dry-run", f"-p{strip}", "-i", temp_path]
+                    apply_cmd = [binary, "--batch", "--forward", f"-p{strip}", "-i", temp_path]
+                dry = subprocess.run(
+                    dry_cmd,
+                    cwd=str(cwd),
+                    text=True,
+                    capture_output=True,
+                    timeout=DEFAULT_TIMEOUT,
+                )
+                dry_output = (dry.stdout or "") + (dry.stderr or "")
+                attempts.append(f"$ {' '.join(shlex.quote(part) for part in dry_cmd[:-1])} <patch>\n{dry_output}")
+                if dry.returncode != 0:
+                    continue
 
-            targets = patch_paths_for_strip(patch_text, strip)
-            if not targets:
-                return 1, "patch dry-run succeeded but no target files were detected"
-            try:
-                checkpoint_id, checkpoint_path = create_checkpoint(cwd, targets, reason="patch tool")
-            except ValueError as exc:
-                return 1, str(exc)
+                targets = patch_paths_for_strip(patch_text, strip)
+                if not targets:
+                    return 1, "patch dry-run succeeded but no target files were detected"
+                try:
+                    checkpoint_id, checkpoint_path = create_checkpoint(cwd, targets, reason="patch tool")
+                except ValueError as exc:
+                    return 1, str(exc)
 
-            applied = subprocess.run(apply_cmd, cwd=str(cwd), text=True, capture_output=True, timeout=DEFAULT_TIMEOUT)
-            apply_output = (applied.stdout or "") + (applied.stderr or "")
-            output = (
-                f"checkpoint: {checkpoint_id}\n{checkpoint_path}\n"
-                f"$ {' '.join(shlex.quote(part) for part in dry_cmd[:-1])} <patch>\n{dry_output}"
-                f"$ {' '.join(shlex.quote(part) for part in apply_cmd[:-1])} <patch>\n{apply_output}"
-            )
-            return applied.returncode, output
-        return 1, f"patch did not apply with -p1 or -p0\n{last_output}"
+                applied = subprocess.run(
+                    apply_cmd,
+                    cwd=str(cwd),
+                    text=True,
+                    capture_output=True,
+                    timeout=DEFAULT_TIMEOUT,
+                )
+                apply_output = (applied.stdout or "") + (applied.stderr or "")
+                output = (
+                    f"checkpoint: {checkpoint_id}\n{checkpoint_path}\n"
+                    f"$ {' '.join(shlex.quote(part) for part in dry_cmd[:-1])} <patch>\n{dry_output}"
+                    f"$ {' '.join(shlex.quote(part) for part in apply_cmd[:-1])} <patch>\n{apply_output}"
+                )
+                return applied.returncode, output
+        return 1, "patch did not apply with available backends at -p1 or -p0\n" + "".join(attempts)
     except FileNotFoundError:
         return 127, "applying edits requires `patch` or `git` on PATH"
     except subprocess.TimeoutExpired as exc:

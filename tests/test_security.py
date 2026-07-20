@@ -213,6 +213,9 @@ class PermissionBoundaryTests(unittest.TestCase):
         malformed = '--- "a/file\\x2etxt"\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n'
         self.assertIn("unsupported filename escape", runtime.unified_patch_error(malformed))
 
+        control = '--- "a/file\\nname.txt"\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n'
+        self.assertIn("control character", runtime.unified_patch_error(control))
+
     def test_checkpoint_rejects_paths_outside_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"

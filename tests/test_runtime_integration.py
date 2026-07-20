@@ -165,31 +165,34 @@ class SynchronizedMessageTests(unittest.TestCase):
         lock = threading.RLock()
         messages = CORE.SynchronizedMessages([{"role": "system", "content": "base"}], lock)
         started = threading.Event()
+        stop = threading.Event()
 
         def mutate() -> None:
             started.set()
-            for index in range(4000):
+            index = 0
+            while not stop.is_set():
                 messages.append({"role": "user", "content": str(index)})
                 if len(messages) > 48:
                     messages.pop(1)
                 if index % 64 == 0:
                     time.sleep(0)
+                index += 1
 
         worker = threading.Thread(target=mutate)
         worker.start()
-        self.assertTrue(started.wait(1.0))
-        snapshots = 0
-        while worker.is_alive():
-            snapshot = deepcopy(messages)
-            self.assertEqual(snapshot[0], {"role": "system", "content": "base"})
-            self.assertLessEqual(len(snapshot), 49)
-            self.assertTrue(
-                all(message.get("role") in {"system", "user"} and "content" in message for message in snapshot)
-            )
-            snapshots += 1
-        worker.join(timeout=1.0)
-
-        self.assertGreater(snapshots, 0)
+        try:
+            self.assertTrue(started.wait(1.0))
+            for _ in range(100):
+                snapshot = deepcopy(messages)
+                self.assertEqual(snapshot[0], {"role": "system", "content": "base"})
+                self.assertLessEqual(len(snapshot), 49)
+                self.assertTrue(
+                    all(message.get("role") in {"system", "user"} and "content" in message for message in snapshot)
+                )
+        finally:
+            stop.set()
+            worker.join(timeout=1.0)
+        self.assertFalse(worker.is_alive())
 
 
 class SignalFeedbackTests(unittest.TestCase):
@@ -1527,6 +1530,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
             root = Path(directory)
             image = root / "reference.png"
             image.write_bytes(b"not-empty")
+            canonical_image = image.resolve()
             ignored = root / "node_modules" / "ignored.png"
             ignored.parent.mkdir()
             ignored.write_bytes(b"not-empty")
@@ -1534,7 +1538,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
             with patch.object(CORE.shutil, "which", return_value=None):
                 discovered = CORE.discover_image_files(root)
 
-        self.assertEqual(discovered, [image])
+        self.assertEqual(discovered, [canonical_image])
 
     def test_visual_prompt_is_restricted_to_vision_models(self) -> None:
         provider = FakeProvider()
@@ -1549,9 +1553,11 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIn("vision", selected.capabilities)
 
     def test_windows_file_url_conversion_preserves_drive_and_unc_paths(self) -> None:
-        self.assertEqual(CORE.file_url_path("file:///C:/Users/Ryan/image.png", windows=True), "C:/Users/Ryan/image.png")
+        drive_path = CORE.file_url_path("file:///C:/Users/Ryan/image.png", windows=True).replace("\\", "/")
+        unc_path = CORE.file_url_path("file://server/share/image.png", windows=True).replace("\\", "/")
+        self.assertEqual(drive_path, "C:/Users/Ryan/image.png")
         self.assertEqual(
-            CORE.file_url_path("file://server/share/image.png", windows=True),
+            unc_path,
             "//server/share/image.png",
         )
         self.assertEqual(
@@ -2430,6 +2436,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             image = root / "reference.png"
             image.write_bytes(b"not-empty")
+            canonical_image = image.resolve()
             CORE.CONFIG_PATH = root / "config.json"
             CORE.HISTORY_PATH = root / "history"
             CORE.CHAT_DIR = root / "chats"
@@ -2497,10 +2504,10 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 picker = await wait_for_selector(app, pilot)
                 picker_options = picker.query_one("#selector-options", ui.OptionList)
                 self.assertEqual(picker_options.get_option_at_index(0).id, "__path__")
-                self.assertEqual(picker_options.get_option_at_index(1).id, str(image))
+                self.assertEqual(picker_options.get_option_at_index(1).id, str(canonical_image))
                 await pilot.press("down", "enter")
                 await pilot.pause(0.1)
-                self.assertEqual(app._pending_images, [image])
+                self.assertEqual(app._pending_images, [canonical_image])
                 self.assertIn("reference.png", str(app.query_one("#attachment-bar", ui.Static).render()))
 
             self.assertEqual(len(list(CORE.CHAT_DIR.glob("*.json"))), 1)

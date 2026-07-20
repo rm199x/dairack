@@ -261,7 +261,7 @@ def doctor(paths: AppPaths = PATHS, host: str | None = None) -> DoctorReport:
             Check(
                 "Edit backend",
                 "pass",
-                "patch" if shutil.which("patch") else "Git apply fallback",
+                "Git apply" if shutil.which("git") else "patch fallback",
             )
         )
     if importlib.util.find_spec("ensurepip") is None and shutil.which("pipx") is None and shutil.which("uv") is None:
