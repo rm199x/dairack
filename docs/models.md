@@ -50,6 +50,10 @@ corroborating evidence, so an inferred label cannot independently grant tools or
 
 ## Advanced Configuration
 
+<p align="center">
+  <img src="assets/coordinator-policy.png" alt="Dairack coordinator operating policy selector" width="614">
+</p>
+
 ```bash
 dairack coordinator show
 dairack coordinator enable

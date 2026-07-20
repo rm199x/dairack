@@ -1,39 +1,41 @@
-# Dairack
+<h1 align="center">DAIRACK</h1>
 
-[![CI](https://github.com/rm199x/dairack/actions/workflows/ci.yml/badge.svg)](https://github.com/rm199x/dairack/actions/workflows/ci.yml)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-4f746c)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-c4934f)](LICENSE)
+<p align="center"><strong>LOCAL INTELLIGENCE</strong></p>
 
-Dairack is a local-first terminal agent with local or remote Ollama compute. It combines a polished Textual interface,
-resumable chats, project indexing, explicit action approvals, code diffs and checkpoints, web tools, image handoffs,
-automatic context compaction, and multi-model coordination.
+<p align="center">
+  <a href="https://github.com/rm199x/dairack/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rm199x/dairack/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-4f746c"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-c4934f"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> &nbsp;&middot;&nbsp;
+  <a href="#remote-compute">Remote Compute</a> &nbsp;&middot;&nbsp;
+  <a href="#coordinator">Coordinator</a> &nbsp;&middot;&nbsp;
+  <a href="#permissions">Permissions</a>
+</p>
+
+Dairack is a local-first terminal agent for Ollama. The interface and agent runtime stay on the client; inference can
+run locally or through a trusted Dairack server.
 
 <p align="center">
   <img src="docs/assets/dairack-terminal.png" alt="Dairack terminal interface in a new local intelligence session" width="100%">
 </p>
 
-The agent runtime always lives on the client: files, shell actions, approvals, chats, project indexes, and checkpoints
-stay on the machine where the interface is open. Model inference can run there or on another Dairack machine. The
-coordinator treats models at the active compute endpoint as one capability pool and profiles them against that
-machine's hardware when it can be verified. Pulling a new model does not require a Dairack source change.
+- Keep files, chats, approvals, project indexes, and checkpoints on your machine.
+- Review shell commands, file access, network requests, and patches before they run.
+- Resume chats and bring project, web, and image context into one workflow.
+- Use one model directly or let Coordinator choose among installed models.
 
-> **Status:** alpha. The tool is functional and locally verified on Linux. Linux, Windows, and Apple Silicon macOS CI
-> are defined for every change, but public configuration and extension APIs may still change before 1.0.
+> **Status:** Alpha. Dairack is functional and locally verified on Linux. CI covers Linux, Windows, and macOS. Public
+> configuration and extension APIs may change before 1.0.
 
-## Requirements
+## Quick Start
 
-- Python 3.11 or newer
-- [Ollama](https://ollama.com/) on the local machine or a Dairack compute server
-- At least one model installed through Dairack or Ollama before chatting
-- `patch` or Git for agent-applied unified diffs
-- `rg` is recommended for faster repository search
+Dairack requires Python 3.11 or newer, [Ollama](https://ollama.com/) locally or on a Dairack compute server, and at least
+one chat model. Git or `patch` is needed for agent-applied edits; `rg` is optional but makes project search faster.
 
-Linux is the primary locally tested platform. Hardware discovery supports NVIDIA, ROCm systems where `rocm-smi` is
-available, Apple Silicon/Metal, and conservative Windows CIM probes. CPU-only operation is supported.
-
-## Install
-
-Install directly from GitHub with an isolated Python tool manager:
+Install from GitHub with an isolated Python tool manager:
 
 ```bash
 uv tool install git+https://github.com/rm199x/dairack.git
@@ -41,7 +43,16 @@ uv tool install git+https://github.com/rm199x/dairack.git
 pipx install git+https://github.com/rm199x/dairack.git
 ```
 
-Alternatively, install from a cloned checkout:
+Then run:
+
+```bash
+dairack setup
+dairack doctor
+dairack
+```
+
+<details>
+<summary>Install from a cloned checkout</summary>
 
 ```bash
 git clone https://github.com/rm199x/dairack.git
@@ -61,187 +72,123 @@ dairack setup
 dairack
 ```
 
-The installer prefers `uv tool`, then `pipx`, then an isolated user virtual environment. It never installs Python
-packages into the system interpreter. See [Installation](docs/installation.md) for direct package-manager commands
-and platform notes.
+The installers choose `uv`, `pipx`, or a private user environment. They do not install packages into the system Python.
 
-## Local Or Remote Compute
+</details>
 
-One Dairack package supports both roles. A normal `dairack` process is the client runtime. The optional `dairack serve`
-command turns an Ollama machine into an authenticated, inference-only compute service; the same server installation
-can still run the normal terminal interface locally.
+Setup supports NVIDIA, Apple Silicon/Metal, ROCm, Windows hardware probes, and CPU-only systems. See
+[Installation](docs/installation.md) for platform notes and non-interactive setup.
 
-For a Tailscale deployment, run this on the model server:
+## Remote Compute
+
+The same Dairack package runs on the client and the model server. Start the authenticated compute bridge on the machine
+with Ollama:
+
+**On the model server**
 
 ```bash
 dairack serve --tailscale --name "Home Server"
 ```
 
-The service remains bound to loopback while Tailscale provides the tailnet HTTPS endpoint. It prints a pairing token.
-On the computer where you want to work:
+Then connect from the computer where you want to work:
+
+**On the client**
 
 ```bash
 dairack connect https://server-name.tailnet-name.ts.net
 dairack
 ```
 
-Enter the pairing token in the private prompt. The default TUI exposes the same flow through `/compute` or the command
-palette. Use `dairack connect local` to return to local Ollama and `dairack connect remote` to restore the saved server.
-`dairack connect` reports connection health, server hardware confidence, models, and latency.
+The server prints a pairing token, which the client stores separately with private permissions. The interface, project
+files, shell, approvals, chats, indexes, and checkpoints remain on the client. Prompts, selected context, approved tool
+results, and attached images are sent to the inference endpoint because the model needs them to answer.
 
-The compute bridge exposes only the Ollama calls Dairack needs plus read-only hardware identity. It has no file, shell,
-chat, approval, index, or checkpoint API. Prompts, selected context, tool results, and attached image bytes still travel
-to the configured inference endpoint so the model can process them. See [Installation](docs/installation.md) and
-[Security](SECURITY.md) before using a server outside a trusted tailnet.
+The bridge accepts only the model operations Dairack needs plus read-only hardware information. Return to local Ollama
+with `dairack connect local`, or restore the saved server with `dairack connect remote`. Do not expose an unauthenticated
+Ollama endpoint to the public internet.
 
-## Manage Models
+## Models
+
+Any Ollama chat model can be selected directly. Setup inspects the active compute machine, discovers installed models,
+and chooses practical runtime defaults. Adding a model does not require a Dairack source change.
 
 ```bash
 dairack models recommend
 dairack models pull <model>
 dairack models update <model>
-dairack models update --all
 dairack models remove <model>
 dairack models
 ```
 
-The terminal UI exposes the same operations through `F6` or `/library`; `/models` remains a compatibility alias.
-Install, fitted-set, and update actions appear before the installed inventory, with native transfer progress,
-cancellation, profile inspection, and confirmed removal. Setup profiles are optional; any Ollama chat model can be
-selected directly. Pulling the same mutable tag checks for a newer manifest, while a new family or versioned tag is
-installed explicitly and does not silently remove the old one.
+<kbd>F6</kbd> or `/library` opens the same model lifecycle in the terminal interface, including transfer progress, cancellation,
+profile inspection, and confirmed removal. See [Models and Coordinator](docs/models.md) for profile tuning and advanced
+routing controls.
 
-`dairack init` and `dairack models refresh` query the active endpoint and regenerate `models.json`. A local endpoint uses
-client hardware; the Dairack bridge supplies verified server hardware. A plain remote Ollama endpoint gets conservative
-backend-managed settings instead of being incorrectly tuned against the client GPU. Existing user overrides survive.
+## Coordinator
 
-Inspect or tune a generated profile without editing source:
-
-```bash
-dairack models inspect <model>
-dairack models set <model> reasoning 0.92
-dairack models set <model> num_ctx 8192
-dairack models set <model> num_batch 192
-dairack models reset <model>
-```
-
-Capability values are routing priors from `0.0` to `1.0`. Ollama's declared support for tools, vision, and thinking
-is authoritative. Known catalog entries receive versioned curated priors; unconventional models receive transparent,
-lower-confidence inferred profiles. Local evaluation can override those priors without changing source.
-
-## Operating Modes
-
-- **Coordinator / adaptive:** balances quality, model-load cost, task complexity, and model residency.
-- **Coordinator / quality:** permits planning, review, and more specialist work for substantive tasks.
-- **Coordinator / efficient:** favors a resident or smaller capable model and avoids semantic arbitration.
-- **Direct model:** uses the selected model without routing.
+| Mode | Behavior |
+| --- | --- |
+| **Adaptive** | Balances response quality, latency, and model-loading cost for each request. |
+| **Quality** | Allows more planning, review, and specialist work when it can improve the result. |
+| **Efficient** | Favors quick, resident models and simpler execution. |
+| **Direct model** | Sends every request to the model you select. |
 
 <p align="center">
   <img src="docs/assets/model-selector.png" alt="Dairack operating mode and model selector" width="670">
 </p>
 
-The active executor, planning/review stages, specialist handoffs, timing, and route rationale are represented in the
-interface. Press `Esc` to close dialogs or interrupt work that supports cancellation. Atomic operations say
-`FINISHING SAFELY` instead of presenting a stop control that cannot work.
+One model is enough. With several installed, Coordinator can choose a suitable model for conversation, code, reasoning,
+research, or images and fall back when a preferred model is unavailable. Its active model and any planning or review
+stage remain visible while work is running. Use `/coordinator` to inspect or change the policy.
 
-Coordinator configuration is optional and available in `/coordinator` or from the command line:
+Requests such as "use a deeper model" or "keep this lightweight" apply only to that turn. They do not silently change
+your saved configuration.
 
-<p align="center">
-  <img src="docs/assets/coordinator-policy.png" alt="Dairack coordinator operating policy selector" width="614">
-</p>
+## Terminal Workflow
 
-```bash
-dairack coordinator policy adaptive
-dairack coordinator set review on
-dairack coordinator prefer coding <installed-model>
-dairack coordinator prefer coding auto
-```
+- <kbd>Ctrl</kbd>+<kbd>P</kbd> opens the command palette; `/help` shows the primary command set.
+- <kbd>F3</kbd> opens saved chats or starts a new session. `dairack --resume` restores the latest chat explicitly.
+- <kbd>F4</kbd> or `/image` stages up to four supported images for a vision-capable model.
+- Agent actions show their target, permission, result, exit status, and elapsed time.
+- Code edits show additions and removals, run a dry check, and create a checkpoint before application.
+- <kbd>Esc</kbd> closes dialogs and interrupts work when the active operation supports cancellation.
 
-Role preferences are soft. Capability gates and automatic fallback remain active if a preferred model is missing or
-cannot handle the input. Bounded model-by-role learning starts from neutral, requires repeated evidence, and can never
-override modality gates. One model is sufficient; complementary models make specialist handoffs useful.
-
-Natural-language compute directions such as asking for a deeper answer, a materially larger executor, or a lighter
-response are interpreted as per-turn preferences. They never persist into the next prompt. Coordinator resolves the
-underlying task, applies the preference only at high enough confidence, preserves modality and action gates, and keeps
-the ordinary automatic route when the request is ambiguous or no suitable alternative exists. Describing content as
-heavier, deeper, or faster does not change model selection.
-
-## Terminal Interface
-
-`/help` shows the primary working set; `/help all` exposes the complete command and profile reference. `Ctrl+P` opens
-the command palette and remains the primary navigation path on compact or mobile terminals where function keys may be
-unavailable. Prose uses a governed reading width while commands, code, and diffs retain horizontal review space.
-
-Startup motion settles into a static ready state. Set `DAIRACK_REDUCED_MOTION=1` for an immediately settled welcome and
-static activity indicators, or persist `"reduced_motion": true` in the Dairack configuration file.
-
-## Sessions and Images
-
-`dairack` opens a fresh, unsaved session by default. The draft is persisted after its first prompt, so opening and
-closing the interface does not create empty chat records. `F3` exposes a new-session action, the saved archive, and a
-startup preference for either fresh sessions or automatic recent-chat resume. `dairack --resume`, `/resume`, and
-`dairack --chat <id>` remain explicit resume paths.
-
-Press `F4` or use `/image` to attach project media or enter a local path. Up to four PNG, JPEG, WebP, GIF, or BMP files
-can be staged for the next prompt. Attachments are sent through Ollama's image input and Coordinator enforces a vision
-capability gate before selecting an executor. Project discovery uses `rg` when available and a bounded native
-filesystem scan otherwise.
-
-## Software Updates
-
-Public builds can use a small HTTPS release manifest or PyPI JSON endpoint. Checks run off the UI thread, are cached
-for 24 hours by default, and fail silently when offline. When a newer version exists, the top bar and `/update` expose
-the version, notes, exact local install command, copy action, and a confirmed attached-terminal update. A successful
-in-app update saves the current chat and exits so the next process starts entirely on the new release.
-
-```bash
-dairack update channel https://example.org/dairack/releases.json
-dairack update check --force
-dairack update apply
-dairack update channel off
-```
-
-The endpoint may return `{"version":"0.2.0","notes_url":"https://..."}` or standard PyPI project JSON. It cannot
-provide executable commands: Dairack constructs a pinned `uv`, `pipx`, or managed-venv command locally. Source builds
-have no default channel until the repository/package owner configures one.
+The interface adapts to compact terminals and settles into a static ready state after startup. Set
+`DAIRACK_REDUCED_MOTION=1` when all non-essential movement should remain disabled.
 
 ## Permissions
 
-Agent mode and action permissions are separate. `ask` is the default and requires approval before model-requested
-shell commands, patches, file reads, or network access. `deny` blocks them. `read-auto` only auto-runs workspace-scoped
-structured reads and a narrow machine-status command set; outbound web calls and arbitrary shell reads still prompt.
+Agent mode lets a model request tools; it does not grant permission by itself.
 
-Read [Permissions](docs/permissions.md) before enabling unattended workflows. Models are untrusted decision makers;
-the permission layer, not a prompt, is the security boundary.
+| Mode | Behavior |
+| --- | --- |
+| `ask` | Show every model-requested action for approval. This is the default. |
+| `read-auto` | Allow project reads and safe status checks; ask for writes, shell, external paths, and network access. |
+| `deny` | Block model-requested tools while keeping direct user commands available. |
 
-Every tool action uses the same compact status contract: action type, target, authority, outcome, exit code, elapsed
-time, and result. `/run`, `/test`, `/search`, `/index`, `/web`, and `/url` use that contract too. Their bounded results
-are retained as structured evidence for the next model turn; maintenance output such as model downloads is not added
-to conversation context. Interactive commands in the default TUI temporarily use the attached terminal, keeping OS
-password prompts separate from the composer.
+Shell commands run with your operating-system privileges after approval. Web searches and page reads leave the machine
+and therefore require approval when requested by a model. Dairack's permission layer is an approval boundary, not an
+operating-system sandbox. Read [Permissions](docs/permissions.md) and [Security](SECURITY.md) before unattended use.
 
-Natural-language requests to inspect a public website are routed to `web_open`; referenced domains can be resolved from
-recent conversation context. Direct page opening accepts any validated public HTTP or HTTPS URL and extracts readable
-text without executing page scripts. The built-in keyless search backend is DuckDuckGo Lite; search is used for discovery
-or verification and can be followed by `web_open` without handing the workflow back to the user.
+## Updates
 
-## State
+Source installs do not assume a release channel. Once one is configured, `/update` shows the available version, release
+notes, and exact local install command before anything runs. See [Release Channel](docs/installation.md#release-channel).
 
-Dairack follows XDG paths on Linux/macOS:
+## Local State
 
-| Purpose | Default |
+Dairack follows standard platform directories:
+
+| Purpose | Linux/macOS default |
 | --- | --- |
 | Configuration and model registry | `~/.config/dairack/` |
 | Chats, checkpoints, and project index | `~/.local/share/dairack/` |
 | Cache | `~/.cache/dairack/` |
 | Runtime state | `~/.local/state/dairack/` |
 
-Set `DAIRACK_HOME=/path` for a fully isolated or portable state tree. Standard `XDG_*_HOME` variables are also
-honored. Windows uses `%APPDATA%\Dairack` for configuration and `%LOCALAPPDATA%\Dairack` for data, cache, and state.
-Configuration and conversation JSON files are written atomically with private permissions where supported.
-Compute bearer tokens are kept in a separate private `compute-credentials.json`; they are never written to the main
-configuration, transcript, or chat archive.
+Windows uses `%APPDATA%\Dairack` for configuration and `%LOCALAPPDATA%\Dairack` for data, cache, and state. Set
+`DAIRACK_HOME=/path` for a fully isolated state tree. Compute credentials are stored separately from configuration and
+chat history.
 
 ## Development
 
@@ -254,5 +201,5 @@ python -m pytest
 python -m build
 ```
 
-Architecture and ownership boundaries are documented in [Architecture](ARCHITECTURE.md). Contributions should start
-with [CONTRIBUTING.md](CONTRIBUTING.md); security-sensitive reports should follow [SECURITY.md](SECURITY.md).
+Read [Architecture](ARCHITECTURE.md) for module boundaries, [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a
+change, and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
