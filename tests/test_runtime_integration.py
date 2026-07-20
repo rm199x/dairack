@@ -2585,7 +2585,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     for index in range(10):
                         app.replace_last_assistant_text(f"chunk {index}")
                     dispatch.assert_not_called()
-                    app._last_stream_render -= ui.STREAM_RENDER_INTERVAL
+                    app._last_stream_render = time.monotonic() - ui.STREAM_RENDER_INTERVAL - 0.01
                     app.replace_last_assistant_text("rendered chunk")
                     dispatch.assert_called_once()
 

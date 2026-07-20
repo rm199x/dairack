@@ -8,6 +8,7 @@ import functools
 import html
 import json
 import math
+import nturl2path
 import os
 import platform
 import re
@@ -3800,8 +3801,8 @@ def size_human(num: int | None) -> str:
 
 def file_url_path(value: str, *, windows: bool | None = None) -> str:
     parsed = urllib.parse.urlparse(value)
-    path = urllib.request.url2pathname(parsed.path)
     is_windows = os.name == "nt" if windows is None else windows
+    path = nturl2path.url2pathname(parsed.path) if is_windows else urllib.parse.unquote(parsed.path)
     if parsed.netloc and parsed.netloc.lower() != "localhost":
         path = f"//{parsed.netloc}{path}"
     elif is_windows and re.match(r"^/[A-Za-z]:", path):
