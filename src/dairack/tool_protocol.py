@@ -259,6 +259,7 @@ TOOL_REGISTRY = ToolRegistry(
                 },
             },
             required=("query",),
+            field_aliases={"scope": "path", "root": "path"},
             body_field="query",
             display_name="Project search",
             activity="Searching project",
@@ -349,36 +350,204 @@ TOOL_REGISTRY = ToolRegistry(
 
 TOOL_TAG_PATTERN = r"(?:tool|DAIRACK_TOOL|ASUSAI_TOOL|tool_call)"
 
+_WINDOWS_PATH_FIELDS = frozenset({"path", "scope", "root", "directory", "cwd"})
+_WINDOWS_PATH_CONTROLS = {
+    "\b": r"\b",
+    "\f": r"\f",
+    "\n": r"\n",
+    "\r": r"\r",
+    "\t": r"\t",
+}
+
+
+def _json_string_end(source: str, start: int) -> int:
+    """Return the closing quote for one JSON string, including malformed escape sequences."""
+    escaped = False
+    for index in range(start + 1, len(source)):
+        char = source[index]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            return index
+    return -1
+
+
+def _repair_windows_path_literal(source: str, start: int) -> tuple[str, int] | None:
+    """Escape lone separators in one drive or UNC path string and return its closing quote."""
+    value_start = start + 1
+    drive_path = (
+        value_start + 2 < len(source)
+        and source[value_start].isalpha()
+        and source[value_start + 1] == ":"
+        and source[value_start + 2] == "\\"
+    )
+    unc_path = source.startswith("\\\\", value_start)
+    if not drive_path and not unc_path:
+        return None
+
+    repaired = ['"']
+    index = value_start
+    while index < len(source):
+        char = source[index]
+        if char == '"':
+            repaired.append(char)
+            return "".join(repaired), index
+        if char != "\\":
+            repaired.append(char)
+            index += 1
+            continue
+        run_end = index + 1
+        while run_end < len(source) and source[run_end] == "\\":
+            run_end += 1
+        count = run_end - index
+        repaired.append("\\" * (count + (count % 2)))
+        index = run_end
+    return None
+
+
+def _repair_windows_path_json(candidate: str) -> str:
+    """Repair only JSON values owned by path-like fields, leaving commands and prose untouched."""
+    parts: list[str] = []
+    cursor = 0
+    index = 0
+    while index < len(candidate):
+        if candidate[index] != '"':
+            index += 1
+            continue
+        key_end = _json_string_end(candidate, index)
+        if key_end < 0:
+            break
+        after_key = key_end + 1
+        while after_key < len(candidate) and candidate[after_key].isspace():
+            after_key += 1
+        if after_key >= len(candidate) or candidate[after_key] != ":":
+            index = key_end + 1
+            continue
+        try:
+            key = json.loads(candidate[index : key_end + 1])
+        except ValueError:
+            index = key_end + 1
+            continue
+        value_start = after_key + 1
+        while value_start < len(candidate) and candidate[value_start].isspace():
+            value_start += 1
+        if str(key).lower() not in _WINDOWS_PATH_FIELDS or value_start >= len(candidate):
+            index = key_end + 1
+            continue
+        if candidate[value_start] != '"':
+            index = key_end + 1
+            continue
+        repaired = _repair_windows_path_literal(candidate, value_start)
+        if repaired is None:
+            index = key_end + 1
+            continue
+        literal, value_end = repaired
+        original = candidate[value_start : value_end + 1]
+        if literal != original:
+            parts.append(candidate[cursor:value_start])
+            parts.append(literal)
+            cursor = value_end + 1
+        index = value_end + 1
+    if not parts:
+        return candidate
+    parts.append(candidate[cursor:])
+    return "".join(parts)
+
+
+def _restore_windows_path_controls(value: Any, field_name: str = "") -> Any:
+    """Undo JSON control escapes that cannot be literal characters in a Windows path."""
+    if isinstance(value, Mapping):
+        return {key: _restore_windows_path_controls(item, str(key)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_restore_windows_path_controls(item) for item in value]
+    if not isinstance(value, str) or field_name.lower() not in _WINDOWS_PATH_FIELDS:
+        return value
+    drive_path = len(value) >= 3 and value[0].isalpha() and value[1] == ":"
+    rooted_path = value.startswith("\\")
+    if not drive_path and not rooted_path:
+        return value
+    for control, escaped in _WINDOWS_PATH_CONTROLS.items():
+        value = value.replace(control, escaped)
+    return value
+
 
 def _loads_tool_json(candidate: str) -> Any:
-    """Parse action JSON, tolerating the unescaped path backslashes models commonly emit on Windows."""
+    """Parse action JSON while recovering model-emitted raw Windows path separators."""
     try:
-        return json.loads(candidate)
+        return _restore_windows_path_controls(json.loads(candidate))
     except RecursionError:
         raise
     except ValueError as exc:
-        repaired = re.sub(r'\\(?!["\\/])', r"\\\\", candidate)
+        repaired = _repair_windows_path_json(candidate)
         if repaired != candidate:
             try:
-                return json.loads(repaired)
+                return _restore_windows_path_controls(json.loads(repaired))
             except ValueError:
                 raise exc from None
         raise
 
 
-def _call_style_arguments(raw: str) -> dict[str, str]:
+def _call_style_arguments(raw: str) -> tuple[dict[str, str] | None, str]:
     arguments: dict[str, str] = {}
-    pattern = re.compile(
-        r"([A-Za-z_][\w-]*)\s*=\s*(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|[^,]*)",
-        re.DOTALL,
-    )
-    for match in pattern.finditer(raw):
-        value = match.group(2).strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            quote = value[0]
-            value = value[1:-1].replace("\\" + quote, quote)
-        arguments[match.group(1).lower()] = html.unescape(value)
-    return arguments
+    index = 0
+    while True:
+        while index < len(raw) and raw[index].isspace():
+            index += 1
+        if index >= len(raw):
+            return arguments, ""
+        key_match = re.match(r"[A-Za-z_][\w-]*", raw[index:])
+        if not key_match:
+            return None, "call-style action contains malformed arguments"
+        key = key_match.group(0).lower()
+        if key in arguments:
+            return None, f"call-style action repeats field {key}"
+        index += len(key_match.group(0))
+        while index < len(raw) and raw[index].isspace():
+            index += 1
+        if index >= len(raw) or raw[index] != "=":
+            return None, f"call-style action field {key} has no value"
+        index += 1
+        while index < len(raw) and raw[index].isspace():
+            index += 1
+
+        if index < len(raw) and raw[index] in {'"', "'"}:
+            quote = raw[index]
+            index += 1
+            value_parts: list[str] = []
+            while index < len(raw):
+                char = raw[index]
+                if char == quote:
+                    index += 1
+                    break
+                if char == "\\" and index + 1 < len(raw) and raw[index + 1] == quote:
+                    value_parts.append(quote)
+                    index += 2
+                    continue
+                value_parts.append(char)
+                index += 1
+            else:
+                return None, f"call-style action field {key} has an unterminated value"
+            value = "".join(value_parts)
+            while index < len(raw) and raw[index].isspace():
+                index += 1
+            if index < len(raw) and raw[index] != ",":
+                return None, f"call-style action has unexpected text after field {key}"
+        else:
+            value_end = raw.find(",", index)
+            if value_end < 0:
+                value_end = len(raw)
+            value = raw[index:value_end].strip()
+            index = value_end
+        if not value:
+            return None, f"call-style action field {key} has an empty value"
+        arguments[key] = html.unescape(value)
+        if index >= len(raw):
+            return arguments, ""
+        index += 1
+        if not raw[index:].strip():
+            return None, "call-style action has a trailing comma"
 
 
 def _decode_call_style(
@@ -405,7 +574,10 @@ def _decode_call_style(
                 return None, "action request JSON must be an object", True
             call, error = registry.validate({"name": raw_name, "arguments": dict(nested)})
             return call, error, True
-        call, error = registry.validate({"name": raw_name, "arguments": _call_style_arguments(inner)})
+        arguments, error = _call_style_arguments(inner)
+        if error:
+            return None, error, True
+        call, error = registry.validate({"name": raw_name, "arguments": arguments or {}})
         return call, error, True
     if not angle:
         return None, "", False

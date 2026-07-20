@@ -118,6 +118,7 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertFalse(error)
         self.assertEqual(call["name"], "search_project")
         self.assertEqual(call["query"], "lockout project")
+        self.assertEqual(call["path"], r"C:\Users\example\dairack")
 
         call, error, recognized = decode_text_tool_call('<web_open(url="https://example.com/page")>')
         self.assertTrue(recognized)
@@ -141,6 +142,21 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(call["name"], "list_dir")
         self.assertEqual(call["path"], "C:\\Users\\example\\project")
 
+    def test_call_style_recovery_rejects_ambiguous_arguments(self) -> None:
+        fixtures = (
+            'shell(cmd="echo safe" trailing text)',
+            'read_file(path="app.py", ???)',
+            'shell(cmd="echo one", cmd="echo two")',
+            "hardware_status(garbage)",
+            'read_file(path="app.py",)',
+        )
+        for payload in fixtures:
+            with self.subTest(payload=payload):
+                call, error, recognized = decode_text_tool_call(payload)
+                self.assertTrue(recognized)
+                self.assertIsNone(call)
+                self.assertTrue(error)
+
     def test_windows_path_backslashes_do_not_poison_action_json(self) -> None:
         call, error, recognized = decode_text_tool_call(
             r'<tool name="read_file">{"path": "C:\Users\example\notes.txt"}</tool>'
@@ -154,6 +170,22 @@ class ToolRegistryTests(unittest.TestCase):
         )
         self.assertFalse(error)
         self.assertEqual(call["path"], "C:\\Users\\example\\notes.txt")
+
+        # JSON accepts these as newline and tab escapes, but neither control character can
+        # occur in a Windows path. Recover the model's intended separators.
+        call, error, recognized = decode_text_tool_call(r'<tool name="read_file">{"path": "C:\new\test.txt"}</tool>')
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(call["path"], r"C:\new\test.txt")
+
+        # Repair is field-aware: an invalid path must not rewrite valid escapes elsewhere.
+        call, error, recognized = decode_text_tool_call(
+            r'<tool name="read_file">{"path": "C:\Users\example\notes.txt", "reason": "line\nnext"}</tool>'
+        )
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(call["path"], r"C:\Users\example\notes.txt")
+        self.assertEqual(call["reason"], "line\nnext")
 
         # Valid JSON is never rewritten by the tolerant retry.
         call, error, recognized = decode_text_tool_call('<tool name="shell">{"command": "printf \'a\\nb\'"}</tool>')

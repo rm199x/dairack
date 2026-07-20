@@ -1822,12 +1822,86 @@ class LoopResilienceTests(unittest.TestCase):
         other = {"name": "read_file", "path": "src/other.py", "reason": ""}
         self.assertEqual(guard.refusal(other), "")
 
+    def test_action_loop_guard_allows_changed_read_results(self) -> None:
+        guard = CORE.ActionLoopGuard()
+        call = {"name": "web_search", "query": "current release", "reason": ""}
+        guard.record(call, "first result")
+        guard.record(call, "updated result")
+        self.assertEqual(guard.refusal(call), "")
+        self.assertIn("unchanged", guard.record(call, "updated result"))
+        self.assertTrue(guard.refusal(call))
+
+    def test_action_loop_guard_resets_when_project_index_changes(self) -> None:
+        guard = CORE.ActionLoopGuard()
+        search = {"name": "search_project", "query": "router", "reason": ""}
+        guard.record(search, "old index result")
+        guard.record(search, "old index result")
+        self.assertTrue(guard.refusal(search))
+        guard.record({"name": "index_project", "path": ".", "reason": ""}, "index refreshed")
+        self.assertEqual(guard.refusal(search), "")
+        self.assertFalse(guard.force_synthesis)
+
     def test_transient_stream_errors_are_distinguished_from_request_errors(self) -> None:
         self.assertTrue(CORE.transient_stream_error(CORE.OllamaError("Ollama stream stalled or disconnected")))
         self.assertTrue(CORE.transient_stream_error(CORE.OllamaError("could not reach Ollama at host: refused")))
+        self.assertTrue(CORE.transient_stream_error(CORE.OllamaError("Ollama returned HTTP 502: Bad Gateway")))
         self.assertTrue(CORE.transient_stream_error(TimeoutError()))
         self.assertFalse(CORE.transient_stream_error(CORE.OllamaError("Ollama returned HTTP 404: no such model")))
         self.assertFalse(CORE.transient_stream_error(ValueError("unrelated")))
+
+    def test_plain_agent_retries_transport_and_repairs_one_malformed_action(self) -> None:
+        class RecoveringProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.responses = [
+                    '<tool name="read_file">{"path":"app.py"</tool>',
+                    'read_file{"path":"app.py"}',
+                    "The file was read successfully.",
+                ]
+                self.attempts = 0
+
+            def chat(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> str:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise CORE.OllamaError("Ollama returned HTTP 502: Bad Gateway")
+                self.last_stats = {"done_reason": "stop"}
+                return self.responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("PLAIN_FALLBACK = True\n", encoding="utf-8")
+            config = coordinator_config(semantic=False)
+            config.update(
+                {
+                    "model_mode": "direct",
+                    "model": "qwen3.5:9b",
+                    "agent": True,
+                    "auto_compact": False,
+                    "permission_mode": "read-auto",
+                }
+            )
+            messages = [
+                {"role": "system", "content": "test"},
+                {"role": "user", "content": "Read app.py"},
+            ]
+            chat: dict[str, Any] = {"summary": "", "project_root": "", "last_route": {}}
+            provider = RecoveringProvider()
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                CORE.chat_turn(provider, "qwen3.5:9b", messages, config, root, chat)
+
+        self.assertEqual(provider.attempts, 4)
+        self.assertIn("The file was read successfully.", output.getvalue())
+        self.assertNotIn("invalid JSON", output.getvalue())
+        self.assertTrue(
+            any(
+                message.get("role") == "user"
+                and "Return exactly one corrected tool request" in str(message.get("content") or "")
+                for message in messages
+            )
+        )
 
 
 class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
@@ -2016,11 +2090,11 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("a")
                     for _ in range(200):
                         await pilot.pause(0.025)
-                        if not app.busy and len(provider.calls) == 3:
+                        if not app.busy and len(provider.calls) == 4:
                             break
 
                     self.assertFalse(app.busy)
-                    self.assertEqual(len(provider.calls), 3)
+                    self.assertEqual(len(provider.calls), 4)
                     web_open.assert_called_once_with(
                         "https://playlockout.com/",
                         cancel_event=app.cancel_event,
@@ -2030,6 +2104,88 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("WEB PAGE  COMPLETE", transcript)
                     self.assertIn("Official ReaperCorp Broadcast Site", transcript)
                     self.assertIn("LOCKOUT is presented", transcript)
+
+    async def test_primary_ui_rejects_a_future_promise_after_an_action(self) -> None:
+        class SequencedProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.responses = [
+                    'read_file{"path":"app.py"}',
+                    "I will inspect the companion file next.",
+                    'read_file{"path":"other.py"}',
+                    "Both files were inspected and contain the expected markers.",
+                ]
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                yield self.responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("APP_MARKER = True\n", encoding="utf-8")
+            (root / "other.py").write_text("OTHER_MARKER = True\n", encoding="utf-8")
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"agent": True, "auto_compact": False, "permission_mode": "read-auto"})
+            provider = SequencedProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+            original_select = CORE.select_orchestrator_route
+
+            def select_with_contract(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                selected = original_select(*args, **kwargs)
+                selected.update(
+                    {
+                        "action_contract": {
+                            "capability": "runtime_action",
+                            "preferred_tool": "read_file",
+                            "target": "app.py and other.py",
+                        },
+                        "execution_scope": "agentic",
+                        "planner": "",
+                        "reviewer": "",
+                    }
+                )
+                return selected
+
+            assessments = [
+                {
+                    "complete": False,
+                    "needs_action": True,
+                    "confidence": 0.98,
+                    "reason": "candidate only promises the second read",
+                },
+                {
+                    "complete": True,
+                    "needs_action": False,
+                    "confidence": 0.99,
+                    "reason": "both reads are reflected in the answer",
+                },
+            ]
+            with (
+                patch.object(CORE, "select_orchestrator_route", side_effect=select_with_contract),
+                patch.object(CORE, "assess_action_completion", side_effect=assessments) as assess,
+            ):
+                async with app.run_test(size=(80, 26)) as pilot:
+                    app.query_one("#composer", ui.Composer).load_text("Inspect app.py and other.py")
+                    await pilot.press("enter")
+                    for _ in range(300):
+                        await pilot.pause(0.025)
+                        if not app.busy and len(provider.calls) == 4:
+                            break
+
+                    self.assertFalse(app.busy)
+                    self.assertEqual(len(provider.calls), 4)
+                    self.assertEqual(assess.call_count, 2)
+                    transcript = app.render_transcript_text()
+                    self.assertNotIn("I will inspect", transcript)
+                    self.assertIn("Both files were inspected", transcript)
+                    self.assertTrue(app.chat["last_route"]["action_completion"]["complete"])
 
     async def test_transcript_entry_accepts_stream_updates_before_mount(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

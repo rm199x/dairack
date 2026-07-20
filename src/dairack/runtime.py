@@ -4736,7 +4736,7 @@ def truncate_middle(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
 REPEATABLE_READ_TOOLS = frozenset(
     {"read_file", "list_dir", "find_paths", "hardware_status", "search_project", "web_search", "web_open"}
 )
-STATE_PRESERVING_TOOLS = REPEATABLE_READ_TOOLS | {"consult_specialist", "analyze_image", "index_project"}
+STATE_PRESERVING_TOOLS = REPEATABLE_READ_TOOLS | {"consult_specialist", "analyze_image"}
 
 
 def tool_call_signature(call: dict[str, str]) -> str:
@@ -4750,6 +4750,11 @@ class ActionLoopGuard:
     def __init__(self) -> None:
         self._counts: dict[str, int] = {}
         self._digests: dict[str, str] = {}
+        self.repeat_stops = 0
+
+    def reset(self) -> None:
+        self._counts.clear()
+        self._digests.clear()
         self.repeat_stops = 0
 
     @property
@@ -4774,16 +4779,17 @@ class ActionLoopGuard:
         """Record an executed action; return a note when a repeated read returned identical output."""
         name = str(call.get("name") or "")
         if name not in STATE_PRESERVING_TOOLS:
-            self._counts.clear()
-            self._digests.clear()
+            self.reset()
             return ""
+        self.repeat_stops = 0
         if name not in REPEATABLE_READ_TOOLS:
             return ""
         signature = tool_call_signature(call)
-        self._counts[signature] = self._counts.get(signature, 0) + 1
         digest = hashlib.sha256(result.encode("utf-8", "replace")).hexdigest()
+        previous_digest = self._digests.get(signature)
+        self._counts[signature] = self._counts.get(signature, 0) + 1 if previous_digest == digest else 1
         note = ""
-        if self._counts[signature] >= 2 and self._digests.get(signature) == digest:
+        if self._counts[signature] >= 2:
             note = "\n[unchanged from the previous run of this exact action]"
         self._digests[signature] = digest
         return note
@@ -4793,7 +4799,20 @@ def transient_stream_error(exc: BaseException) -> bool:
     """Recognize connection hiccups worth one silent in-turn retry, as opposed to real request errors."""
     if isinstance(exc, OllamaError):
         text = str(exc).lower()
-        return any(marker in text for marker in ("stalled", "disconnect", "could not reach", "malformed stream"))
+        return any(
+            marker in text
+            for marker in (
+                "stalled",
+                "disconnect",
+                "could not reach",
+                "malformed stream",
+                "connection reset",
+                "timed out",
+                "http 502",
+                "http 503",
+                "http 504",
+            )
+        )
     return isinstance(exc, (TimeoutError, ConnectionError))
 
 
@@ -9561,6 +9580,7 @@ def chat_turn(
     revision_feedback = ""
     completion_repair_attempted = False
     action_contract_repair_attempted = False
+    action_repair_attempted = False
     action_completion_repairs = 0
     action_limit = agent_action_limit(config)
     action_steps = 0
@@ -9579,16 +9599,25 @@ def chat_turn(
             finalizing,
             synthesis_attempts > 1,
         )
-        response = provider.chat(
-            executor,
-            request_messages,
-            stream=False,
-            think=bool(runtime.get("think")),
-            num_ctx=int(runtime.get("num_ctx") or 4096),
-            extra_options=ollama_options(runtime),
-            tools=request_tools or None,
-            tool_call_sink=native_calls.append,
-        )
+        request_retry_used = False
+        while True:
+            try:
+                response = provider.chat(
+                    executor,
+                    request_messages,
+                    stream=False,
+                    think=bool(runtime.get("think")),
+                    num_ctx=int(runtime.get("num_ctx") or 4096),
+                    extra_options=ollama_options(runtime),
+                    tools=request_tools or None,
+                    tool_call_sink=native_calls.append,
+                )
+                break
+            except Exception as exc:
+                if request_retry_used or not transient_stream_error(exc):
+                    raise
+                request_retry_used = True
+                native_calls.clear()
         action_feedback = ""
         revision_feedback = ""
         call, parse_error = resolve_tool_request(response, native_calls)
@@ -9691,6 +9720,19 @@ def chat_turn(
                 print(response)
             return
         if parse_error:
+            if not action_repair_attempted:
+                action_repair_attempted = True
+                messages.append(assistant_message)
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Action request rejected by the runtime: "
+                            f"{parse_error}. Return exactly one corrected tool request and no other text."
+                        ),
+                    }
+                )
+                continue
             messages.append(assistant_message)
             observe_route_outcome(config, route, -1.0, weight=1.0, source="tool-protocol")
             route["action_parse_error"] = parse_error

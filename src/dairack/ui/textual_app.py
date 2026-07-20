@@ -4512,6 +4512,7 @@ class DairackTextualBase(App[None]):
             repairing_action = False
             action_repair_attempted = False
             action_contract_repair_attempted = False
+            action_completion_repairs = 0
             completion_repair_attempted = False
             synthesis_attempts = 0
             while True:
@@ -4644,7 +4645,7 @@ class DairackTextualBase(App[None]):
                 )
                 if call and not internal_call:
                     action_text = self.core.tool_request_display(call)
-                    rendered_text = f"{visible_text}\n\n{action_text}" if visible_text else action_text
+                    rendered_text = action_text
                 elif call:
                     rendered_text = visible_text
                 elif parse_error:
@@ -4691,7 +4692,7 @@ class DairackTextualBase(App[None]):
                     self._route_action_feedback = action_requirement
                     repairing_action = True
                     self.replace_last_assistant_text("")
-                    self.set_busy(True, "preparing web access")
+                    self.set_busy(True, "preparing requested action")
                     self.save_current_chat()
                     continue
                 incomplete_reason = ""
@@ -4724,6 +4725,53 @@ class DairackTextualBase(App[None]):
                     )
                     self.save_current_chat()
                     return
+                contract = route.get("action_contract")
+                if (
+                    not call
+                    and not parse_error
+                    and not incomplete_reason
+                    and not finalizing
+                    and bool(self.config.get("agent"))
+                    and self._agent_steps_used > 0
+                    and isinstance(contract, dict)
+                    and contract.get("capability")
+                ):
+                    self.set_busy(True, "verifying action result")
+                    try:
+                        completion = self.core.assess_action_completion(
+                            self.provider,
+                            self.config,
+                            route,
+                            self.messages,
+                            assistant_text,
+                            self.cancel_event,
+                        )
+                    except Exception as exc:
+                        completion = {"error": str(exc)}
+                    if completion:
+                        route["action_completion"] = completion
+                    enforce_completion = (
+                        completion
+                        and not completion.get("error")
+                        and not completion.get("complete")
+                        and float(completion.get("confidence") or 0) >= 0.65
+                    )
+                    if enforce_completion and action_completion_repairs < 2:
+                        action_completion_repairs += 1
+                        if self.messages and self.messages[-1].get("role") == "assistant":
+                            self.messages.pop()
+                        self._route_action_feedback = self.core.action_completion_directive(completion)
+                        repairing_action = True
+                        self.replace_last_assistant_text("")
+                        self.set_busy(True, "continuing requested action")
+                        self.save_current_chat()
+                        continue
+                    if enforce_completion:
+                        reason = str(completion.get("reason") or "completion could not be verified")
+                        self.replace_last_assistant_text("The requested action did not complete.")
+                        self.append_error(f"Agent stopped after two completion corrections.\n{reason}")
+                        self.save_current_chat()
+                        return
                 if finalizing:
                     invalid_final = bool(call or parse_error or incomplete_reason or not assistant_text.strip())
                     if invalid_final and synthesis_attempts < 2:
@@ -4986,6 +5034,7 @@ class DairackTextualBase(App[None]):
         except Exception as exc:
             code = 1
             result = f"interactive action failed: {exc}"
+        self._loop_guard.record(call, result)
         try:
             self.append_action(
                 self.core.tool_result_display(call, code, result, approved_by, time.monotonic() - started)
