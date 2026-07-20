@@ -101,7 +101,11 @@ The action loop is bounded and self-correcting: model-emitted action requests ar
 call-style near-misses and unescaped Windows path backslashes), malformed requests get one correction pass and then a
 plain explanation, an identical read repeated with no intervening state change is refused with its prior result,
 persistent repetition forces final synthesis, bounded tool output keeps its beginning and end, a dropped model
-connection retries once silently, and an over-budget request omits project retrieval before failing.
+connection retries once silently, and an over-budget request omits project retrieval before failing. The decision
+ladder that chooses each turn's next action lives in one frontend-agnostic core (`turn.py`) that every interface
+drives, so the Textual, fallback-terminal, and plain-CLI paths cannot diverge. Under `read-auto`, a response that
+returns several independently auto-approvable in-scope reads runs them together in one turn; the batch is gated so it
+can never execute anything that would not auto-run on its own.
 
 Natural-language compute controls are a closed, schema-validated contract separate from task intent. They are
 confidence-gated, apply to one turn only, and cannot create action authority. A request for higher capacity must pass a

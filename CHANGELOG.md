@@ -44,7 +44,11 @@ semantic versioning after 1.0.
 - Exact-string `edit_file` action for targeted single-occurrence edits, checkpointed for `/undo`, scoped to the
   working directory, and previewed as a diff during permission review alongside `patch`.
 - Frontend-agnostic turn decision core (`turn.py`) that owns the agent turn's repair, completion, review, and
-  finalization ladder as pure tested functions; the plain-CLI loop drives on it as the reference consumer.
+  finalization ladder as pure tested functions; all three interfaces (Textual, fallback terminal, and plain CLI)
+  drive on it, replacing three independently drifting loop implementations.
+- Batched execution of multiple auto-approvable project reads returned in one response under `read-auto`, so
+  independent lookups run in a single turn instead of failing the one-action check; each call still passes the same
+  loop-guard, action-budget, and scope enforcement, and any non-read member disqualifies the whole batch.
 
 ### Changed
 
