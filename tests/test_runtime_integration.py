@@ -16,9 +16,9 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
-from test_models import hardware
-
 os.environ.setdefault("DAIRACK_HOME", tempfile.mkdtemp(prefix="dairack-tests-"))
+
+from test_models import hardware  # noqa: E402
 
 from dairack import runtime as CORE  # noqa: E402
 from dairack.bootstrap import InitializationResult  # noqa: E402
@@ -34,6 +34,8 @@ CORE.PATHS = AppPaths(
     TEST_ROOT / "cache",
     TEST_ROOT / "state",
 )
+CORE.PATHS.ensure()
+CORE.PATHS.hardware_file.write_text(json.dumps(hardware().to_dict(), sort_keys=True), encoding="utf-8")
 MODELS = [
     CORE.ModelInfo(
         "qwen3.5:9b",
