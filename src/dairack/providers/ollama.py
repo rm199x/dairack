@@ -40,6 +40,8 @@ def _request_json(
     payload: Mapping[str, Any] | None = None,
     timeout: float | None = 15,
     headers: Mapping[str, str] | None = None,
+    *,
+    opener: urllib.request.OpenerDirector | None = None,
 ) -> dict[str, Any]:
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(
@@ -48,8 +50,9 @@ def _request_json(
         method=method,
         headers={"Content-Type": "application/json", "Accept": "application/json", **dict(headers or {})},
     )
+    open_request = urllib.request.urlopen if opener is None else opener.open
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_request(request, timeout=timeout) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
@@ -72,6 +75,8 @@ def _stream_json(
     payload: Mapping[str, Any],
     headers: Mapping[str, str] | None = None,
     cancel_event: Event | None = None,
+    *,
+    opener: urllib.request.OpenerDirector | None = None,
 ) -> Iterator[dict[str, Any]]:
     if cancel_event and cancel_event.is_set():
         return
@@ -81,8 +86,9 @@ def _stream_json(
         method="POST",
         headers={"Content-Type": "application/json", "Accept": "application/x-ndjson", **dict(headers or {})},
     )
+    open_request = urllib.request.urlopen if opener is None else opener.open
     try:
-        response = urllib.request.urlopen(request, timeout=GENERATION_IDLE_TIMEOUT)
+        response = open_request(request, timeout=GENERATION_IDLE_TIMEOUT)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         raise OllamaError(f"Ollama returned HTTP {exc.code}: {detail or exc.reason}", exc.code) from exc
@@ -190,6 +196,8 @@ class OllamaProvider:
     def __init__(self, host: str = "127.0.0.1:11434", token: str = "") -> None:
         self.host = normalize_host(host)
         self.token = token.strip()
+        # Compute endpoints are explicit peers; ambient proxies can break private routes and expose bearer credentials.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.stream_phase = "idle"
         self.current_model = ""
         self.current_stats: dict[str, Any] = {}
@@ -198,6 +206,37 @@ class OllamaProvider:
 
     def url(self, path: str) -> str:
         return f"{self.host}{path}"
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = 15,
+    ) -> dict[str, Any]:
+        return _request_json(
+            method,
+            self.url(path),
+            payload,
+            timeout=timeout,
+            headers=self.headers,
+            opener=self._opener,
+        )
+
+    def _stream(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+        cancel_event: Event | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        return _stream_json(
+            self.url(path),
+            payload,
+            self.headers,
+            cancel_event,
+            opener=self._opener,
+        )
 
     @property
     def headers(self) -> dict[str, str]:
@@ -211,28 +250,26 @@ class OllamaProvider:
         return True
 
     def version(self) -> str:
-        return str(
-            _request_json("GET", self.url("/api/version"), timeout=5, headers=self.headers).get("version") or "unknown"
-        )
+        return str(self._request("GET", "/api/version", timeout=5).get("version") or "unknown")
 
     def compute_info(self) -> dict[str, Any]:
         try:
-            return _request_json("GET", self.url(BRIDGE_INFO_PATH), timeout=5, headers=self.headers)
+            return self._request("GET", BRIDGE_INFO_PATH, timeout=5)
         except OllamaError as exc:
             if exc.status_code not in {404, 405}:
                 raise
-        return _request_json("GET", self.url(LEGACY_BRIDGE_INFO_PATH), timeout=5, headers=self.headers)
+        return self._request("GET", LEGACY_BRIDGE_INFO_PATH, timeout=5)
 
     def show_model(self, model: str, refresh: bool = False) -> dict[str, Any]:
         key = model.lower()
         if not refresh and key in self._show_cache:
             return self._show_cache[key]
-        value = _request_json("POST", self.url("/api/show"), {"model": model}, timeout=15, headers=self.headers)
+        value = self._request("POST", "/api/show", {"model": model}, timeout=15)
         self._show_cache[key] = value
         return value
 
     def list_models(self) -> list[ModelDescriptor]:
-        payload = _request_json("GET", self.url("/api/tags"), timeout=10, headers=self.headers)
+        payload = self._request("GET", "/api/tags", timeout=10)
         result: list[ModelDescriptor] = []
         for item in payload.get("models", []):
             if not isinstance(item, Mapping):
@@ -280,7 +317,7 @@ class OllamaProvider:
         return capability.lower() in self.model_features(model)
 
     def running_details(self) -> list[dict[str, Any]]:
-        payload = _request_json("GET", self.url("/api/ps"), timeout=5, headers=self.headers)
+        payload = self._request("GET", "/api/ps", timeout=5)
         return [dict(item) for item in payload.get("models", []) if isinstance(item, Mapping)]
 
     def running_models(self) -> list[str]:
@@ -366,7 +403,7 @@ class OllamaProvider:
         seen_tool_calls: set[str] = set()
         done_seen = False
         try:
-            for event in _stream_json(self.url("/api/chat"), payload, self.headers, cancel_event):
+            for event in self._stream("/api/chat", payload, cancel_event):
                 if cancel_event and cancel_event.is_set():
                     break
                 message = event.get("message") if isinstance(event.get("message"), Mapping) else {}
@@ -477,9 +514,7 @@ class OllamaProvider:
             tools=tools,
         )
         try:
-            response = _request_json(
-                "POST", self.url("/api/chat"), payload, timeout=GENERATION_IDLE_TIMEOUT, headers=self.headers
-            )
+            response = self._request("POST", "/api/chat", payload, timeout=GENERATION_IDLE_TIMEOUT)
         finally:
             self.stream_phase = "idle"
             self.current_model = ""
@@ -502,7 +537,7 @@ class OllamaProvider:
         return content
 
     def pull(self, model: str) -> Iterator[dict[str, Any]]:
-        yield from _stream_json(self.url("/api/pull"), {"model": model, "stream": True}, self.headers)
+        yield from self._stream("/api/pull", {"model": model, "stream": True})
 
     def delete(self, model: str) -> None:
-        _request_json("DELETE", self.url("/api/delete"), {"model": model}, timeout=30, headers=self.headers)
+        self._request("DELETE", "/api/delete", {"model": model}, timeout=30)

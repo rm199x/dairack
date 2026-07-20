@@ -111,6 +111,8 @@ agent tools or opens client paths.
 The provider boundary is the network boundary. Local files and images are read by the client, and only request content
 needed for inference is serialized to the configured endpoint. Model-requested actions return to the client, pass
 through the normal permission engine, execute there, and may then be included as bounded evidence in a later request.
+Configured compute endpoints are direct peers and do not inherit ambient operating-system proxy settings. Web access
+and release discovery use their own transports and policies.
 
 Initialization has three hardware modes:
 

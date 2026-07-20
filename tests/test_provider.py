@@ -60,6 +60,22 @@ class OllamaProviderTests(unittest.TestCase):
         for call in request.call_args_list:  # type: ignore[attr-defined]
             self.assertEqual(call.kwargs["headers"], {"Authorization": "Bearer private-token"})
 
+    def test_provider_builds_a_direct_transport_without_ambient_proxies(self) -> None:
+        direct_opener = object()
+        with patch(
+            "dairack.providers.ollama.urllib.request.build_opener",
+            return_value=direct_opener,
+        ) as build_opener:
+            provider = OllamaProvider("https://compute.example.test", "private-token")
+
+        handler = build_opener.call_args.args[0]
+        self.assertEqual(handler.proxies, {})
+        self.assertIs(provider._opener, direct_opener)
+
+        with patch("dairack.providers.ollama._request_json", return_value={"version": "test"}) as request:
+            self.assertEqual(provider.version(), "test")
+        self.assertIs(request.call_args.kwargs["opener"], direct_opener)
+
     @patch("dairack.providers.ollama._request_json")
     def test_compute_info_falls_back_to_the_legacy_bridge_endpoint(self, request: object) -> None:
         request.side_effect = [  # type: ignore[attr-defined]
@@ -197,6 +213,7 @@ class OllamaProviderTests(unittest.TestCase):
         self.assertEqual(chunks, [])
         self.assertEqual(calls, [call])
         self.assertEqual(provider.last_stats["done_reason"], "stop")
+        self.assertIs(stream.call_args.kwargs["opener"], provider._opener)  # type: ignore[attr-defined]
 
     @patch("dairack.providers.ollama._stream_json")
     def test_stream_preserves_length_stop_and_clears_stale_stats(self, stream: object) -> None:

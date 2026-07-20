@@ -66,7 +66,8 @@ network path you trust with that content.
 
 The bridge binds to loopback by default and requires a high-entropy bearer token. Use HTTPS, Tailscale Serve, or another
 authenticated encrypted proxy for remote access. Direct Ollama has no Dairack authentication layer and must not be
-published openly.
+published openly. Compute connections do not inherit ambient operating-system proxy settings, keeping private routes
+and bearer credentials on the explicitly configured path.
 
 Possession of a bridge token grants inference and the allowlisted model-management operations, including model pull and
 delete. Rotate the server token if it is exposed. The bridge has no catch-all proxy route; adding one requires a
