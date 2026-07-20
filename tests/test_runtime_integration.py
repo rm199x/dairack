@@ -2401,6 +2401,66 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("found no blocking issue", transcript)
                 self.assertNotIn("unfinished", transcript)
 
+    async def test_read_auto_batches_multiple_reads_in_one_response(self) -> None:
+        class BatchThenAnswerProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.round = 0
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                self.round += 1
+                sink = kwargs.get("tool_call_sink")
+                if self.round == 1 and callable(sink):
+                    sink({"function": {"name": "read_file", "arguments": {"path": "a.py"}}})
+                    sink({"function": {"name": "read_file", "arguments": {"path": "b.py"}}})
+                    return
+                yield "Both files define stubs."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            (root / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+            (root / "b.py").write_text("def b():\n    return 2\n", encoding="utf-8")
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update(
+                {
+                    "model_mode": "direct",
+                    "model": "qwen3.5:9b",
+                    "agent": True,
+                    "auto_compact": False,
+                    "permission_mode": "read-auto",
+                }
+            )
+            provider = BatchThenAnswerProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(80, 26)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text("Read a.py and b.py")
+                await pilot.press("enter")
+                for _ in range(200):
+                    await pilot.pause(0.025)
+                    if not app.busy and provider.round == 2:
+                        break
+
+                self.assertFalse(app.busy)
+                # Both reads ran from a single response, then one synthesis generation followed.
+                self.assertEqual(provider.round, 2)
+                tool_results = [
+                    m for m in app.messages if str(m.get("content") or "").startswith("Structured tool result:")
+                ]
+                self.assertEqual(len(tool_results), 2)
+                self.assertTrue(any("def a()" in str(m.get("content") or "") for m in tool_results))
+                self.assertTrue(any("def b()" in str(m.get("content") or "") for m in tool_results))
+                self.assertIn("Both files define stubs.", app.render_transcript_text())
+
     async def test_transient_stream_error_is_retried_once_without_a_visible_failure(self) -> None:
         class FlakyProvider(FakeProvider):
             def __init__(self) -> None:

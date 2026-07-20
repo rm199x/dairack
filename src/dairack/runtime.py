@@ -4912,6 +4912,37 @@ def resolve_tool_request(
     return call, error
 
 
+def read_only_batch(
+    native_calls: list[dict[str, Any]],
+    cwd: Path,
+    project_root: Path | None = None,
+) -> list[dict[str, str]]:
+    """Return validated calls when a response is a batch of independently auto-approvable reads.
+
+    A non-empty result is only returned when there is more than one native call and every one of
+    them would auto-run on its own as an in-scope, read-only action. Any write, network, shell,
+    coordinator, or out-of-scope call — or any parse failure — yields an empty list, so the caller
+    falls back to strict single-action handling. This never widens what may run without approval.
+    """
+    if len(native_calls) < 2:
+        return []
+    validated: list[dict[str, str]] = []
+    for raw in native_calls:
+        call, _error = _validated_tool_call(raw)
+        if not call:
+            return []
+        call = normalize_coordinator_tool_call(call)
+        if is_internal_coordinator_call(call):
+            return []
+        if not is_read_only_tool_call(call):
+            return []
+        if not is_auto_approvable_tool_call(call, cwd, project_root):
+            return []
+        call["_protocol"] = "native"
+        validated.append(call)
+    return validated
+
+
 def agent_tool_schemas() -> list[dict[str, Any]]:
     return TOOL_REGISTRY.schemas()
 
@@ -7953,6 +7984,9 @@ class DairackTui:
                         first_chunk = True
                         self.replace_last_assistant_text("")
                         self.set_busy(True, f"reconnecting / {executor}")
+                if not self.cancel_event.is_set() and self.maybe_run_read_batch(native_calls, assistant_text):
+                    self.set_busy(True, "continuing")
+                    continue
                 call, parse_error = resolve_tool_request(assistant_text, native_calls)
                 visible_text = strip_tool_markup(assistant_text)
                 internal_call = bool(call and is_internal_coordinator_call(normalize_coordinator_tool_call(call)))
@@ -8268,6 +8302,31 @@ class DairackTui:
         self.save_current_chat()
         self.app.invalidate()
         return "pending"
+
+    def maybe_run_read_batch(self, native_calls: list[dict[str, Any]], assistant_text: str) -> bool:
+        """Execute a response's calls together when they are all auto-approvable reads.
+
+        Returns True when a batch ran, so the caller continues to the next generation instead
+        of the single-action path. Each call still passes through run_tool_call, so the loop
+        guard, action budget, and read-auto scope checks apply exactly as for one call. Gated to
+        read-auto: in ask/deny modes this returns False and normal per-action handling applies.
+        """
+        if str(self.config.get("permission_mode") or "ask") != "read-auto":
+            return False
+        project_root = project_scope_for_chat(self.chat, self.cwd)
+        batch = read_only_batch(native_calls, self.cwd, project_root)
+        if not batch:
+            return False
+        visible = strip_tool_markup(assistant_text)
+        self.replace_last_assistant_text(visible or f"Reading {len(batch)} project locations...")
+        self.append_assistant_end()
+        self.messages.append({"role": "assistant", "content": assistant_text, "tool_calls": native_calls})
+        self.save_current_chat()
+        for call in batch:
+            if self.cancel_event.is_set():
+                break
+            self.run_tool_call(call, approved_by="read-auto")
+        return True
 
     def run_tool_call(self, call: dict[str, str], approved_by: str) -> None:
         call = normalize_coordinator_tool_call(call)

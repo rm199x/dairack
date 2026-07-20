@@ -4638,6 +4638,9 @@ class DairackTextualBase(App[None]):
                 timings = route.setdefault("timings", {})
                 timings["execute"] = round(float(timings.get("execute") or 0) + time.monotonic() - execution_started, 3)
                 route["passes"] = int(route.get("passes") or 0) + 1
+                if not self.cancel_event.is_set() and self.maybe_run_read_batch(native_calls, assistant_text):
+                    self.set_busy(True, "continuing")
+                    continue
                 visible_text = self._visible_stream_text(assistant_text)
                 call, parse_error = self.core.resolve_tool_request(assistant_text, native_calls)
                 internal_call = bool(

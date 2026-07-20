@@ -68,6 +68,59 @@ class PermissionBoundaryTests(unittest.TestCase):
                 )
             )
 
+    def test_read_only_batch_admits_only_all_auto_approvable_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / ".git").mkdir()
+            (project / "a.py").write_text("a\n", encoding="ascii")
+            (project / "b.py").write_text("b\n", encoding="ascii")
+            outside = Path(directory) / "secret.txt"
+            outside.write_text("secret\n", encoding="ascii")
+
+            def native(name: str, **args: str) -> dict[str, object]:
+                return {"function": {"name": name, "arguments": {**args}}}
+
+            # Two in-scope reads batch together.
+            batch = runtime.read_only_batch(
+                [native("read_file", path="a.py"), native("list_dir", path=".")], project, project
+            )
+            self.assertEqual([c["name"] for c in batch], ["read_file", "list_dir"])
+
+            # A single call is never a batch.
+            self.assertEqual(runtime.read_only_batch([native("read_file", path="a.py")], project, project), [])
+
+            # Any write, shell, network, or out-of-scope member disqualifies the whole batch.
+            self.assertEqual(
+                runtime.read_only_batch(
+                    [native("read_file", path="a.py"), native("shell", cmd="rm -rf .")], project, project
+                ),
+                [],
+            )
+            self.assertEqual(
+                runtime.read_only_batch(
+                    [native("read_file", path="a.py"), native("web_search", query="x")], project, project
+                ),
+                [],
+            )
+            self.assertEqual(
+                runtime.read_only_batch(
+                    [
+                        native("read_file", path="a.py"),
+                        native("edit_file", path="a.py", old_string="a", new_string="c"),
+                    ],
+                    project,
+                    project,
+                ),
+                [],
+            )
+            self.assertEqual(
+                runtime.read_only_batch(
+                    [native("read_file", path="a.py"), native("read_file", path=str(outside))], project, project
+                ),
+                [],
+            )
+
     def test_read_auto_rejects_traversal_and_symlink_scope_escapes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
