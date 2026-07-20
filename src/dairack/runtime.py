@@ -4486,7 +4486,9 @@ def system_prompt(cwd: Path, agent: bool, config: dict[str, Any] | None = None) 
             claim web access is unavailable when these tools are supplied or ask the
             user to invoke an internal web tool for you.
             For code work, prefer search_project, read_file, list_dir, and git diff
-            before patching. Then request patch for edits. Do not write files through
+            before editing. For targeted changes, request edit_file with the exact
+            current text and its replacement; use patch with a unified diff only for
+            multi-file or large rewrites. Do not write files through
             shell redirection, sed -i, Python scripts, or install commands unless the
             user explicitly asked for that action. Prefer read-only inspection
             commands first. Never request destructive commands unless the user
@@ -6418,6 +6420,98 @@ def apply_unified_patch(patch_text: str, cwd: Path) -> tuple[int, str]:
                 pass
 
 
+def _exact_edit_content(target: Path, old_string: str, new_string: str) -> tuple[str, str] | tuple[None, str]:
+    """Return (updated_content, "") for a valid exact edit, or (None, error)."""
+    if not old_string:
+        return None, "edit_file requires the exact existing text in old_string"
+    if old_string == new_string:
+        return None, "old_string and new_string are identical; nothing to change"
+    if not target.exists():
+        return None, f"file not found: {target}"
+    if not target.is_file():
+        return None, f"not a file: {target}"
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None, f"not a UTF-8 text file: {target}"
+    except OSError as exc:
+        return None, f"could not read {target}: {exc}"
+    occurrences = content.count(old_string)
+    if occurrences == 0:
+        return None, (
+            "old_string was not found in the file. Re-read the file and copy the exact "
+            "current text, including whitespace and indentation."
+        )
+    if occurrences > 1:
+        return None, (
+            f"old_string matches {occurrences} places in the file. Include more surrounding "
+            "lines so it matches exactly once."
+        )
+    return content.replace(old_string, new_string, 1), ""
+
+
+def apply_exact_edit(call: dict[str, str], cwd: Path) -> tuple[int, str]:
+    target = resolve_user_path(cwd, call.get("path", ""))
+    updated, error = _exact_edit_content(target, call.get("old_string", ""), call.get("new_string", ""))
+    if updated is None:
+        return 1, error
+    try:
+        rel = str(target.resolve().relative_to(cwd.resolve()))
+    except ValueError:
+        return 1, f"refusing to edit outside the working directory: {target}"
+    try:
+        checkpoint_id, checkpoint_path = create_checkpoint(cwd, [rel], reason="edit tool")
+    except ValueError as exc:
+        return 1, str(exc)
+    original = target.read_text(encoding="utf-8")
+    mode = target.stat().st_mode & 0o777
+    atomic_write_bytes(target, updated.encode("utf-8"), mode=mode)
+    diff_lines = list(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            updated.splitlines(keepends=True),
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+        )
+    )
+    added = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
+    return 0, (
+        f"checkpoint: {checkpoint_id}\n{checkpoint_path}\n"
+        f"edited {rel}: +{added} -{removed} lines\n" + truncate_middle("".join(diff_lines), 12000)
+    )
+
+
+def edit_preview_diff(call: dict[str, str], cwd: Path) -> str:
+    """Render the diff an edit_file request would apply, for permission review."""
+    target = resolve_user_path(cwd, call.get("path", ""))
+    updated, error = _exact_edit_content(target, call.get("old_string", ""), call.get("new_string", ""))
+    if updated is None:
+        return f"edit_file would fail: {error}"
+    original = target.read_text(encoding="utf-8")
+    rel = call.get("path", "")
+    return "".join(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            updated.splitlines(keepends=True),
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+        )
+    )
+
+
+def tool_approval_diff(call: dict[str, str], cwd: Path) -> str:
+    """Return the change preview shown during permission review for write actions."""
+    if call.get("name") == "patch":
+        return call.get("patch", "")
+    if call.get("name") == "edit_file":
+        try:
+            return edit_preview_diff(call, cwd)
+        except OSError as exc:
+            return f"edit_file preview unavailable: {exc}"
+    return ""
+
+
 def execute_tool_call(
     call: dict[str, str],
     cwd: Path,
@@ -6437,6 +6531,8 @@ def execute_tool_call(
         return run_shell(call.get("cmd", ""), scope, cancel_event=cancel_event)
     if call.get("name") == "patch":
         return apply_unified_patch(call.get("patch", ""), scope)
+    if call.get("name") == "edit_file":
+        return apply_exact_edit(call, scope)
     if call.get("name") == "read_file":
         line = None
         if call.get("line"):
@@ -6480,7 +6576,7 @@ def execute_tool_call(
 def tool_result_message(call: dict[str, str], code: int, result: str) -> str:
     if call.get("name") == "shell":
         return f"Shell tool result:\ncommand: {call.get('cmd', '')}\nexit_code: {code}\noutput:\n{result}"
-    if call.get("name") == "patch":
+    if call.get("name") in {"patch", "edit_file"}:
         return f"Patch tool result:\nsummary: {tool_summary(call)}\nexit_code: {code}\noutput:\n{result}"
     if call.get("name") == "consult_specialist":
         return f"Coordinator specialist result:\nsummary: {tool_summary(call)}\nexit_code: {code}\noutput:\n{result}"
@@ -6561,15 +6657,16 @@ def diff_style_for_line(line: str) -> str:
     return "class:diff.ctx"
 
 
-def approve_tool(call: dict[str, str]) -> bool:
+def approve_tool(call: dict[str, str], cwd: Path | None = None) -> bool:
     print()
     print("Tool request:")
     if call.get("reason"):
         print(f"  reason: {call['reason']}")
     print(f"  {tool_summary(call)}")
-    if call.get("name") == "patch":
+    preview = tool_approval_diff(call, cwd or Path.cwd())
+    if preview:
         print()
-        for line in call.get("patch", "").splitlines():
+        for line in preview.splitlines():
             if line.startswith("+") and not line.startswith("+++"):
                 print(ansi(line, "32"))
             elif line.startswith("-") and not line.startswith("---"):
@@ -8138,8 +8235,9 @@ class DairackTui:
             return "continue"
 
         self.pending_tool = call
-        if call.get("name") == "patch":
-            self.append_diff(call.get("patch", ""))
+        approval_diff = tool_approval_diff(call, project_scope_for_chat(self.chat, self.cwd))
+        if approval_diff:
+            self.append_diff(approval_diff)
         self.save_current_chat()
         self.app.invalidate()
         return "pending"
@@ -9788,7 +9886,7 @@ def chat_turn(
             messages.append(denied_tool_history_message(call, "by permissions policy"))
             print(f"blocked by permissions: {tool_summary(call)}")
             return
-        if not auto_approved and not approve_tool(call):
+        if not auto_approved and not approve_tool(call, project_root):
             messages.append(denied_tool_history_message(call, "by user"))
             print("denied")
             return

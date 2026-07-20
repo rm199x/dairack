@@ -247,6 +247,60 @@ class PermissionBoundaryTests(unittest.TestCase):
         control = '--- "a/file\\nname.txt"\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n'
         self.assertIn("control character", runtime.unified_patch_error(control))
 
+    def test_exact_edit_applies_checkpoints_and_restores(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "config.py"
+            target.write_text("timeout = 30\nretries = 2\n", encoding="ascii")
+            call = {
+                "name": "edit_file",
+                "path": "config.py",
+                "old_string": "timeout = 30",
+                "new_string": "timeout = 60",
+            }
+            with patch.object(runtime, "CHECKPOINT_DIR", root / ".checkpoints"):
+                code, output = runtime.apply_exact_edit(call, root)
+                self.assertEqual(code, 0, output)
+                self.assertEqual(target.read_text(encoding="ascii"), "timeout = 60\nretries = 2\n")
+                self.assertIn("checkpoint:", output)
+                self.assertIn("+1 -1", output)
+                undo_code, undo_output = runtime.undo_checkpoint("latest")
+            self.assertEqual(undo_code, 0, undo_output)
+            self.assertEqual(target.read_text(encoding="ascii"), "timeout = 30\nretries = 2\n")
+
+    def test_exact_edit_requires_a_unique_match_and_stays_in_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "app.py"
+            target.write_text("x = 1\nx = 1\n", encoding="ascii")
+            ambiguous = {"name": "edit_file", "path": "app.py", "old_string": "x = 1", "new_string": "x = 2"}
+            code, output = runtime.apply_exact_edit(ambiguous, root)
+            self.assertEqual(code, 1)
+            self.assertIn("matches 2 places", output)
+            self.assertEqual(target.read_text(encoding="ascii"), "x = 1\nx = 1\n")
+
+            missing = {"name": "edit_file", "path": "app.py", "old_string": "y = 9", "new_string": "y = 8"}
+            code, output = runtime.apply_exact_edit(missing, root)
+            self.assertEqual(code, 1)
+            self.assertIn("not found", output)
+
+            outside = {"name": "edit_file", "path": "../escape.py", "old_string": "a", "new_string": "b"}
+            (root.parent / "escape.py").write_text("a\n", encoding="ascii")
+            code, output = runtime.apply_exact_edit(outside, root)
+            self.assertEqual(code, 1)
+            self.assertIn("outside the working directory", output)
+            self.assertEqual((root.parent / "escape.py").read_text(encoding="ascii"), "a\n")
+
+    def test_exact_edit_preview_matches_the_pending_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "note.txt").write_text("hello world\n", encoding="ascii")
+            call = {"name": "edit_file", "path": "note.txt", "old_string": "world", "new_string": "dairack"}
+            preview = runtime.tool_approval_diff(call, root)
+            self.assertIn("-hello world", preview)
+            self.assertIn("+hello dairack", preview)
+            self.assertEqual((root / "note.txt").read_text(encoding="ascii"), "hello world\n")
+
     def test_checkpoint_rejects_paths_outside_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"

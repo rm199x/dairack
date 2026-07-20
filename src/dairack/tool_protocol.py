@@ -204,6 +204,35 @@ TOOL_REGISTRY = ToolRegistry(
             risk="write",
         ),
         ToolSpec(
+            "edit_file",
+            "Replace one exact text occurrence in a file. The old text must match exactly once.",
+            {
+                "path": {"type": "string", "description": "File path."},
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact existing text to replace, with enough context to be unique.",
+                },
+                "new_string": {"type": "string", "description": "Replacement text; empty deletes the old text."},
+            },
+            required=("path", "old_string"),
+            aliases=("str_replace", "str_replace_editor", "replace_in_file", "edit"),
+            field_aliases={
+                "old_str": "old_string",
+                "new_str": "new_string",
+                "old": "old_string",
+                "new": "new_string",
+                "find": "old_string",
+                "replace": "new_string",
+                "search": "old_string",
+                "file": "path",
+            },
+            display_name="Edit",
+            activity="Editing file",
+            target_field="path",
+            target_label="PATH",
+            risk="write",
+        ),
+        ToolSpec(
             "read_file",
             "Read a text file, optionally centered around a line number.",
             {

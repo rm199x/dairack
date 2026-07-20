@@ -4950,8 +4950,9 @@ class DairackTextualBase(App[None]):
             self.run_tool_call(call, approved_by="read-auto")
             return "continue"
 
-        if call.get("name") == "patch":
-            self.append_diff(call.get("patch", ""))
+        approval_diff = self.core.tool_approval_diff(call, self.core.project_scope_for_chat(self.chat, self.cwd))
+        if approval_diff:
+            self.append_diff(approval_diff)
         self.save_current_chat()
         self._dispatch(self._show_approval_main, call)
         return "pending"

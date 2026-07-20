@@ -1937,6 +1937,9 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     "model": "qwen3.5:9b",
                     "agent": True,
                     "auto_compact": False,
+                    # This test asserts runtime-event retention across turns, not
+                    # window-eviction behavior; keep the window comfortably large.
+                    "num_ctx": 16384,
                 }
             )
             provider = FailingThenExplainingProvider()
