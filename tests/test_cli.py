@@ -237,9 +237,7 @@ class CliTests(unittest.TestCase):
 
     def test_compute_service_install_uses_a_restartable_foreground_unit(self) -> None:
         unit_path = Path(self.temporary.name) / "dairack-compute.service"
-        options = cli._serve_parser().parse_args(
-            ["--install-service", "--name", "Home Server", "--port", "11435"]
-        )
+        options = cli._serve_parser().parse_args(["--install-service", "--name", "Home Server", "--port", "11435"])
         completed = SimpleNamespace(returncode=0, stdout="", stderr="")
         with (
             patch.object(cli.sys, "platform", "linux"),

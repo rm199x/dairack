@@ -474,7 +474,9 @@ def _run_serve(args: Sequence[str]) -> int:
         upstream = endpoint_policy(options.upstream).endpoint
         OllamaProvider(upstream).version()
         if options.install_service:
-            public_endpoint = _tailscale_serve(options.port) if options.tailscale else f"http://{options.bind}:{options.port}"
+            public_endpoint = (
+                _tailscale_serve(options.port) if options.tailscale else f"http://{options.bind}:{options.port}"
+            )
             _install_compute_service(options, token_file, upstream)
             print("DAIRACK COMPUTE SERVICE\n")
             print(f"  endpoint     {public_endpoint}")

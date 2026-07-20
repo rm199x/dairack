@@ -4339,9 +4339,7 @@ class DairackTextualBase(App[None]):
         self.config["last_chat"] = chat["id"]
         self.core.save_config(self.config)
         with self.lock:
-            self.messages[0]["content"] = self.core.system_prompt(
-                self.cwd, bool(self.config.get("agent")), self.config
-            )
+            self.messages[0]["content"] = self.core.system_prompt(self.cwd, bool(self.config.get("agent")), self.config)
             self.blocks.append({"role": "system", "text": f"resumed chat: {self.chat['title']}"})
         self.save_current_chat()
         self._history = [
