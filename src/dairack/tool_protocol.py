@@ -456,14 +456,36 @@ def _repair_windows_path_json(candidate: str) -> str:
     return "".join(parts)
 
 
+_DRIVE_ANCHORED_CONTROL = re.compile(r"([A-Za-z]:[\w\\ .()\-]*)([\b\f\n\r\t])")
+
+
+def _restore_drive_anchored_controls(value: str) -> str:
+    """Restore control characters that continue a drive-letter path inside any string value.
+
+    `dir C:\\new` parses as valid JSON with a newline in the middle of the path; a control
+    character directly continuing a `C:`-anchored path run cannot be intentional. Controls
+    outside a path run — such as real newlines between shell statements — are preserved.
+    """
+    while True:
+        replaced = _DRIVE_ANCHORED_CONTROL.sub(
+            lambda match: match.group(1) + _WINDOWS_PATH_CONTROLS[match.group(2)],
+            value,
+        )
+        if replaced == value:
+            return value
+        value = replaced
+
+
 def _restore_windows_path_controls(value: Any, field_name: str = "") -> Any:
     """Undo JSON control escapes that cannot be literal characters in a Windows path."""
     if isinstance(value, Mapping):
         return {key: _restore_windows_path_controls(item, str(key)) for key, item in value.items()}
     if isinstance(value, list):
         return [_restore_windows_path_controls(item) for item in value]
-    if not isinstance(value, str) or field_name.lower() not in _WINDOWS_PATH_FIELDS:
+    if not isinstance(value, str):
         return value
+    if field_name.lower() not in _WINDOWS_PATH_FIELDS:
+        return _restore_drive_anchored_controls(value)
     drive_path = len(value) >= 3 and value[0].isalpha() and value[1] == ":"
     rooted_path = value.startswith("\\")
     if not drive_path and not rooted_path:
@@ -484,6 +506,15 @@ def _loads_tool_json(candidate: str) -> Any:
         if repaired != candidate:
             try:
                 return _restore_windows_path_controls(json.loads(repaired))
+            except ValueError:
+                pass
+        # Last resort for invalid JSON only: re-escape every lone backslash. This cannot
+        # corrupt a valid payload (those parsed above) and recovers Windows paths inside
+        # non-path fields such as shell commands.
+        blanket = re.sub(r'\\(?!["\\/])', r"\\\\", candidate)
+        if blanket != candidate:
+            try:
+                return _restore_windows_path_controls(json.loads(blanket))
             except ValueError:
                 raise exc from None
         raise

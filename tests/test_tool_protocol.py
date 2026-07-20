@@ -192,6 +192,38 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertFalse(error)
         self.assertEqual(call["cmd"], "printf 'a\nb'")
 
+    def test_windows_paths_recover_inside_command_fields(self) -> None:
+        # Invalid escapes in a non-path field fall back to blanket re-escaping, which only
+        # runs on JSON that already failed to parse and so cannot corrupt a valid payload.
+        call, error, recognized = decode_text_tool_call(
+            r'<tool name="shell">{"cmd": "dir C:\Users\example\Documents"}</tool>'
+        )
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(call["cmd"], r"dir C:\Users\example\Documents")
+
+        # Valid-JSON control escapes that continue a drive-anchored path run are restored
+        # to the separators the model meant.
+        call, error, recognized = decode_text_tool_call(r'<tool name="shell">{"cmd": "dir C:\new\builds"}</tool>')
+        self.assertFalse(error)
+        self.assertEqual(call["cmd"], r"dir C:\new\builds")
+
+        # Real newlines between shell statements are not path fragments and stay intact.
+        call, error, recognized = decode_text_tool_call('<tool name="shell">{"cmd": "echo one\\necho two"}</tool>')
+        self.assertFalse(error)
+        self.assertEqual(call["cmd"], "echo one\necho two")
+
+    def test_tool_name_envelope_with_attribute_body_decodes(self) -> None:
+        # Observed on a Windows client: the tool name used as the envelope tag with
+        # attribute-style arguments in the body.
+        payload = '<search_project>query="LOCKOUT" filetype=".uproject"</search_project>'
+        call, error, recognized = decode_text_tool_call(payload)
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(call["name"], "search_project")
+        self.assertEqual(call["query"], "LOCKOUT")
+        self.assertEqual(strip_tool_protocol(payload), "")
+
     def test_near_miss_markup_never_reaches_visible_text(self) -> None:
         prose = 'However, there is a hidden folder:\n<list_dir(path="C:\\Users\\example\\.hidden")>'
         self.assertEqual(strip_tool_protocol(prose), "However, there is a hidden folder:")
