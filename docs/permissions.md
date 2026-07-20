@@ -1,33 +1,71 @@
 # Permissions
 
-Agent mode lets a model request typed tools. It does not grant an action by itself. The permission policy decides
-whether the request is blocked, shown for approval, or eligible for narrow automatic execution.
+<p align="center">
+  <a href="../README.md">Overview</a> &nbsp;&middot;&nbsp;
+  <a href="README.md">Documentation</a> &nbsp;&middot;&nbsp;
+  <a href="installation.md">Installation</a> &nbsp;&middot;&nbsp;
+  <a href="models.md">Models</a>
+</p>
 
-| Mode | Behavior |
+Agent mode allows a model to request typed tools. It grants no authority by itself. The permission policy decides
+whether each request is blocked, shown for approval, or eligible for narrow automatic execution.
+
+## Policy
+
+| Mode | Model-requested actions |
 | --- | --- |
-| `ask` | Prompt for every model-requested tool action. This is the default. |
-| `read-auto` | Auto-run project reads and safe status commands. Ask for writes, shell, external paths, and network. |
-| `deny` | Block model-requested tools. Direct slash commands entered by the user remain available. |
+| `ask` | Show every tool action for approval. This is the default. |
+| `read-auto` | Run project reads and safe machine-status checks automatically; ask for everything else. |
+| `deny` | Block tool actions. Direct slash commands entered by the user remain available. |
 
-Coordinator-internal text-only specialist consultation is bounded model inference rather than a client tool action,
-so it remains available in `deny` mode and does not require approval. Image handoffs read the file on the client and
-therefore follow path and permission checks before inference.
+| Request | `ask` | `read-auto` | `deny` |
+| --- | --- | --- | --- |
+| Active-project read | Approval | Automatic | Blocked |
+| Allowlisted machine status | Approval | Automatic | Blocked |
+| External-path read | Approval | Approval | Blocked |
+| Shell, patch, or package action | Approval | Approval | Blocked |
+| Web search or page read | Approval | Approval | Blocked |
 
-Approval is per request. A shell approval authorizes exactly the displayed command, but the command runs through the
-user's shell and has that user's OS privileges. The default TUI suspends its composer and opens an attached terminal
-for commands that need direct TTY input, so password prompts cannot overlap the Dairack input field. Non-interactive
-runtimes block those commands; `sudo -n` remains available when credentials are already cached.
+> Dairack is an approval boundary, not an operating-system sandbox. An approved shell command runs with the invoking
+> user's privileges and network access.
 
-While work is active, `Esc` is offered only when the implementation has a real cancellation path. Shell process trees,
-project indexing and search, model inference, and streamed network reads are cancellable. Patch application and short
-atomic maintenance operations finish without a misleading stop affordance.
+## Approval
 
-Patch requests display additions and removals, perform a dry run, validate target paths, and create a checkpoint before
-application. Checkpoints are recovery aids, not a substitute for version control.
+Approval is scoped to the exact displayed request. A shell approval authorizes that command once; it does not grant a
+model unrestricted terminal access. Actions show their type, target, authority, result, exit status, and elapsed time.
 
-Web search terms and fetched URLs leave the machine. They always require approval when initiated by a model, including
-under `read-auto`, because query strings can carry local information.
+Commands that require direct terminal input temporarily use the attached terminal, keeping operating-system password
+prompts outside the Dairack composer. Non-interactive runtimes block those commands. `sudo -n` remains available when
+credentials are already cached.
 
-Automatic machine-status commands are parsed into a command-specific argv allowlist and revalidated immediately before
-execution. They do not run through a shell. Any unsupported option, file argument, command composition, or executable
-path falls back to explicit approval.
+Text-only Coordinator consultation is bounded model inference rather than a client tool action, so it remains available
+under `deny`. Image handoffs read a client file and therefore pass normal path and permission checks before inference.
+
+## Cancellation
+
+<kbd>Esc</kbd> appears as a stop control only when the active operation has a real cancellation path. Model inference,
+shell process trees, project indexing and search, and streamed network reads are cancellable. Patch application and
+short atomic maintenance operations finish with `FINISHING SAFELY` instead of offering a stop control that cannot work.
+
+## Patches and Checkpoints
+
+Patch requests display additions and removals, validate every target against the active project, perform a dry run, and
+create a checkpoint before application. Checkpoints aid recovery; they are not a substitute for version control.
+
+## Network Access
+
+Search terms, URLs, retrieved pages, and any local details included in them leave the machine. Model-requested web
+search and page reads always require approval, including under `read-auto`.
+
+Dairack validates public HTTP and HTTPS destinations, revalidates redirects, applies time and size limits, and extracts
+readable text without executing page scripts. Those controls reduce exposure but do not make untrusted content safe.
+
+## Read-Auto Boundary
+
+Automatic machine-status commands are parsed into a command-specific argument allowlist and revalidated immediately
+before execution. They do not run through a shell. Unsupported options, file arguments, composed commands, or unknown
+executable paths fall back to explicit approval.
+
+Project reads are limited to the active workspace and structured Dairack tools. Arbitrary shell-based reads and paths
+outside that workspace remain approval-gated. See the full [Security Policy](../SECURITY.md) for trust and disclosure
+guidance.

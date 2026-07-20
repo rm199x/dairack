@@ -1,6 +1,13 @@
 # Changelog
 
-All notable changes are documented here. The project follows semantic versioning after the 1.0 release.
+<p align="center">
+  <a href="README.md">Overview</a> &nbsp;&middot;&nbsp;
+  <a href="docs/README.md">Documentation</a> &nbsp;&middot;&nbsp;
+  <a href="docs/release-checklist.md">Release Checklist</a>
+</p>
+
+Notable user-visible changes are recorded here. Pre-1.0 work remains under `Unreleased`; versioned releases will follow
+semantic versioning after 1.0.
 
 ## [Unreleased]
 

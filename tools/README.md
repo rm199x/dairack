@@ -1,35 +1,52 @@
 # Coordinator Lab
 
-This directory contains development and release-validation tooling. It is not
-included in the Dairack wheel and never runs during a chat.
+<p align="center">
+  <a href="../README.md">Overview</a> &nbsp;&middot;&nbsp;
+  <a href="../docs/README.md">Documentation</a> &nbsp;&middot;&nbsp;
+  <a href="../ARCHITECTURE.md">Architecture</a> &nbsp;&middot;&nbsp;
+  <a href="../CONTRIBUTING.md">Contributing</a>
+</p>
 
-Run from the repository root with the project environment active:
+The Coordinator lab is repository-only development and release tooling. It does not ship in the Dairack wheel, run
+during a chat, or execute agent tools.
+
+## Run the Lab
+
+Use the project environment from the repository root:
 
 ```bash
 .venv/bin/python tools/coordinator_lab.py --profile quick
 .venv/bin/python tools/coordinator_lab.py --profile semantic
 .venv/bin/python tools/coordinator_lab.py --profile full
+```
+
+| Profile | Work performed | Model inference |
+| --- | --- | --- |
+| `quick` | 1,116 unique deterministic routing cases | No |
+| `semantic` | Curated semantic archetypes with cached classifier responses | Bounded |
+| `full` | Semantic archetypes plus prompt variants | Explicit budget |
+
+Runs use a reproducible cold model pool regardless of what Ollama currently has loaded. Add
+`--resident-model MODEL` more than once when a controlled warm-state sensitivity check is part of the experiment.
+
+## Scenario Data
+
+The checked-in dataset lives at `tools/data/coordinator-scenarios.json`. Supply another JSON dataset with `--dataset`.
+Keep every paraphrase in the same family as its source archetype so grouped validation folds cannot leak related
+examples into both training and evaluation.
+
+The harness calls Coordinator route selection only. It cannot execute shell, file, patch, web, package-management, or
+other client tools.
+
+## Bounded Optimization
+
+```bash
 .venv/bin/python tools/coordinator_lab.py --profile semantic --optimize --candidates 96
 ```
 
-Profiles are deliberately bounded:
+The optimizer searches five bounded, interpretable policy parameters. It uses scenario-family leave-one-out
+validation, regularizes toward the checked-in baseline, and rejects hard safety or modality regressions. A candidate is
+reported for review and never applied automatically.
 
-- `quick` runs 1,116 unique deterministic cases without model inference.
-- `semantic` runs the curated archetypes and caches classifier responses.
-- `full` adds semantic prompt variants under an explicit inference budget.
-
-The optimizer searches five bounded, interpretable policy parameters. It uses
-scenario-family leave-one-out validation, rejects hard safety or modality
-regressions, regularizes toward the checked-in baseline, and never applies a
-candidate automatically.
-
-Scenario data lives in `tools/data/coordinator-scenarios.json`. External JSON
-datasets can be supplied with `--dataset`. Keep paraphrases in the same family
-as their source archetype so they cannot leak across grouped validation folds.
-
-The harness only calls coordinator route selection. It does not execute shell,
-file, patch, web, or package-management tools.
-
-Runs use a reproducible cold model pool by default, regardless of what Ollama
-happens to have loaded. Use `--resident-model MODEL` (repeatable) to run an
-explicit warm-state sensitivity check without changing production policy.
+Tuning changes should include grouped holdout results, per-role movement, and explicit confirmation that safety and
+modality gates did not regress.

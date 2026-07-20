@@ -201,5 +201,5 @@ python -m pytest
 python -m build
 ```
 
-Read [Architecture](ARCHITECTURE.md) for module boundaries, [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a
-change, and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+Use the [documentation index](docs/README.md) for installation, model, permission, architecture, security, contribution,
+and release references.

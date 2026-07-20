@@ -1,38 +1,76 @@
 # Installation
 
-## Recommended Tool Installers
+<p align="center">
+  <a href="../README.md">Overview</a> &nbsp;&middot;&nbsp;
+  <a href="README.md">Documentation</a> &nbsp;&middot;&nbsp;
+  <a href="models.md">Models</a> &nbsp;&middot;&nbsp;
+  <a href="permissions.md">Permissions</a>
+</p>
 
-Install from a checkout with either isolated Python tool manager:
+The same Dairack package supports a local workstation, a remote-compute client, and an Ollama model server. The client
+always owns the interface, project files, actions, approvals, and conversation state.
+
+## Choose a Setup
+
+| Setup | Dairack | Inference | Best for |
+| --- | --- | --- | --- |
+| **Local** | One machine | Local Ollama | The shortest path and fully local operation |
+| **Remote compute** | Client and server | Trusted Dairack server | Using server hardware from another computer |
+| **Direct Ollama** | Client only | Existing HTTPS Ollama endpoint | Advanced deployments with their own secure proxy |
+
+## Install
+
+Dairack requires Python 3.11 or newer. Install it with an isolated Python tool manager:
 
 ```bash
-uv tool install .
+uv tool install git+https://github.com/rm199x/dairack.git
 # or
-pipx install .
+pipx install git+https://github.com/rm199x/dairack.git
 ```
 
-Then run the consumer setup flow against the local Ollama service:
+Then initialize the active compute endpoint and verify the environment:
 
 ```bash
 dairack setup
 dairack doctor
+dairack
 ```
 
-## Client And Compute Server
+Ollama must already be installed locally or reachable through a configured Dairack compute server. Setup presents a
+model plan before any multi-gigabyte download begins.
 
-Install the same Dairack package on both machines. The server does not need a separate edition or daemon package.
+<details>
+<summary>Install from a cloned checkout</summary>
 
-On the machine with Ollama and the models:
+```bash
+git clone https://github.com/rm199x/dairack.git
+cd dairack
+./scripts/install.sh
+dairack setup
+dairack doctor
+```
+
+The installer selects `uv`, `pipx`, or an isolated user virtual environment in that order. Set `DAIRACK_BIN_DIR` to
+choose the fallback command directory and `DAIRACK_VENV` to choose its environment path. It never installs packages
+into the system Python interpreter or invokes `sudo`.
+
+</details>
+
+## Remote Compute
+
+Install Dairack on both machines. The server does not need a separate edition or unrestricted remote access.
+
+**On the machine with Ollama and the models**
 
 ```bash
 dairack serve --tailscale --name "Home Server"
 ```
 
-`dairack serve` binds to `127.0.0.1:11435`, creates a private bearer token, validates local Ollama, and exposes only a
-strict model API allowlist plus read-only hardware metadata. `--tailscale` configures Tailscale Serve to publish that
-loopback port over tailnet HTTPS. Keep the foreground process running, or place this command under the operating
-system's user service manager when it should start at login or boot.
+The bridge binds to `127.0.0.1:11435`, creates a private bearer token, checks local Ollama, and exposes only the model
+API operations Dairack needs plus read-only hardware metadata. `--tailscale` publishes that loopback service over
+tailnet HTTPS. Keep the process running or place it under the operating system's user service manager.
 
-On each client machine:
+**On each client**
 
 ```bash
 dairack connect https://server-name.tailnet-name.ts.net
@@ -40,51 +78,47 @@ dairack doctor
 dairack
 ```
 
-Enter the token shown by the server. It is stored separately with private file permissions. For scripts, pass it
-without placing it in command history:
+Enter the token printed by the server. Dairack stores it separately with private file permissions. For scripts, pass
+the token through standard input instead of command history:
 
 ```bash
 printf '%s\n' "$DAIRACK_PAIR_TOKEN" | dairack connect https://server.example --token-stdin
 ```
 
-Connection lifecycle commands:
+| Command | Purpose |
+| --- | --- |
+| `dairack connect` | Inspect and test the active endpoint |
+| `dairack connect local` | Return to local Ollama |
+| `dairack connect remote` | Restore the last saved server |
+| `dairack connect test --json` | Print machine-readable health and hardware data |
+
+The compute server receives prompts, selected context, approved tool results, retrieved text, and attached images used
+for inference. It receives no Dairack shell, project-filesystem, chat, index, approval, or checkpoint API. See
+[Security](../SECURITY.md#remote-compute-boundary) before using a server outside a trusted tailnet.
+
+<details>
+<summary>Connect to an existing Ollama endpoint</summary>
+
+An existing Ollama HTTPS reverse proxy can be connected directly. Without the Dairack bridge, server hardware cannot
+be verified, so Dairack leaves backend placement and batching automatic and uses a conservative context profile.
 
 ```bash
-dairack connect                 # inspect and test the active endpoint
-dairack connect local           # use local Ollama
-dairack connect remote          # restore the last saved server
-dairack connect test --json     # machine-readable health and hardware report
+dairack connect https://ollama.example
 ```
 
-An existing Ollama HTTPS reverse proxy can be connected directly. Plain remote Ollama does not provide bridge hardware
-identity, so Dairack leaves backend execution knobs automatic and uses a conservative context profile. Generic HTTP is
-rejected by default; `--allow-http` exists only for a deliberately trusted private network. Never expose unauthenticated
-Ollama directly to the public internet.
+Generic HTTP is rejected by default. `--allow-http` exists for deliberately trusted private networks only. Never expose
+an unauthenticated Ollama endpoint to the public internet.
 
-The client owns the working directory and every action. The compute server sees model request content, including
-prompts, selected conversation context, approved tool results, and attached image bytes, but it receives no general
-filesystem or shell endpoint from Dairack.
+</details>
 
-## Convenience Installer
+## Windows
 
-`scripts/install.sh` selects `uv`, `pipx`, or an isolated user virtual environment in that order. Set `DAIRACK_BIN_DIR`
-to choose the fallback command directory and `DAIRACK_VENV` to choose its environment path.
-
-```bash
-./scripts/install.sh
-```
-
-On Debian-derived systems, the fallback requires the package providing `venv` for the active Python version. The
-installer reports the needed action rather than invoking `sudo`.
-
-## Windows PowerShell
-
-The Windows installer uses `uv`, then `pipx`, then an isolated per-user virtual environment. It does not require
-administrator privileges. The fallback adds only that environment's `Scripts` directory to the user PATH.
-Private state relies on the ACL inherited from the current user's profile directories; POSIX `0600`/`0700` mode bits
-do not provide an additional Windows access-control boundary.
+The PowerShell installer uses `uv`, then `pipx`, then an isolated per-user virtual environment. It does not require
+administrator privileges and adds only the fallback environment's `Scripts` directory to the user `PATH`.
 
 ```powershell
+git clone https://github.com/rm199x/dairack.git
+Set-Location dairack
 Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\install.ps1
 dairack setup
@@ -92,14 +126,12 @@ dairack doctor
 dairack
 ```
 
-Ollama must be installed and running separately. Git for Windows provides the edit backend used by agent patches.
-The terminal UI, model API, chats, and indexing are native Python; shell actions use the Windows command processor,
-with PowerShell invoked explicitly when needed.
+Ollama must be installed and running separately. Git for Windows supplies the patch backend used for agent edits.
+Private state relies on the ACL inherited from the current user's profile directories.
 
-## Non-Interactive Setup
+## Managed Setup
 
-Setup never downloads multi-gigabyte models without displaying a plan. For managed installs, choose an optional
-profile or an arbitrary model explicitly:
+For non-interactive provisioning, select a recommended profile or an explicit model:
 
 ```bash
 dairack setup --profile balanced --yes
@@ -107,8 +139,8 @@ dairack setup --model qwen3.5:9b --yes
 dairack setup --profile manual
 ```
 
-`minimal`, `balanced`, and `complete` are recommendations, not compatibility modes. `--no-pull` previews and stores
-settings without downloading.
+`minimal`, `balanced`, and `complete` are recommendations rather than compatibility modes. `--no-pull` records and
+previews settings without downloading a model.
 
 ## Development Install
 
@@ -118,7 +150,7 @@ python3 -m venv .venv
 python -m pip install -e '.[dev]'
 ```
 
-Do not point an editable development install at a production state tree when testing migrations. Use:
+Use an isolated state tree while testing migrations or destructive setup paths:
 
 ```bash
 DAIRACK_HOME="$(mktemp -d)" dairack setup --profile manual
@@ -126,15 +158,16 @@ DAIRACK_HOME="$(mktemp -d)" dairack setup --profile manual
 
 ## Release Channel
 
-Dairack does not guess a project identity. A distributor must own and configure an HTTPS manifest or PyPI JSON URL:
+Source installs do not assume a package or release owner. A distributor can configure an HTTPS manifest or PyPI JSON
+endpoint explicitly:
 
 ```bash
 dairack update channel https://example.org/dairack/releases.json
 ```
 
-The selected endpoint and cache interval are stored in normal configuration. `DAIRACK_UPDATE_INDEX_URL` can seed a
-new configuration during managed provisioning. Run `dairack update channel off` to disable checks. Application updates
-do not modify Ollama models, chats, indexes, profiles, or checkpoints.
-Plain HTTP is accepted only for a loopback release endpoint during local development. Update installation honors the
-package index configured for the owning `uv`, `pipx`, or Python environment; review that environment when using a
-private package mirror.
+`DAIRACK_UPDATE_INDEX_URL` can seed a new configuration during managed provisioning. Use
+`dairack update channel off` to disable checks. Release metadata can provide a version and notes URL, but it cannot
+provide an executable install command; Dairack constructs that command for the environment that owns the installation.
+
+Plain HTTP is accepted only for a loopback endpoint during development. Updating Dairack does not modify Ollama models,
+chats, indexes, profiles, or checkpoints.

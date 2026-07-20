@@ -46,7 +46,7 @@ dairack = "dairack.cli:main"
 Homepage = "https://github.com/rm199x/dairack"
 Repository = "https://github.com/rm199x/dairack.git"
 Issues = "https://github.com/rm199x/dairack/issues"
-Documentation = "https://github.com/rm199x/dairack#readme"
+Documentation = "https://github.com/rm199x/dairack/blob/main/docs/README.md"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
