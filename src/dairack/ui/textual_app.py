@@ -4676,32 +4676,56 @@ class DairackTextualBase(App[None]):
                 self._executor_stats = dict(getattr(self.provider, "last_stats", {}) or {})
                 self._last_turn_stats = dict(self._executor_stats)
                 self.save_current_chat()
-                action_requirement = self.core.action_contract_directive(route, retry=True)
-                if (
-                    not call
-                    and not parse_error
-                    and not finalizing
-                    and bool(self.config.get("agent"))
-                    and self._agent_steps_used == 0
-                    and action_requirement
-                    and not action_contract_repair_attempted
-                ):
-                    action_contract_repair_attempted = True
-                    if self.messages and self.messages[-1].get("role") == "assistant":
-                        self.messages.pop()
-                    self._route_action_feedback = action_requirement
-                    repairing_action = True
-                    self.replace_last_assistant_text("")
-                    self.set_busy(True, "preparing requested action")
-                    self.save_current_chat()
-                    continue
                 incomplete_reason = ""
                 if not call and not parse_error:
                     incomplete_reason = self.core.response_incomplete_reason(
                         assistant_text,
                         self._executor_stats,
                     )
-                if incomplete_reason and not completion_repair_attempted:
+                agent_enabled = bool(self.config.get("agent"))
+                contract = route.get("action_contract")
+                state = self.core.TurnState(
+                    action_limit=action_limit,
+                    action_steps=self._agent_steps_used,
+                    synthesis_attempts=synthesis_attempts,
+                    review_rounds=self._route_review_rounds,
+                    contract_repair_attempted=action_contract_repair_attempted,
+                    completion_repair_attempted=completion_repair_attempted,
+                    parse_repair_attempted=action_repair_attempted,
+                    action_completion_repairs=action_completion_repairs,
+                )
+                facts = self.core.ResponseFacts(
+                    has_call=bool(call),
+                    parse_error=parse_error or "",
+                    incomplete_reason=incomplete_reason,
+                    response_blank=not assistant_text.strip(),
+                )
+                route_facts = self.core.RouteFacts(
+                    has_reviewer=bool(route.get("reviewer")) and bool(assistant_text.strip()),
+                    action_requirement=(
+                        (self.core.action_contract_directive(route, retry=True) or "") if agent_enabled else ""
+                    ),
+                    contract_capability=bool(
+                        agent_enabled and isinstance(contract, dict) and contract.get("capability")
+                    ),
+                )
+                if completion_repair_attempted and not incomplete_reason and not call and not parse_error:
+                    retry_record = route.get("completion_retry")
+                    if isinstance(retry_record, dict):
+                        retry_record["recovered"] = True
+                action = self.core.next_action(state, facts, route_facts, finalizing)
+
+                if action is self.core.TurnAction.REPAIR_CONTRACT:
+                    action_contract_repair_attempted = True
+                    if self.messages and self.messages[-1].get("role") == "assistant":
+                        self.messages.pop()
+                    self._route_action_feedback = route_facts.action_requirement
+                    repairing_action = True
+                    self.replace_last_assistant_text("")
+                    self.set_busy(True, "preparing requested action")
+                    self.save_current_chat()
+                    continue
+                if action is self.core.TurnAction.RETRY_COMPLETION:
                     completion_repair_attempted = True
                     if self.messages and self.messages[-1].get("role") == "assistant":
                         self.messages.pop()
@@ -4715,27 +4739,13 @@ class DairackTextualBase(App[None]):
                     self.set_busy(True, f"completing / {executor}")
                     self.save_current_chat()
                     continue
-                if completion_repair_attempted and not incomplete_reason and not call and not parse_error:
-                    retry_record = route.get("completion_retry")
-                    if isinstance(retry_record, dict):
-                        retry_record["recovered"] = True
-                if incomplete_reason and not finalizing:
+                if action is self.core.TurnAction.STOP_INCOMPLETE:
                     self.append_system(
                         "Response remained structurally incomplete after one retry.\n" + incomplete_reason
                     )
                     self.save_current_chat()
                     return
-                contract = route.get("action_contract")
-                if (
-                    not call
-                    and not parse_error
-                    and not incomplete_reason
-                    and not finalizing
-                    and bool(self.config.get("agent"))
-                    and self._agent_steps_used > 0
-                    and isinstance(contract, dict)
-                    and contract.get("capability")
-                ):
+                if action is self.core.TurnAction.CHECK_COMPLETION:
                     self.set_busy(True, "verifying action result")
                     try:
                         completion = self.core.assess_action_completion(
@@ -4750,13 +4760,14 @@ class DairackTextualBase(App[None]):
                         completion = {"error": str(exc)}
                     if completion:
                         route["action_completion"] = completion
-                    enforce_completion = (
+                    enforce_completion = bool(
                         completion
                         and not completion.get("error")
                         and not completion.get("complete")
                         and float(completion.get("confidence") or 0) >= 0.65
                     )
-                    if enforce_completion and action_completion_repairs < 2:
+                    outcome = self.core.completion_arbiter_outcome(state, enforce_completion)
+                    if outcome is self.core.CompletionOutcome.REPAIR:
                         action_completion_repairs += 1
                         if self.messages and self.messages[-1].get("role") == "assistant":
                             self.messages.pop()
@@ -4766,60 +4777,61 @@ class DairackTextualBase(App[None]):
                         self.set_busy(True, "continuing requested action")
                         self.save_current_chat()
                         continue
-                    if enforce_completion:
+                    if outcome is self.core.CompletionOutcome.STOP:
                         reason = str(completion.get("reason") or "completion could not be verified")
                         self.replace_last_assistant_text("The requested action did not complete.")
                         self.append_error(f"Agent stopped after two completion corrections.\n{reason}")
                         self.save_current_chat()
                         return
-                if finalizing:
-                    invalid_final = bool(call or parse_error or incomplete_reason or not assistant_text.strip())
-                    if invalid_final and synthesis_attempts < 2:
-                        if call:
-                            self.messages.append(
-                                self.core.denied_tool_history_message(
-                                    call,
-                                    "because the task action budget is exhausted",
-                                )
+                    action = self.core.next_action(state, facts, route_facts, finalizing, completion_checked=True)
+                if action is self.core.TurnAction.SYNTHESIZE_RETRY:
+                    if call:
+                        self.messages.append(
+                            self.core.denied_tool_history_message(
+                                call,
+                                "because the task action budget is exhausted",
                             )
-                        else:
-                            self.messages.append(
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "Tool actions are unavailable for this task now. Return a concise final "
-                                        "answer using the action results already present."
-                                    ),
-                                }
-                            )
-                        repairing_action = True
-                        self.replace_last_assistant_text("Concluding from collected evidence...")
-                        self.set_busy(True, f"synthesizing / {executor}")
-                        self.save_current_chat()
-                        continue
-                    if invalid_final:
-                        self.append_system(
-                            "Task action budget reached; the executor did not return a usable final synthesis. "
-                            "All action results remain in this chat."
                         )
-                        self.save_current_chat()
-                    return
-                if parse_error:
-                    if not action_repair_attempted:
-                        action_repair_attempted = True
-                        repairing_action = True
+                    else:
                         self.messages.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    "Action request rejected by the runtime: "
-                                    f"{parse_error}. Return exactly one corrected tool request and no other text."
+                                    "Tool actions are unavailable for this task now. Return a concise final "
+                                    "answer using the action results already present."
                                 ),
                             }
                         )
-                        self.set_busy(True, "correcting action request")
-                        self.save_current_chat()
-                        continue
+                    repairing_action = True
+                    self.replace_last_assistant_text("Concluding from collected evidence...")
+                    self.set_busy(True, f"synthesizing / {executor}")
+                    self.save_current_chat()
+                    continue
+                if action is self.core.TurnAction.FINALIZE_FAIL:
+                    self.append_system(
+                        "Task action budget reached; the executor did not return a usable final synthesis. "
+                        "All action results remain in this chat."
+                    )
+                    self.save_current_chat()
+                    return
+                if action is self.core.TurnAction.FINALIZE_DELIVER:
+                    return
+                if action is self.core.TurnAction.REPAIR_PARSE:
+                    action_repair_attempted = True
+                    repairing_action = True
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Action request rejected by the runtime: "
+                                f"{parse_error}. Return exactly one corrected tool request and no other text."
+                            ),
+                        }
+                    )
+                    self.set_busy(True, "correcting action request")
+                    self.save_current_chat()
+                    continue
+                if action is self.core.TurnAction.BLOCK_PARSE:
                     route["action_parse_error"] = parse_error
                     self.replace_last_assistant_text(
                         "I could not format that action correctly, so nothing was run. Rephrasing the request may help."
@@ -4846,67 +4858,72 @@ class DairackTextualBase(App[None]):
                     )
                     self.save_current_chat()
                     return
-                if not call:
+                if action is self.core.TurnAction.REVIEW:
                     reviewer = str(route.get("reviewer") or "")
-                    if reviewer and self._route_review_rounds < 2 and assistant_text.strip():
-                        self._route_review_rounds += 1
-                        review_round = self._route_review_rounds
-                        if review_round == 1:
-                            self._route_original_answer = assistant_text
-                        self.set_busy(True, f"reviewing / {reviewer}")
-                        review_started = time.monotonic()
-                        try:
-                            review = self.core.orchestrator_review(
-                                self.provider,
-                                route,
-                                self.messages,
-                                assistant_text,
-                                self.config,
-                                self.cancel_event,
-                            )
-                        except Exception as exc:
-                            review = {"verdict": "error", "feedback": "", "error": str(exc)}
-                        timings = route.setdefault("timings", {})
-                        timings["review"] = round(
-                            float(timings.get("review") or 0) + time.monotonic() - review_started, 3
+                    self._route_review_rounds += 1
+                    state.review_rounds = self._route_review_rounds
+                    review_round = self._route_review_rounds
+                    if review_round == 1:
+                        self._route_original_answer = assistant_text
+                    self.set_busy(True, f"reviewing / {reviewer}")
+                    review_started = time.monotonic()
+                    try:
+                        review = self.core.orchestrator_review(
+                            self.provider,
+                            route,
+                            self.messages,
+                            assistant_text,
+                            self.config,
+                            self.cancel_event,
                         )
-                        review["round"] = review_round
-                        route["review"] = review
-                        if review.get("verdict") in {"pass", "revise"}:
-                            self.core.observe_route_outcome(
-                                self.config,
-                                route,
-                                1.0 if review["verdict"] == "pass" else -1.0,
-                                weight=0.75,
-                                source="independent-review",
-                            )
-                        self.chat["last_route"] = route
-                        if self.cancel_event.is_set():
-                            self.append_system("Quality review interrupted; retained the completed response.")
-                            self.save_current_chat()
-                            return
-                        if review.get("verdict") == "revise" and review.get("feedback"):
-                            if review_round >= 2:
-                                review["unresolved"] = True
-                                self.append_system(
-                                    "Independent review still requests changes after one revision; "
-                                    "kept the revised answer. Details are available with /route."
-                                )
-                                self.save_current_chat()
-                                return
-                            if self.messages and self.messages[-1].get("role") == "assistant":
-                                self.messages.pop()
-                            self._route_feedback = str(review["feedback"])
-                            self.append_system("Independent review requested corrections; revising.")
-                            self.set_busy(True, f"revising / {executor}")
-                            continue
-                        if review_round >= 2 and review.get("verdict") == "pass":
-                            retry_record = route.get("review")
-                            if isinstance(retry_record, dict):
-                                retry_record["revision_confirmed"] = True
+                    except Exception as exc:
+                        review = {"verdict": "error", "feedback": "", "error": str(exc)}
+                    timings = route.setdefault("timings", {})
+                    timings["review"] = round(float(timings.get("review") or 0) + time.monotonic() - review_started, 3)
+                    review["round"] = review_round
+                    route["review"] = review
+                    if review.get("verdict") in {"pass", "revise"}:
+                        self.core.observe_route_outcome(
+                            self.config,
+                            route,
+                            1.0 if review["verdict"] == "pass" else -1.0,
+                            weight=0.75,
+                            source="independent-review",
+                        )
+                    self.chat["last_route"] = route
+                    if self.cancel_event.is_set():
+                        self.append_system("Quality review interrupted; retained the completed response.")
                         self.save_current_chat()
+                        return
+                    review_result = self.core.review_outcome(
+                        state,
+                        str(review.get("verdict") or ""),
+                        bool(review.get("feedback")),
+                    )
+                    if review_result is self.core.ReviewOutcome.REVISE:
+                        if self.messages and self.messages[-1].get("role") == "assistant":
+                            self.messages.pop()
+                        self._route_feedback = str(review["feedback"])
+                        self.append_system("Independent review requested corrections; revising.")
+                        self.set_busy(True, f"revising / {executor}")
+                        continue
+                    if review_result is self.core.ReviewOutcome.UNRESOLVED:
+                        review["unresolved"] = True
+                        self.append_system(
+                            "Independent review still requests changes after one revision; "
+                            "kept the revised answer. Details are available with /route."
+                        )
+                        self.save_current_chat()
+                        return
+                    if review_round >= 2 and review.get("verdict") == "pass":
+                        retry_record = route.get("review")
+                        if isinstance(retry_record, dict):
+                            retry_record["revision_confirmed"] = True
+                    self.save_current_chat()
                     return
-                if not self.config.get("agent"):
+                if action is self.core.TurnAction.DELIVER:
+                    return
+                if not agent_enabled:
                     self.append_system(
                         "Agent mode is off. Enable it with /agent on before approving model-requested actions."
                     )
