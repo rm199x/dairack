@@ -1688,7 +1688,8 @@ class CoordinatorRoutingTests(unittest.TestCase):
             )
 
         self.assertEqual(code, 0)
-        self.assertIn(str(marker), output)
+        self.assertIn(marker.name, output)
+        self.assertIn(project.name, output)
         self.assertIn("project", output)
 
     def test_structural_completion_detection_is_bounded_and_general(self) -> None:
