@@ -170,6 +170,7 @@ COMMAND_DESCRIPTIONS = {
     "/orchestrator": "Alias for /coordinator",
     "/route": "Inspect the coordinator's last decision",
     "/compute": "Inspect or change the model compute server",
+    "/hardware": "Distinguish client and compute hardware",
     "/image": "Attach visual input to the next prompt",
     "/images": "Inspect staged image attachments",
     "/detach": "Remove a staged image attachment",
@@ -643,6 +644,8 @@ class ApprovalScreen(ModalScreen[str]):
             "patch": "APPLY PATCH",
             "read_file": "ALLOW READ",
             "list_dir": "ALLOW READ",
+            "find_paths": "ALLOW SEARCH",
+            "hardware_status": "ALLOW READ",
             "search_project": "ALLOW SEARCH",
             "index_project": "BUILD INDEX",
             "web_search": "SEARCH WEB",
@@ -1483,7 +1486,7 @@ class DairackTextualBase(App[None]):
         self.chat = chat or core.new_chat_state(cwd, config)
         self.lock = threading.RLock()
         self.messages = core.SynchronizedMessages(
-            messages or [{"role": "system", "content": core.system_prompt(cwd, bool(config.get("agent")))}],
+            messages or [{"role": "system", "content": core.system_prompt(cwd, bool(config.get("agent")), config)}],
             self.lock,
         )
         self.blocks: list[dict[str, str]] = list(blocks or [])
@@ -1625,6 +1628,7 @@ class DairackTextualBase(App[None]):
         commands = [
             ("Intelligence mode", "Choose coordinated routing or a direct compute model", "/model"),
             ("Compute server", "Inspect or change where model inference runs", "/compute"),
+            ("Hardware map", "Distinguish the client from the inference server", "/hardware"),
             ("Model library", "Install, update, remove, and inspect compute models", "/library"),
             ("Coordinator settings", "Configure policy, stages, and soft role preferences", "/coordinator"),
             ("Coordinator: adaptive", "Balance response quality and compute cost", "/coordinator adaptive"),
@@ -2898,10 +2902,11 @@ class DairackTextualBase(App[None]):
         try:
             with self.suspend():
                 print(f"\n[dairack interactive] $ {command}\n", flush=True)
+                invocation, use_shell = self.core.shell_invocation(command)
                 code = subprocess.call(
-                    command,
+                    invocation,
                     cwd=str(self.cwd),
-                    shell=True,
+                    shell=use_shell,
                     env=self.core.command_environment(),
                 )
                 print(f"\n[exit {code}] returning to dairack", flush=True)
@@ -3083,6 +3088,11 @@ class DairackTextualBase(App[None]):
         with self.lock:
             self.config.clear()
             self.config.update(result.config)
+            self.messages[0]["content"] = self.core.system_prompt(
+                self.cwd,
+                bool(self.config.get("agent")),
+                self.config,
+            )
         self.provider = provider
         self.version = result.ollama_version
         self._active_route = None
@@ -4244,7 +4254,7 @@ class DairackTextualBase(App[None]):
                 model = f"COORD / {policy}" + (f" > {executor}" if executor else "")
             else:
                 model = str(session.get("model") or "unknown model").upper()
-            messages = self.core.sanitize_messages(session.get("messages"), self.cwd, False)
+            messages = self.core.sanitize_messages(session.get("messages"), self.cwd, False, self.config)
             count = self.core.message_count(messages)
             count_label = f"{count} {'MSG' if count == 1 else 'MSGS'}"
             row_width = max(28, min(82, self.size.width - 12))
@@ -4329,7 +4339,9 @@ class DairackTextualBase(App[None]):
         self.config["last_chat"] = chat["id"]
         self.core.save_config(self.config)
         with self.lock:
-            self.messages[0]["content"] = self.core.system_prompt(self.cwd, bool(self.config.get("agent")))
+            self.messages[0]["content"] = self.core.system_prompt(
+                self.cwd, bool(self.config.get("agent")), self.config
+            )
             self.blocks.append({"role": "system", "text": f"resumed chat: {self.chat['title']}"})
         self.save_current_chat()
         self._history = [
@@ -4349,7 +4361,12 @@ class DairackTextualBase(App[None]):
         self.chat = self.core.new_chat_state(self.cwd, self.config, title)
         self.chat["_transient"] = True
         self.messages = self.core.SynchronizedMessages(
-            [{"role": "system", "content": self.core.system_prompt(self.cwd, bool(self.config.get("agent")))}],
+            [
+                {
+                    "role": "system",
+                    "content": self.core.system_prompt(self.cwd, bool(self.config.get("agent")), self.config),
+                }
+            ],
             self.lock,
         )
         self.blocks = []
@@ -4888,10 +4905,11 @@ class DairackTextualBase(App[None]):
         try:
             with self.suspend():
                 print(f"\n[dairack action / {approved_by}] $ {command}\n", flush=True)
+                invocation, use_shell = self.core.shell_invocation(command)
                 code = subprocess.call(
-                    command,
+                    invocation,
                     cwd=str(self.cwd),
-                    shell=True,
+                    shell=use_shell,
                     env=self.core.command_environment(),
                 )
                 print(f"\n[exit {code}] returning to dairack", flush=True)

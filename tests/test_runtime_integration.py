@@ -69,6 +69,7 @@ def semantic_json(**overrides: Any) -> str:
         "complexity": 0.2,
         "needs_plan": False,
         "needs_review": False,
+        "requires_action": False,
         "confidence": 0.9,
         "compute_preference": "auto",
         "control_target": "none",
@@ -93,6 +94,7 @@ SEMANTIC_JSON = semantic_json(
     complexity=0.94,
     needs_plan=True,
     needs_review=True,
+    requires_action=True,
     confidence=0.94,
     reason="multi-stage code change with operational risk",
 )
@@ -298,6 +300,44 @@ class CoordinatorRoutingTests(unittest.TestCase):
         }
         self.assertIn("web_open", tool_names)
         self.assertIn("https://playlockout.com/", CORE.coordinator_executor_directive(decision, coordinator_config()))
+
+    def test_semantic_runtime_action_requires_a_real_tool_call(self) -> None:
+        provider = FakeProvider(
+            (),
+            response=semantic_json(
+                intent="system_action",
+                agent=0.92,
+                general=0.2,
+                complexity=0.28,
+                confidence=0.96,
+                requires_action=True,
+                reason="must search client files",
+            ),
+        )
+        decision = route(provider, "Can you find the Unreal project named Lockout?")
+
+        self.assertEqual(decision["action_contract"]["capability"], "runtime_action")
+        self.assertEqual(decision["execution_scope"], "agentic")
+        directive = CORE.coordinator_executor_directive(decision, coordinator_config())
+        self.assertIn("real function", CORE.system_prompt(Path("/tmp"), True, coordinator_config()))
+        self.assertIn("supplied function tool", directive)
+        self.assertIn("Do not print commands", directive)
+
+    def test_explanatory_request_does_not_gain_an_action_contract(self) -> None:
+        provider = FakeProvider(
+            (),
+            response=semantic_json(
+                intent="general",
+                general=0.9,
+                complexity=0.12,
+                confidence=0.95,
+                requires_action=False,
+                reason="general instructions only",
+            ),
+        )
+        decision = route(provider, "Explain how I can find an Unreal project on Windows")
+
+        self.assertFalse(decision.get("action_contract"))
 
     def test_website_follow_up_resolves_the_prior_public_target(self) -> None:
         decision = route(
@@ -733,6 +773,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
                     confidence=0.95,
                     control_confidence=0.95,
                     needs_plan=True,
+                    requires_action=True,
                     reason="multi-step service setup",
                 ),
                 0.45,
@@ -1595,6 +1636,60 @@ class CoordinatorRoutingTests(unittest.TestCase):
 
         self.assertIn("audit requests are read-only", prompt)
         self.assertIn("inspection, explanation, review, and audit remain read-only", directive)
+
+    def test_action_completion_arbiter_rejects_a_future_promise(self) -> None:
+        provider = FakeProvider(
+            response=json.dumps(
+                {
+                    "complete": False,
+                    "needs_action": True,
+                    "confidence": 0.98,
+                    "reason": "candidate only promises another search",
+                }
+            )
+        )
+        route_state = {
+            "executor": "qwen3.5:9b",
+            "action_contract": {"capability": "runtime_action", "preferred_tool": "auto"},
+            "semantic_assessment": {"model": "qwen3.5:9b"},
+        }
+        messages = [
+            {"role": "user", "content": "Find the project named Lockout"},
+            {
+                "role": "tool",
+                "tool_name": "list_dir",
+                "content": "Structured tool result:\ntool: list_dir\nexit_code: 0\noutput:\nwrong directory",
+            },
+        ]
+
+        result = CORE.assess_action_completion(
+            provider,
+            coordinator_config(),
+            route_state,
+            messages,
+            "Please wait while I check another location.",
+        )
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["needs_action"])
+        self.assertIn("exactly one", CORE.action_completion_directive(result))
+
+    def test_find_paths_locates_a_named_unreal_project_without_shell_syntax(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "Projects" / "Lockout"
+            project.mkdir(parents=True)
+            marker = project / "Lockout.uproject"
+            marker.write_text("{}", encoding="ascii")
+
+            code, output = CORE.execute_tool_call(
+                {"name": "find_paths", "query": "Lockout", "path": str(root)},
+                root,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn(str(marker), output)
+        self.assertIn("project", output)
 
     def test_structural_completion_detection_is_bounded_and_general(self) -> None:
         self.assertIn(

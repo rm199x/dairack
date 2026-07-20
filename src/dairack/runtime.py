@@ -55,7 +55,10 @@ from .coordinator.policy import POLICIES as COORDINATOR_POLICY_DEFINITIONS
 from .coordinator.policy import policy_for
 from .coordinator.tuning import DEFAULT_TUNING
 from .coordinator.tuning import for_config as coordinator_tuning_for_config
+from .file_discovery import find_paths as discover_paths
 from .identity import APP_NAME, env_enabled
+from .machine import hardware_status as format_hardware_status
+from .machine import machine_prompt
 from .messages import canonicalize_messages
 from .models import (
     ModelDescriptor,
@@ -102,7 +105,8 @@ DEFAULT_TIMEOUT = 120
 SENSITIVE_CHILD_ENV_KEYS = {"DAIRACK_COMPUTE_TOKEN", "ASUSAI_COMPUTE_TOKEN"}
 NATIVE_TOOL_DIRECTIVE = (
     "Function tools are active through the provider API for this request. Return actions through the native "
-    "tool_calls field; do not print function names, arguments, or fallback markup as response content."
+    "tool_calls field; return no ordinary response text alongside a tool call, and do not print function names, "
+    "arguments, or fallback markup as response content."
 )
 MAX_TOOL_OUTPUT = 24000
 DEFAULT_AGENT_ACTION_LIMIT = 12
@@ -151,6 +155,7 @@ SLASH_COMMANDS = [
     "/orchestrator",
     "/route",
     "/compute",
+    "/hardware",
     "/image",
     "/images",
     "/detach",
@@ -207,6 +212,7 @@ INTELLIGENCE
   /coordinator [mode]   set adaptive, quality, efficient, or off
   /route                inspect the latest routing decision
   /compute              inspect or change the inference server
+  /hardware             distinguish client and compute hardware
 
 WORKSPACE
   /image [path]         attach visual input
@@ -236,6 +242,7 @@ COMPLETE COMMAND REFERENCE
   /route [history|feedback good|bad]
                          inspect routes or calibrate the latest decision
   /compute              inspect or change the model compute server
+  /hardware             show authoritative client and compute hardware
   /image [path]         attach an image, or open the project image selector
   /images               show images staged for the next prompt
   /detach [N|all]       remove a staged image
@@ -1689,6 +1696,7 @@ COORDINATOR_SEMANTIC_SCHEMA: dict[str, Any] = {
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "needs_plan": {"type": "boolean"},
         "needs_review": {"type": "boolean"},
+        "requires_action": {"type": "boolean"},
         "compute_preference": {
             "type": "string",
             "enum": ["auto", "quality", "higher_capacity", "efficiency"],
@@ -1716,6 +1724,7 @@ COORDINATOR_SEMANTIC_SCHEMA: dict[str, Any] = {
         "confidence",
         "needs_plan",
         "needs_review",
+        "requires_action",
         "compute_preference",
         "control_target",
         "preference_strength",
@@ -1749,10 +1758,14 @@ def coordinator_semantic_assessment(
         "Assess semantic requirements for a model-routing control plane. Do not solve the task and do not choose "
         "a model. Return one JSON object only. Classify intent as conversation, general, research, reasoning, "
         "coding, system_action, visual, or mixed. Return numeric values from 0.0 to 1.0 for code, agent, reasoning, "
-        "general, research, vision, risk, complexity, and confidence; booleans needs_plan and needs_review; and a "
+        "general, research, vision, risk, complexity, and confidence; booleans needs_plan, needs_review, and "
+        "requires_action; and a "
         "reason under 120 characters. Code means software source, debugging, or implementation, never music, writing, "
         "or generic technical language. Agent means the task requires files, commands, tools, or another external "
-        "action; imperative grammar alone is not agentic. Research means current external facts or sources are needed. "
+        "action; imperative grammar alone is not agentic. requires_action is true only when fulfilling this turn "
+        "requires the runtime to inspect or change external state now. It is false for explanations, instructions, "
+        "hypothetical examples, and questions about what the runtime could do. Research means current external facts "
+        "or sources are needed. "
         "Reasoning means conceptual analysis, comparison, derivation, or judgment. General includes conversation, "
         "creative work, naming, prose, and ordinary explanations. Planning and review require genuine multi-stage or "
         "high-stakes work, not merely a request to improve an answer. Also classify the user's per-turn compute "
@@ -1831,7 +1844,7 @@ def coordinator_semantic_assessment(
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             return {}
         assessment[key] = round(value, 3)
-    for key in ("needs_plan", "needs_review"):
+    for key in ("needs_plan", "needs_review", "requires_action"):
         value = parsed.get(key)
         if not isinstance(value, bool):
             return {}
@@ -1930,6 +1943,19 @@ def _merge_semantic_assessment(
     # Semantic output may raise observed risk, but it cannot erase deterministic evidence.
     signals["risk"] = round(max(deterministic_risk, float(signals.get("risk") or 0)), 3)
     action_contract = analysis.get("action_contract")
+    if (
+        not (isinstance(action_contract, dict) and action_contract.get("capability"))
+        and bool(assessment.get("requires_action"))
+        and confidence >= 0.60
+    ):
+        action_contract = {
+            "capability": "runtime_action",
+            "preferred_tool": "auto",
+            "target": "",
+            "reason": "semantic runtime action requirement",
+        }
+        merged["action_contract"] = action_contract
+        signals["agent"] = round(max(0.48, float(signals.get("agent") or 0)), 3)
     if isinstance(action_contract, dict) and action_contract.get("capability") == "public_web":
         signals["research"] = round(max(0.72, float(signals.get("research") or 0)), 3)
         signals["agent"] = round(max(0.48, float(signals.get("agent") or 0)), 3)
@@ -2436,12 +2462,37 @@ def format_route_history(chat: dict[str, Any], limit: int = 12) -> str:
 
 def action_contract_directive(route: dict[str, Any], retry: bool = False) -> str:
     contract = route.get("action_contract")
-    if not isinstance(contract, dict) or contract.get("capability") != "public_web":
+    if not isinstance(contract, dict) or not contract.get("capability"):
+        return ""
+    capability = str(contract.get("capability") or "")
+    tool_steps = max(0, int(route.get("tool_steps") or 0))
+    correction = "The previous answer did not satisfy the requested action. " if retry else ""
+    if capability == "runtime_action":
+        if tool_steps:
+            instruction = (
+                "Continue from the returned action evidence. If it fulfills the request, report the concrete result. "
+                "If more work is needed, request exactly one appropriate supplied function tool."
+            )
+        else:
+            instruction = "Request exactly one appropriate supplied function tool as the next action."
+        return (
+            "Coordinator action requirement: "
+            + correction
+            + instruction
+            + " Do not print commands or function calls as prose, claim an action is running when no tool call was "
+            "made, ask the user to wait, or end with a promise to act later. If no supplied tool can safely progress, "
+            "state the limitation or ask one precise question."
+        )
+    if capability != "public_web":
         return ""
     preferred = str(contract.get("preferred_tool") or "web_open")
     target = str(contract.get("target") or "")
-    correction = "The previous answer did not satisfy the requested network action. " if retry else ""
-    if preferred == "web_search":
+    if tool_steps:
+        instruction = (
+            "Continue from the returned web evidence. Fetch another page only when it is still needed; otherwise "
+            "answer with the concrete result and source URLs."
+        )
+    elif preferred == "web_search":
         instruction = (
             "Request web_search as the next action. After its result, use web_open yourself when page content is "
             "needed to answer; do not hand that continuation back to the user."
@@ -2678,6 +2729,142 @@ def _collect_orchestrator_response(
             break
         chunks.append(chunk)
     return "".join(chunks).strip()
+
+
+ACTION_COMPLETION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "complete": {"type": "boolean"},
+        "needs_action": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": {"type": "string", "maxLength": 180},
+    },
+    "required": ["complete", "needs_action", "confidence", "reason"],
+    "additionalProperties": False,
+}
+
+
+def _recent_action_evidence(messages: list[dict[str, Any]], limit: int = 9000) -> str:
+    evidence: list[str] = []
+    size = 0
+    for message in reversed(messages):
+        content = str(message.get("content") or "").strip()
+        role = str(message.get("role") or "")
+        if not content:
+            continue
+        if role == "tool" or content.startswith(TOOL_RESULT_PREFIXES):
+            excerpt = truncate(content, 2800)
+            if size + len(excerpt) > limit and evidence:
+                break
+            evidence.append(excerpt)
+            size += len(excerpt)
+        if len(evidence) >= 6:
+            break
+    return "\n\n".join(reversed(evidence))
+
+
+def assess_action_completion(
+    provider: Any,
+    config: dict[str, Any],
+    route: dict[str, Any],
+    messages: list[dict[str, Any]],
+    candidate: str,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    contract = route.get("action_contract")
+    if not isinstance(contract, dict) or not contract.get("capability") or not candidate.strip():
+        return {}
+    semantic = route.get("semantic_assessment")
+    model = str(semantic.get("model") or "") if isinstance(semantic, dict) else ""
+    model = model or str(route.get("executor") or config.get("model") or "")
+    if not model:
+        return {}
+    runtime = runtime_config_for_model(config, model)
+    runtime["think"] = False
+    options = runtime.get("model_options")
+    runtime["model_options"] = dict(options) if isinstance(options, dict) else {}
+    runtime["model_options"]["temperature"] = 0
+    prompt = (
+        "Judge whether a local agent's candidate response has actually completed the user's request. Return strict "
+        "JSON only. Use only the supplied action evidence. complete is false when the response merely announces "
+        "future work, asks the user to wait, prints commands that were not executed, searches the wrong target, or "
+        "leaves failed actions unresolved. An accurate result, an evidence-backed not-found result, a clear safety "
+        "denial, or a precise limitation can be complete. needs_action is true only when another supplied runtime "
+        "tool could materially advance the request now. Do not solve the task yourself.\n\n"
+        f"USER REQUEST\n{truncate(latest_user_task(messages), 2400)}\n\n"
+        f"ACTION CONTRACT\n{json.dumps(contract, sort_keys=True)}\n\n"
+        f"ACTION EVIDENCE\n{_recent_action_evidence(messages) or '(none)'}\n\n"
+        f"CANDIDATE RESPONSE\n{truncate(candidate, 5000)}"
+    )
+    provider_state = {
+        name: getattr(provider, name)
+        for name in ("last_stats", "current_stats", "current_model", "stream_phase")
+        if hasattr(provider, name)
+    }
+    try:
+        raw = _collect_orchestrator_response(
+            provider,
+            model,
+            [
+                {
+                    "role": "system",
+                    "content": "You are a completion arbiter inside an agent runtime. Output strict JSON only.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            runtime,
+            cancel_event,
+            140,
+            ACTION_COMPLETION_SCHEMA,
+        )
+    finally:
+        for name, value in provider_state.items():
+            try:
+                setattr(provider, name, value)
+            except (AttributeError, TypeError):
+                pass
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+    except (json.JSONDecodeError, TypeError, RecursionError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    complete = parsed.get("complete")
+    needs_action = parsed.get("needs_action")
+    confidence = parsed.get("confidence")
+    if not isinstance(complete, bool) or not isinstance(needs_action, bool) or isinstance(confidence, bool):
+        return {}
+    try:
+        confidence_value = float(confidence)
+    except (TypeError, ValueError):
+        return {}
+    if not math.isfinite(confidence_value) or not 0.0 <= confidence_value <= 1.0:
+        return {}
+    return {
+        "complete": complete,
+        "needs_action": needs_action,
+        "confidence": round(confidence_value, 3),
+        "reason": truncate(str(parsed.get("reason") or "completion unclear"), 180),
+        "model": model,
+    }
+
+
+def action_completion_directive(assessment: dict[str, Any]) -> str:
+    reason = str(assessment.get("reason") or "the result did not complete the requested action")
+    if assessment.get("needs_action"):
+        next_step = "Request exactly one appropriate supplied function tool now and continue from its result."
+    else:
+        next_step = "Return an honest final result, limitation, or one precise blocking question now."
+    return (
+        "Coordinator completion requirement: The previous candidate was not complete: "
+        + reason
+        + ". "
+        + next_step
+        + " Do not ask the user to wait, print an unexecuted command, or promise future work."
+    )
 
 
 def orchestrator_plan(
@@ -3066,7 +3253,12 @@ def new_chat_state(cwd: Path, config: dict[str, Any], title: str = "") -> dict[s
     }
 
 
-def sanitize_messages(raw: Any, cwd: Path, agent: bool) -> list[dict[str, Any]]:
+def sanitize_messages(
+    raw: Any,
+    cwd: Path,
+    agent: bool,
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     if isinstance(raw, list):
         for item in raw:
@@ -3108,9 +3300,9 @@ def sanitize_messages(raw: Any, cwd: Path, agent: bool) -> list[dict[str, Any]]:
                 message["tool_name"] = tool_name
             messages.append(message)
     if not messages or messages[0].get("role") != "system":
-        messages.insert(0, {"role": "system", "content": system_prompt(cwd, agent)})
+        messages.insert(0, {"role": "system", "content": system_prompt(cwd, agent, config)})
     else:
-        messages[0] = {"role": "system", "content": system_prompt(cwd, agent)}
+        messages[0] = {"role": "system", "content": system_prompt(cwd, agent, config)}
     return messages
 
 
@@ -3280,7 +3472,7 @@ def chat_runtime_state(
         "summary_format": str(session.get("summary_format") or ""),
         "last_compacted_at": str(session.get("last_compacted_at") or ""),
     }
-    messages = sanitize_messages(session.get("messages"), cwd, bool(config.get("agent")))
+    messages = sanitize_messages(session.get("messages"), cwd, bool(config.get("agent")), config)
     blocks = sanitize_blocks(session.get("blocks"))
     if not blocks:
         blocks = blocks_from_messages(messages)
@@ -4193,9 +4385,10 @@ def application_implementation_path() -> Path:
     return package_path
 
 
-def system_prompt(cwd: Path, agent: bool) -> str:
+def system_prompt(cwd: Path, agent: bool, config: dict[str, Any] | None = None) -> str:
     host_system = platform.system() or "Unknown"
     implementation_path = application_implementation_path()
+    active_config = config if isinstance(config, dict) else default_config()
     base = textwrap.dedent(
         f"""
         You are Dairack, a local terminal assistant running on the user's machine.
@@ -4203,14 +4396,16 @@ def system_prompt(cwd: Path, agent: bool) -> str:
         Handle ordinary conversation and general questions naturally. Treat coding and
         system work as capabilities, not as the assumed subject of every request.
         Current working directory: {cwd}
+        Client home directory: {Path.home()}
         Dairack implementation path: {implementation_path}
-        Host operating system: {host_system}
+        Client operating system: {host_system}
         Your agent runtime, tools, approvals, and working directory live on this client.
         Model inference comes from the configured Ollama compute endpoint, which may be
         local or remote. The compute server cannot access client paths except through
         content deliberately included in a model request or an approved client-side tool result.
         """
     ).strip()
+    base += "\n\n" + machine_prompt(active_config, PATHS)
     if not agent:
         base += (
             "\n\n"
@@ -4230,7 +4425,11 @@ def system_prompt(cwd: Path, agent: bool) -> str:
                 f"""
             Agent mode is enabled. Use the supplied function tools whenever they are
             available. Request exactly one action at a time, then wait for its result.
-            Do not print commands or function calls as ordinary prose.
+            Do not print commands or function calls as ordinary prose. Never say that
+            an action is running, ask the user to wait, or promise to inspect something
+            unless the same response contains a real function tool call.
+            When requesting a tool, return no narration alongside it; Dairack's action
+            surface communicates what is happening. Keep ordinary prose for final results.
 
             Available tools:
 {tool_catalog}
@@ -4239,8 +4438,13 @@ def system_prompt(cwd: Path, agent: bool) -> str:
             return one <tool> JSON envelope that conforms to the same tool schema.
             Never mix an action request with ordinary response text.
 
-            For server hardware questions, prefer inspection commands like lscpu,
-            free -h, df -h, nvidia-smi, lspci, uname -a, and ollama ps.
+            Use hardware_status only when the authoritative machine map needs to be
+            restated; do not run shell commands for ordinary hardware identity questions.
+            To locate a named file, directory, or project outside the active workspace,
+            use find_paths with the exact name and an explicit likely root such as the
+            client home directory. Do not silently search the current directory when the
+            requested object is expected elsewhere. Treat user-supplied names as entities
+            before interpreting them as error types, licenses, or generic concepts.
             For recent facts, prices, releases, docs, schedules, or anything likely
             to have changed, use web_search first and include source URLs in your answer.
             When the user asks you to inspect a public website, URL, link, or domain,
@@ -4277,10 +4481,10 @@ def system_prompt(cwd: Path, agent: bool) -> str:
                 "\n\n"
                 + textwrap.dedent(
                     """
-                The shell tool uses the Windows command processor. Prefer native
-                commands such as cd, dir, type, where, systeminfo, and nvidia-smi.
-                Invoke PowerShell explicitly with powershell -NoProfile -Command when
-                a PowerShell-only command is needed.
+                The shell tool runs PowerShell on Windows. Use PowerShell syntax only;
+                do not mix cmd.exe redirection or Unix commands into it. Prefer modern
+                commands such as Get-CimInstance, Get-ChildItem, Get-Content,
+                Get-Command, systeminfo, and nvidia-smi. Do not use deprecated wmic.
                 """
                 ).strip()
             )
@@ -4436,6 +4640,17 @@ def _run_process(
         time.sleep(min(0.05, remaining))
 
 
+def shell_invocation(cmd: str) -> tuple[str | list[str], bool]:
+    """Return the user's platform shell invocation without relying on shell=True on Windows."""
+    if os.name != "nt":
+        return cmd, True
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell:
+        return [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], False
+    command_processor = os.environ.get("COMSPEC") or "cmd.exe"
+    return [command_processor, "/d", "/s", "/c", cmd], False
+
+
 def run_shell(
     cmd: str,
     cwd: Path,
@@ -4449,7 +4664,8 @@ def run_shell(
             "This command appears to require a terminal password prompt or direct TTY input.\n"
             "Run sudo authentication in a normal terminal first, or use a non-interactive form such as sudo -n when credentials are already cached.",
         )
-    return _run_process(cmd, cwd, timeout, cancel_event, shell=True)
+    command, use_shell = shell_invocation(cmd)
+    return _run_process(command, cwd, timeout, cancel_event, shell=use_shell)
 
 
 def run_argv(
@@ -4708,6 +4924,8 @@ def tool_summary(call: dict[str, str]) -> str:
         specialty = coordinator_specialty(call).replace("_", " ")
         target = f" | {call.get('path')}" if call.get("path") else ""
         return f"coordinator delegate {specialty}{target} | {call.get('task', '')[:100]}"
+    if call.get("name") == "find_paths":
+        return f"find {call.get('query', '')[:80]} under {call.get('path', '')[:100]}"
     presentation = tool_presentation(call)
     target = truncate(collapse_ws(str(presentation.get("target") or "")), 140).splitlines()[0]
     return f"{call.get('name') or 'tool'} {target}".rstrip()
@@ -6094,6 +6312,13 @@ def execute_tool_call(
         if enforce_project_scope and not path_within(target, scope):
             return 1, f"read-auto scope blocked: {target}"
         return list_directory(scope, str(target))
+    if call.get("name") == "find_paths":
+        target = resolve_user_path(scope, call.get("path", "."))
+        if enforce_project_scope and not path_within(target, scope):
+            return 1, f"read-auto scope blocked: {target}"
+        return discover_paths(target, call.get("query", ""), cancel_event=cancel_event)
+    if call.get("name") == "hardware_status":
+        return 0, format_hardware_status(load_config(), PATHS)
     if call.get("name") == "search_project":
         requested_root = call.get("path", "").strip()
         search_scope = resolve_user_path(scope, requested_root) if requested_root else scope
@@ -6118,7 +6343,16 @@ def tool_result_message(call: dict[str, str], code: int, result: str) -> str:
         return f"Patch tool result:\nsummary: {tool_summary(call)}\nexit_code: {code}\noutput:\n{result}"
     if call.get("name") == "consult_specialist":
         return f"Coordinator specialist result:\nsummary: {tool_summary(call)}\nexit_code: {code}\noutput:\n{result}"
-    if call.get("name") in {"read_file", "list_dir", "search_project", "index_project", "web_search", "web_open"}:
+    if call.get("name") in {
+        "read_file",
+        "list_dir",
+        "find_paths",
+        "hardware_status",
+        "search_project",
+        "index_project",
+        "web_search",
+        "web_open",
+    }:
         return (
             f"Structured tool result:\n"
             f"tool: {call.get('name')}\n"
@@ -6417,7 +6651,7 @@ class DairackTui:
         self.chat = chat or new_chat_state(cwd, config)
         self.lock = threading.RLock()
         self.messages = SynchronizedMessages(
-            messages or [{"role": "system", "content": system_prompt(cwd, bool(config.get("agent")))}],
+            messages or [{"role": "system", "content": system_prompt(cwd, bool(config.get("agent")), config)}],
             self.lock,
         )
         self._worker_threads: set[threading.Thread] = set()
@@ -7157,7 +7391,7 @@ class DairackTui:
         self.config["last_chat"] = chat["id"]
         save_config(self.config)
         with self.lock:
-            self.messages[0]["content"] = system_prompt(self.cwd, bool(self.config.get("agent")))
+            self.messages[0]["content"] = system_prompt(self.cwd, bool(self.config.get("agent")), self.config)
         self.append_system(f"resumed chat: {self.chat['title']}")
         self.app.invalidate()
 
@@ -7165,7 +7399,7 @@ class DairackTui:
         self.chat = new_chat_state(self.cwd, self.config, title)
         self.chat["_transient"] = True
         self.messages = SynchronizedMessages(
-            [{"role": "system", "content": system_prompt(self.cwd, bool(self.config.get("agent")))}],
+            [{"role": "system", "content": system_prompt(self.cwd, bool(self.config.get("agent")), self.config)}],
             self.lock,
         )
         self.blocks = []
@@ -7341,6 +7575,7 @@ class DairackTui:
             repairing_action = False
             action_repair_attempted = False
             action_contract_repair_attempted = False
+            action_completion_repairs = 0
             completion_repair_attempted = False
             completion_feedback = ""
             action_feedback = ""
@@ -7433,7 +7668,7 @@ class DairackTui:
                 internal_call = bool(call and is_internal_coordinator_call(normalize_coordinator_tool_call(call)))
                 if call and not internal_call:
                     action_text = tool_request_display(call)
-                    rendered_text = f"{visible_text}\n\n{action_text}" if visible_text else action_text
+                    rendered_text = action_text
                 elif call:
                     rendered_text = visible_text
                 elif parse_error:
@@ -7472,7 +7707,7 @@ class DairackTui:
                     action_feedback = action_requirement
                     repairing_action = True
                     self.replace_last_assistant_text("")
-                    self.set_busy(True, "preparing web access")
+                    self.set_busy(True, "preparing requested action")
                     self.save_current_chat()
                     continue
                 stats = dict(getattr(self.provider, "last_stats", {}) or {})
@@ -7504,6 +7739,53 @@ class DairackTui:
                     )
                     self.save_current_chat()
                     return
+                contract = route.get("action_contract")
+                if (
+                    not call
+                    and not parse_error
+                    and not incomplete_reason
+                    and not finalizing
+                    and bool(self.config.get("agent"))
+                    and self._agent_steps_used > 0
+                    and isinstance(contract, dict)
+                    and contract.get("capability")
+                ):
+                    self.set_busy(True, "verifying action result")
+                    try:
+                        completion = assess_action_completion(
+                            self.provider,
+                            self.config,
+                            route,
+                            self.messages,
+                            assistant_text,
+                            self.cancel_event,
+                        )
+                    except Exception as exc:
+                        completion = {"error": str(exc)}
+                    if completion:
+                        route["action_completion"] = completion
+                    enforce_completion = (
+                        completion
+                        and not completion.get("error")
+                        and not completion.get("complete")
+                        and float(completion.get("confidence") or 0) >= 0.65
+                    )
+                    if enforce_completion and action_completion_repairs < 2:
+                        action_completion_repairs += 1
+                        if self.messages and self.messages[-1].get("role") == "assistant":
+                            self.messages.pop()
+                        action_feedback = action_completion_directive(completion)
+                        repairing_action = True
+                        self.replace_last_assistant_text("")
+                        self.set_busy(True, "continuing requested action")
+                        self.save_current_chat()
+                        continue
+                    if enforce_completion:
+                        reason = str(completion.get("reason") or "completion could not be verified")
+                        self.replace_last_assistant_text("The requested action did not complete.")
+                        self.append_error(f"Agent stopped after two completion corrections.\n{reason}")
+                        self.save_current_chat()
+                        return
                 if finalizing:
                     invalid_final = bool(call or parse_error or incomplete_reason or not assistant_text.strip())
                     if invalid_final and synthesis_attempts < 2:
@@ -7792,6 +8074,8 @@ class DairackTui:
                 f"  {self.config.get('ollama_host')}\n\n"
                 "The legacy interface reports compute status only. Run `dairack connect --help` to change it."
             )
+        elif command == "hardware":
+            self.append_reference(format_hardware_status(self.config, PATHS))
         elif command == "image":
             if not args:
                 self.append_system("usage: /image <path>")
@@ -7845,7 +8129,7 @@ class DairackTui:
             self.command_toggle("think", args)
         elif command == "agent":
             self.command_agent(args)
-            self.messages[0]["content"] = system_prompt(self.cwd, bool(self.config.get("agent")))
+            self.messages[0]["content"] = system_prompt(self.cwd, bool(self.config.get("agent")), self.config)
             self.save_current_chat()
         elif command in {"permissions", "permission", "perm"}:
             self.command_permissions(args)
@@ -8125,6 +8409,12 @@ class DairackTui:
             return
         if args[0] in {"on", "off"}:
             self.config["agent"] = args[0] == "on"
+            with self.lock:
+                self.messages[0]["content"] = system_prompt(
+                    self.cwd,
+                    bool(self.config.get("agent")),
+                    self.config,
+                )
             save_config(self.config)
             self.append_system(f"agent: {args[0]}")
             return
@@ -8255,7 +8545,7 @@ class DairackTui:
             return
         self.cwd = target
         update_project_scope_after_cd(self.chat, self.cwd)
-        self.messages[0]["content"] = system_prompt(self.cwd, bool(self.config.get("agent")))
+        self.messages[0]["content"] = system_prompt(self.cwd, bool(self.config.get("agent")), self.config)
         self.append_system(str(self.cwd))
         self.save_current_chat()
 
@@ -8546,6 +8836,8 @@ def handle_command(
         print(f"  {config.get('compute_mode', 'local')} / {config.get('compute_name', 'Local Ollama')}")
         print(f"  {config.get('ollama_host')}")
         print("Run `dairack connect --help` outside this plain session to change it.")
+    elif command == "hardware":
+        print(format_hardware_status(config, PATHS))
     elif command == "image":
         pending = chat.setdefault("_pending_images", [])
         if not isinstance(pending, list):
@@ -8638,7 +8930,7 @@ def handle_command(
             print(f"task action budget: {agent_action_limit(config)}")
         elif args[0] in {"on", "off"}:
             config["agent"] = args[0] == "on"
-            messages[0]["content"] = system_prompt(cwd, bool(config.get("agent")))
+            messages[0]["content"] = system_prompt(cwd, bool(config.get("agent")), config)
             save_config(config)
             save_chat_session(chat, cwd, config, messages, blocks_from_messages(messages))
             print(f"agent: {args[0]}")
@@ -8690,7 +8982,7 @@ def handle_command(
     elif command == "new":
         chat.clear()
         chat.update(new_chat_state(cwd, config, " ".join(args)))
-        messages[:] = [{"role": "system", "content": system_prompt(cwd, bool(config.get("agent")))}]
+        messages[:] = [{"role": "system", "content": system_prompt(cwd, bool(config.get("agent")), config)}]
         save_chat_session(chat, cwd, config, messages, [])
         config["last_chat"] = chat["id"]
         save_config(config)
@@ -8779,7 +9071,7 @@ def handle_command(
         else:
             cwd = target
             update_project_scope_after_cd(chat, cwd)
-            messages[0]["content"] = system_prompt(cwd, bool(config.get("agent")))
+            messages[0]["content"] = system_prompt(cwd, bool(config.get("agent")), config)
             save_chat_session(chat, cwd, config, messages, blocks_from_messages(messages))
             print(cwd)
     elif command == "index":
@@ -9022,6 +9314,7 @@ def chat_turn(
     revision_feedback = ""
     completion_repair_attempted = False
     action_contract_repair_attempted = False
+    action_completion_repairs = 0
     action_limit = agent_action_limit(config)
     action_steps = 0
     synthesis_attempts = 0
@@ -9089,6 +9382,44 @@ def chat_turn(
             messages.append(assistant_message)
             print(f"Response remained structurally incomplete after one retry: {incomplete_reason}")
             return
+        contract = route.get("action_contract")
+        if (
+            not call
+            and not parse_error
+            and not incomplete_reason
+            and not finalizing
+            and action_steps > 0
+            and isinstance(contract, dict)
+            and contract.get("capability")
+        ):
+            try:
+                completion = assess_action_completion(
+                    provider,
+                    config,
+                    route,
+                    [*messages, assistant_message],
+                    response,
+                )
+            except Exception as exc:
+                completion = {"error": str(exc)}
+            if completion:
+                route["action_completion"] = completion
+            enforce_completion = (
+                completion
+                and not completion.get("error")
+                and not completion.get("complete")
+                and float(completion.get("confidence") or 0) >= 0.65
+            )
+            if enforce_completion and action_completion_repairs < 2:
+                action_completion_repairs += 1
+                action_feedback = action_completion_directive(completion)
+                continue
+            if enforce_completion:
+                reason = str(completion.get("reason") or "completion could not be verified")
+                stopped = f"The requested action did not complete.\n{reason}"
+                messages.append({"role": "assistant", "content": stopped})
+                print(stopped)
+                return
         if finalizing:
             messages.append(assistant_message)
             invalid_final = bool(call or parse_error or incomplete_reason or not response.strip())
@@ -9244,7 +9575,7 @@ def interactive(args: argparse.Namespace, config: dict[str, Any]) -> None:
 
     cwd = Path.cwd()
     chat = new_chat_state(cwd, config)
-    messages = [{"role": "system", "content": system_prompt(cwd, bool(config.get("agent")))}]
+    messages = [{"role": "system", "content": system_prompt(cwd, bool(config.get("agent")), config)}]
     blocks: list[dict[str, str]] = []
     startup_notice = (
         "No compute model is installed. The model library is open; choose a fitted setup profile or any Ollama model."
@@ -9362,7 +9693,7 @@ def one_shot(args: argparse.Namespace, config: dict[str, Any], prompt: str) -> i
 
     cwd = Path.cwd()
     messages = [
-        {"role": "system", "content": system_prompt(cwd, False)},
+        {"role": "system", "content": system_prompt(cwd, False, config)},
         {"role": "user", "content": prompt},
     ]
     route = select_orchestrator_route(provider, config, messages, cwd)

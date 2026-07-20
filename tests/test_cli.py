@@ -234,3 +234,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 130)
         server.server_close.assert_called_once_with()
         self.assertIn("STOPPED", output.getvalue())
+
+    def test_compute_service_install_uses_a_restartable_foreground_unit(self) -> None:
+        unit_path = Path(self.temporary.name) / "dairack-compute.service"
+        options = cli._serve_parser().parse_args(
+            ["--install-service", "--name", "Home Server", "--port", "11435"]
+        )
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with (
+            patch.object(cli.sys, "platform", "linux"),
+            patch.object(cli, "_user_service_path", return_value=unit_path),
+            patch.object(cli, "_systemctl_user", return_value=completed) as systemctl,
+        ):
+            cli._install_compute_service(options, self.paths.compute_bridge_token_file, "http://127.0.0.1:11434")
+
+        unit = unit_path.read_text(encoding="utf-8")
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("python", unit.lower())
+        self.assertIn("-m dairack serve", unit)
+        self.assertNotIn("--install-service", unit)
+        self.assertEqual(
+            [call.args for call in systemctl.call_args_list],
+            [
+                ("daemon-reload",),
+                ("enable", cli.COMPUTE_SERVICE_UNIT),
+                ("restart", cli.COMPUTE_SERVICE_UNIT),
+            ],
+        )

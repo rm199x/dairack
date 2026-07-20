@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -43,6 +45,8 @@ from .models import CAPABILITY_NAMES, load_hardware, load_registry, save_registr
 from .paths import PATHS, migrate_legacy_state
 from .providers.ollama import OllamaError, OllamaProvider
 from .updates import UpdateError, UpdateInfo, apply_update, check_for_update, format_update_command, update_command
+
+COMPUTE_SERVICE_UNIT = "dairack-compute.service"
 
 
 def _lifecycle_parser() -> argparse.ArgumentParser:
@@ -253,6 +257,14 @@ def _serve_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tailscale", action="store_true", help="publish the loopback bridge to this tailnet over HTTPS"
     )
+    service = parser.add_mutually_exclusive_group()
+    service.add_argument(
+        "--install-service",
+        action="store_true",
+        help="install and start a restartable Linux user service",
+    )
+    service.add_argument("--service-status", action="store_true", help="show Linux user-service status")
+    service.add_argument("--remove-service", action="store_true", help="stop and remove the Linux user service")
     return parser
 
 
@@ -320,8 +332,134 @@ def _tailscale_serve(port: int) -> str:
     return f"https://{dns_name}" if dns_name else "the HTTPS URL shown by `tailscale serve status`"
 
 
+def _user_service_path() -> Path:
+    configured = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    root = Path(configured).expanduser() if configured else Path.home() / ".config"
+    return root / "systemd" / "user" / COMPUTE_SERVICE_UNIT
+
+
+def _systemctl_user(*args: str) -> subprocess.CompletedProcess[str]:
+    executable = shutil.which("systemctl")
+    if not executable:
+        raise ComputeError("systemctl is not available; run the compute bridge in foreground mode")
+    return subprocess.run(
+        [executable, "--user", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def _service_error(result: subprocess.CompletedProcess[str]) -> str:
+    return _subprocess_output(result.stderr) or _subprocess_output(result.stdout) or f"exit {result.returncode}"
+
+
+def _compute_service_command(options: argparse.Namespace, token_file: Path, upstream: str) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "dairack",
+        "serve",
+        "--bind",
+        str(options.bind),
+        "--port",
+        str(options.port),
+        "--upstream",
+        upstream,
+        "--token-file",
+        str(token_file),
+    ]
+    if options.name:
+        command.extend(("--name", str(options.name)))
+    if options.no_auth:
+        command.append("--no-auth")
+    return command
+
+
+def _install_compute_service(options: argparse.Namespace, token_file: Path, upstream: str) -> None:
+    if sys.platform != "linux":
+        raise ComputeError("automatic service installation currently requires Linux with systemd")
+    unit_path = _user_service_path()
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    command = shlex.join(_compute_service_command(options, token_file, upstream))
+    unit = (
+        "[Unit]\n"
+        "Description=Dairack compute bridge\n"
+        "Wants=network-online.target\n"
+        "After=network-online.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={command}\n"
+        "Restart=on-failure\n"
+        "RestartSec=3\n"
+        "Environment=PYTHONUNBUFFERED=1\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    temporary = unit_path.with_suffix(".service.tmp")
+    temporary.write_text(unit, encoding="utf-8")
+    temporary.replace(unit_path)
+    for args in (("daemon-reload",), ("enable", COMPUTE_SERVICE_UNIT), ("restart", COMPUTE_SERVICE_UNIT)):
+        result = _systemctl_user(*args)
+        if result.returncode:
+            raise ComputeError(f"could not {' '.join(args)}: {_service_error(result)}")
+
+
+def _compute_service_status() -> int:
+    try:
+        result = _systemctl_user("status", COMPUTE_SERVICE_UNIT, "--no-pager")
+    except (ComputeError, subprocess.TimeoutExpired) as exc:
+        print(f"service status failed: {exc}", file=sys.stderr)
+        return 1
+    output = result.stdout.strip() or result.stderr.strip()
+    print(output or f"{COMPUTE_SERVICE_UNIT}: no status returned")
+    return 0 if result.returncode == 0 else 1
+
+
+def _remove_compute_service() -> int:
+    try:
+        result = _systemctl_user("disable", "--now", COMPUTE_SERVICE_UNIT)
+        if result.returncode and "not loaded" not in _service_error(result).lower():
+            raise ComputeError(_service_error(result))
+        _user_service_path().unlink(missing_ok=True)
+        reload_result = _systemctl_user("daemon-reload")
+        if reload_result.returncode:
+            raise ComputeError(_service_error(reload_result))
+    except (ComputeError, OSError, subprocess.TimeoutExpired) as exc:
+        print(f"service removal failed: {exc}", file=sys.stderr)
+        return 1
+    print("Dairack compute service removed.")
+    print("Tailscale Serve remains configured; disable it separately if it is no longer needed.")
+    return 0
+
+
+def _linger_enabled() -> bool | None:
+    executable = shutil.which("loginctl")
+    if not executable:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "show-user", getpass.getuser(), "-p", "Linger", "--value"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    value = result.stdout.strip().lower()
+    return True if value == "yes" else False if value == "no" else None
+
+
 def _run_serve(args: Sequence[str]) -> int:
     options = _serve_parser().parse_args(args)
+    if options.service_status:
+        return _compute_service_status()
+    if options.remove_service:
+        return _remove_compute_service()
     if options.tailscale and options.bind not in {"127.0.0.1", "::1", "localhost"}:
         print("serve failed: --tailscale requires the bridge to remain bound to loopback", file=sys.stderr)
         return 2
@@ -335,6 +473,26 @@ def _run_serve(args: Sequence[str]) -> int:
         token = "" if options.no_auth else load_or_create_bridge_token(token_file)
         upstream = endpoint_policy(options.upstream).endpoint
         OllamaProvider(upstream).version()
+        if options.install_service:
+            public_endpoint = _tailscale_serve(options.port) if options.tailscale else f"http://{options.bind}:{options.port}"
+            _install_compute_service(options, token_file, upstream)
+            print("DAIRACK COMPUTE SERVICE\n")
+            print(f"  endpoint     {public_endpoint}")
+            print(f"  upstream     {upstream}")
+            print("  lifecycle    systemd user service / restart on failure")
+            print(f"  unit         {_user_service_path()}")
+            print(f"  access       {'bearer token' if token else 'loopback only / no token'}")
+            if token:
+                print(f"  token file   {token_file}")
+                if options.show_token or not token_existed:
+                    print(f"\nPAIR TOKEN\n{token}")
+                print(f"\nOn the client:  dairack connect {public_endpoint}")
+            if _linger_enabled() is False:
+                print(
+                    f"\nNOTICE  Keep the service running after logout with: sudo loginctl enable-linger {getpass.getuser()}"
+                )
+            print("\nREADY  Manage with `dairack serve --service-status` or `dairack serve --remove-service`.")
+            return 0
         server = ComputeBridgeServer(
             BridgeConfig(
                 bind=options.bind,
@@ -351,7 +509,7 @@ def _run_serve(args: Sequence[str]) -> int:
             server.server_close()
         print("\nSTOPPED")
         return 130
-    except (ComputeError, OllamaError, OSError) as exc:
+    except (ComputeError, OllamaError, OSError, subprocess.TimeoutExpired) as exc:
         if server is not None:
             server.server_close()
         print(f"serve failed: {exc}", file=sys.stderr)

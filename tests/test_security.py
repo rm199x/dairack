@@ -56,6 +56,17 @@ class PermissionBoundaryTests(unittest.TestCase):
             )
             self.assertFalse(runtime.is_auto_approvable_tool_call({"name": "index_project", "path": "."}, project))
             self.assertFalse(runtime.is_auto_approvable_tool_call({"name": "web_search", "query": "secret"}, project))
+            self.assertTrue(runtime.is_auto_approvable_tool_call({"name": "hardware_status"}, project))
+            self.assertTrue(
+                runtime.is_auto_approvable_tool_call(
+                    {"name": "find_paths", "query": "source", "path": str(project)}, project
+                )
+            )
+            self.assertFalse(
+                runtime.is_auto_approvable_tool_call(
+                    {"name": "find_paths", "query": "secret", "path": str(Path(directory))}, project
+                )
+            )
 
     def test_read_auto_rejects_traversal_and_symlink_scope_escapes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -106,6 +117,26 @@ class PermissionBoundaryTests(unittest.TestCase):
             code, _output = runtime.run_shell("sudo apt update", Path.cwd())
         self.assertEqual(code, 126)
         popen.assert_not_called()
+
+    def test_windows_shell_invocation_uses_powershell_without_cmd_interpretation(self) -> None:
+        with (
+            patch.object(runtime.os, "name", "nt"),
+            patch.object(runtime.shutil, "which", side_effect=lambda name: "C:/pwsh.exe" if name == "pwsh" else None),
+        ):
+            command, use_shell = runtime.shell_invocation("Get-CimInstance Win32_Processor; 2>$null")
+
+        self.assertEqual(
+            command,
+            [
+                "C:/pwsh.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_Processor; 2>$null",
+            ],
+        )
+        self.assertFalse(use_shell)
 
         with patch.object(runtime.subprocess, "Popen") as popen:
             code, _output = runtime.run_argv(["passwd"], Path.cwd())

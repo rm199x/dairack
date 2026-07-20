@@ -46,6 +46,8 @@ change.
 | `paths.py` | XDG, Windows, and portable filesystem layout |
 | `config.py` | Versioned validation and atomic private writes |
 | `hardware.py` | Cross-platform hardware probes and conservative runtime tuning |
+| `machine.py` | Authoritative client/compute identity map and user-facing hardware status |
+| `file_discovery.py` | Bounded cross-platform discovery of named client paths |
 | `models.py` | Provider-neutral metadata, inferred capabilities, registry, and overrides |
 | `catalog.py` + `data/` | Optional versioned recommendations and known-model routing priors |
 | `model_ops.py` | Validated pull/remove operations and transport-neutral progress state |
@@ -80,7 +82,9 @@ when a recommended model exists. Ollama remains responsible for backend-specific
 ## Request Flow
 
 The coordinator first derives deterministic task signals. Adaptive and quality policies may ask the most efficient
-suitable installed model for a schema-validated semantic assessment when the request warrants it. Capability scores,
+suitable installed model for a schema-validated semantic assessment when the request warrants it. That assessment
+also declares whether the turn requires a real runtime action; the execution contract rejects prose that merely claims
+an action is underway. Action workflows receive one bounded semantic completion check before they settle. Capability scores,
 hardware fit, complexity-discounted residency, grounded-research cost, task quality demand, profile confidence, soft
 role preferences, and a small bounded learned residual produce an executor ranking. Semantic output cannot invent an
 image, bypass a capability gate, or force planning/review without supporting deterministic evidence.

@@ -11,6 +11,8 @@ class ToolRegistryTests(unittest.TestCase):
 
         self.assertEqual(schemas["read_file"]["parameters"]["required"], ["path"])
         self.assertEqual(schemas["index_project"]["parameters"]["required"], [])
+        self.assertEqual(schemas["hardware_status"]["parameters"]["required"], [])
+        self.assertEqual(schemas["find_paths"]["parameters"]["required"], ["query", "path"])
         self.assertIn("path", schemas["search_project"]["parameters"]["properties"])
         self.assertNotIn("analyze_image", schemas)
 
@@ -21,6 +23,12 @@ class ToolRegistryTests(unittest.TestCase):
         call, error = TOOL_REGISTRY.validate({"name": "read_file"})
         self.assertIsNone(call)
         self.assertIn("missing path", error)
+
+        call, error = TOOL_REGISTRY.validate(
+            {"name": "find_paths", "arguments": {"query": "Lockout", "path": "C:/Users/example"}}
+        )
+        self.assertFalse(error)
+        self.assertEqual(call["name"], "find_paths")
 
     def test_registry_owns_complete_action_presentation_metadata(self) -> None:
         allowed_risks = {"read", "write", "system", "local", "network", "coordinator"}

@@ -22,6 +22,7 @@ whether each request is blocked, shown for approval, or eligible for narrow auto
 | --- | --- | --- | --- |
 | Active-project read | Approval | Automatic | Blocked |
 | Allowlisted machine status | Approval | Automatic | Blocked |
+| Named-path search outside the project | Approval | Approval | Blocked |
 | External-path read | Approval | Approval | Blocked |
 | Shell, patch, or package action | Approval | Approval | Blocked |
 | Web search or page read | Approval | Approval | Blocked |

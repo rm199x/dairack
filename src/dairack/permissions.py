@@ -317,7 +317,14 @@ def is_read_only_tool_call(call: dict[str, str]) -> bool:
     name = call.get("name")
     if name == "shell":
         return is_read_only_shell_command(call.get("cmd", ""))
-    return name in {"read_file", "list_dir", "search_project", "consult_specialist"}
+    return name in {
+        "read_file",
+        "list_dir",
+        "find_paths",
+        "hardware_status",
+        "search_project",
+        "consult_specialist",
+    }
 
 
 def is_internal_coordinator_call(call: dict[str, str]) -> bool:
@@ -335,7 +342,9 @@ def is_auto_approvable_tool_call(
         return is_read_only_shell_command(call.get("cmd", ""))
     if name == "consult_specialist" and not str(call.get("path") or "").strip():
         return True
-    if name not in {"read_file", "list_dir", "search_project", "consult_specialist"}:
+    if name == "hardware_status":
+        return True
+    if name not in {"read_file", "list_dir", "find_paths", "search_project", "consult_specialist"}:
         return False
     scope = project_root or cwd
     try:

@@ -38,6 +38,9 @@ semantic versioning after 1.0.
 - One-package client/compute roles with an authenticated inference-only bridge, Tailscale Serve integration, private
   pairing credentials, verified server hardware profiles, and native live compute switching.
 - Confidence-gated per-turn quality, capacity, and efficiency controls with resolved-task execution and route feedback.
+- Authoritative client/compute hardware identity, bounded cross-platform path discovery, and a deterministic
+  `/hardware` surface.
+- Restartable Linux user-service lifecycle for the remote compute bridge, including native status and removal commands.
 
 ### Changed
 
@@ -78,6 +81,10 @@ semantic versioning after 1.0.
   read-auto execution, stalled inference, project-index freshness, and corrupt configuration or index state.
 - Semantic specialization now requires corroborating task evidence, and explicit compute preferences can change the
   executor without becoming sticky model state or granting action tools.
+- Semantically identified runtime actions now require real tool calls, and a bounded completion arbiter prevents
+  unexecuted commands or future-work promises from silently ending an agent turn.
+- Windows shell actions now run through PowerShell consistently instead of mixing PowerShell syntax with `cmd.exe`.
+- Fallback upgrades reuse a healthy isolated runtime instead of requiring system `venv` support again.
 
 ### Removed
 

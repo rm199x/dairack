@@ -63,7 +63,7 @@ Install Dairack on both machines. The server does not need a separate edition or
 **On the machine with Ollama and the models**
 
 ```bash
-dairack serve --tailscale --name "Home Server"
+dairack serve --install-service --tailscale --name "Home Server"
 ```
 
 On first use, Tailscale may print a tailnet approval URL and wait. Open that URL, enable Serve, and return to the
@@ -72,7 +72,9 @@ waiting indefinitely.
 
 The bridge binds to `127.0.0.1:11435`, creates a private bearer token, checks local Ollama, and exposes only the model
 API operations Dairack needs plus read-only hardware metadata. `--tailscale` publishes that loopback service over
-tailnet HTTPS. Keep the process running or place it under the operating system's user service manager.
+tailnet HTTPS. `--install-service` installs a systemd user service with restart-on-failure behavior. Inspect it with
+`dairack serve --service-status` or remove it with `dairack serve --remove-service`. Without `--install-service`, the
+bridge remains a foreground process and stops when its terminal closes.
 
 **On each client**
 

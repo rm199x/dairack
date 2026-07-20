@@ -228,6 +228,27 @@ TOOL_REGISTRY = ToolRegistry(
             target_label="PATH",
         ),
         ToolSpec(
+            "find_paths",
+            "Find files or directories by name under one explicit client-side search root.",
+            {
+                "query": {"type": "string", "description": "File, directory, or project name to match."},
+                "path": {"type": "string", "description": "Explicit client-side directory to search beneath."},
+            },
+            required=("query", "path"),
+            display_name="Path search",
+            activity="Finding paths",
+            target_field="path",
+            target_label="ROOT",
+            interruptible=True,
+        ),
+        ToolSpec(
+            "hardware_status",
+            "Read Dairack's authoritative client and configured compute hardware identities.",
+            {},
+            display_name="Hardware status",
+            activity="Reading hardware status",
+        ),
+        ToolSpec(
             "search_project",
             "Search the indexed project memory for files, symbols, or concepts.",
             {

@@ -81,17 +81,20 @@ Setup supports NVIDIA, Apple Silicon/Metal, ROCm, Windows hardware probes, and C
 
 ## Remote Compute
 
-The same Dairack package runs on the client and the model server. Start the authenticated compute bridge on the machine
-with Ollama:
+The same Dairack package runs on the client and the model server. On Linux, install the authenticated bridge as a
+restartable user service on the machine with Ollama:
 
 **On the model server**
 
 ```bash
-dairack serve --tailscale --name "Home Server"
+dairack serve --install-service --tailscale --name "Home Server"
 ```
 
 The first Tailscale Serve setup may print a one-time tailnet approval URL. Open it while the command waits; Dairack
 continues as soon as Serve is enabled.
+
+Inspect it with `dairack serve --service-status`. Foreground mode remains available by omitting `--install-service`;
+that process stops when its terminal closes.
 
 Then connect from the computer where you want to work:
 
