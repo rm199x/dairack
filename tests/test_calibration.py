@@ -6,7 +6,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dairack.coordinator.calibration import MAX_ADJUSTMENT, MAX_EVIDENCE, adjustment, load_state, observe, report, reset
+from dairack.coordinator.calibration import (
+    MAX_ADJUSTMENT,
+    MAX_EVIDENCE,
+    MAX_TOTAL_ADJUSTMENT,
+    adjustment,
+    load_state,
+    observe,
+    report,
+    reset,
+)
 
 
 class CoordinatorCalibrationTests(unittest.TestCase):
@@ -29,6 +38,50 @@ class CoordinatorCalibrationTests(unittest.TestCase):
             learned, capped_evidence = adjustment(load_state(path), "model:a", "reasoning")
             self.assertLessEqual(learned, MAX_ADJUSTMENT)
             self.assertLessEqual(capped_evidence, MAX_EVIDENCE)
+
+    def test_kind_evidence_sharpens_the_matching_kind_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "learning.json"
+            for _ in range(2):
+                observe(path, "model:a", "coding", 1, weight=3, source="feedback")
+            for _ in range(2):
+                observe(path, "model:a", "coding", -1, weight=3, source="feedback", kind="coding agent")
+            state = load_state(path)
+
+            coarse, coarse_evidence = adjustment(state, "model:a", "coding")
+            matched, matched_evidence = adjustment(state, "model:a", "coding", kind="coding agent")
+            unseen, _ = adjustment(state, "model:a", "coding", kind="deep reasoning")
+
+            # Balanced coarse evidence cancels out; the kind that actually failed stays negative.
+            self.assertEqual(coarse, 0.0)
+            self.assertLess(matched, 0.0)
+            self.assertEqual(unseen, coarse)
+            # Evidence reported is the coarse superset either way.
+            self.assertEqual(coarse_evidence, matched_evidence)
+            self.assertGreaterEqual(matched, -MAX_TOTAL_ADJUSTMENT)
+
+    def test_kind_component_is_bounded_and_needs_minimum_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "learning.json"
+            for _ in range(100):
+                observe(path, "model:a", "reasoning", 1, weight=4, source="feedback", kind="deep reasoning")
+            learned, _ = adjustment(load_state(path), "model:a", "reasoning", kind="deep reasoning")
+            self.assertGreater(learned, MAX_ADJUSTMENT)
+            self.assertLessEqual(learned, MAX_TOTAL_ADJUSTMENT)
+
+            sparse = Path(directory) / "sparse.json"
+            for _ in range(2):
+                observe(sparse, "model:b", "research", -1, source="review", kind="research")
+            learned, evidence = adjustment(load_state(sparse), "model:b", "research", kind="research")
+            self.assertEqual(learned, 0.0)
+            self.assertEqual(evidence, 2.0)
+
+    def test_report_lists_kind_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "learning.json"
+            observe(path, "model:a", "coding", -1, weight=3, source="feedback", kind="coding agent")
+            rendered = report(path)
+            self.assertIn("model:a  /  coding  /  coding agent", rendered)
 
     def test_corrupt_record_values_fail_neutral(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

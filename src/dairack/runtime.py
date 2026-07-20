@@ -46,6 +46,7 @@ from .config import (
 from .config import (
     save_config as save_app_config,
 )
+from .coordinator.calibration import MAX_TOTAL_ADJUSTMENT as MAX_LEARNED_ADJUSTMENT
 from .coordinator.calibration import adjustment as calibration_adjustment
 from .coordinator.calibration import load_state as load_calibration_state
 from .coordinator.calibration import observe as observe_calibration
@@ -1045,7 +1046,7 @@ def _orchestrator_candidate_score(
         )
     if preferred_model and name.lower() == preferred_model.lower():
         score += {"efficient": 0.045, "adaptive": 0.060, "quality": 0.045}[policy]
-    score += max(-0.06, min(0.06, learned_adjustment))
+    score += max(-MAX_LEARNED_ADJUSTMENT, min(MAX_LEARNED_ADJUSTMENT, learned_adjustment))
     score *= 0.96 + max(0.0, min(1.0, profile_confidence)) * 0.04
     if signals["vision"] and capabilities["vision"] < 0.50:
         score *= 0.12
@@ -2096,6 +2097,7 @@ def select_orchestrator_route(
         preference = str(routing_control.get("preference") or "auto") if routing_control.get("active") else "auto"
         preference_strength = float(routing_control.get("strength") or 0) if routing_control.get("active") else 0.0
         role = _coordinator_task_role(active_signals)
+        kind = _coordinator_task_kind(active_signals)
         preferred = _coordinator_role_preference(config, role, models)
         ranked: list[dict[str, Any]] = []
         for model in models:
@@ -2103,7 +2105,7 @@ def select_orchestrator_route(
                 continue
             metadata = model_capability_metadata(model)
             profile_confidence = float(metadata.get("confidence") or 0.5)
-            raw_learned, learning_evidence = calibration_adjustment(learning_state, model.name, role)
+            raw_learned, learning_evidence = calibration_adjustment(learning_state, model.name, role, kind)
             learned = _effective_learning_adjustment(active_signals, active_complexity, raw_learned)
             score = _orchestrator_candidate_score(
                 model,
@@ -2634,6 +2636,7 @@ def observe_route_outcome(
     if any(isinstance(item, dict) and item.get("source") == source for item in events):
         return f"Learning evidence already recorded for {source}."
     role = str(route.get("preference_role") or _coordinator_task_role(route.get("signals") or {}))
+    kind = str(route.get("task_kind") or "")
     model = str(route["executor"])
     learned, evidence = observe_calibration(
         coordinator_learning_path(),
@@ -2642,6 +2645,7 @@ def observe_route_outcome(
         reward,
         weight=weight,
         source=source,
+        kind=kind,
     )
     events.append(
         {
@@ -2652,7 +2656,8 @@ def observe_route_outcome(
             "evidence": round(evidence, 2),
         }
     )
-    return f"Learning recorded: {model} / {role} / adjustment {learned:+.3f} / evidence {evidence:.1f}"
+    scope = f"{role} / {kind}" if kind else role
+    return f"Learning recorded: {model} / {scope} / adjustment {learned:+.3f} / evidence {evidence:.1f}"
 
 
 def record_route_feedback(config: dict[str, Any], route: dict[str, Any] | None, value: str) -> str:
