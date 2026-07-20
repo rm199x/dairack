@@ -90,6 +90,19 @@ from .permissions import (
 )
 from .providers.ollama import OllamaError, OllamaProvider
 from .tool_protocol import TOOL_REGISTRY, decode_text_tool_call, strip_tool_protocol
+from .turn import (
+    CompletionOutcome,
+    ResponseFacts,
+    ReviewOutcome,
+    RouteFacts,
+    TurnAction,
+    TurnState,
+    completion_arbiter_outcome,
+    finalizing,
+    next_action,
+    review_outcome,
+    synthesis_exhausted,
+)
 
 # Compatibility exports for the Textual layer and existing integrations.
 is_read_only_shell_command = _is_read_only_shell_command
@@ -9639,8 +9652,8 @@ def chat_turn(
         if finalizing:
             directives.append(
                 agent_synthesis_directive(
-                    action_steps,
-                    action_limit,
+                    state.action_steps,
+                    state.action_limit,
                     retry=synthesis_retry,
                 )
             )
@@ -9674,29 +9687,30 @@ def chat_turn(
         messages.append({"role": "assistant", "content": response})
         return
 
-    review_rounds = 0
+    state = TurnState(action_limit=agent_action_limit(config))
     revision_feedback = ""
-    completion_repair_attempted = False
-    action_contract_repair_attempted = False
-    action_repair_attempted = False
-    action_completion_repairs = 0
-    action_limit = agent_action_limit(config)
-    action_steps = 0
-    synthesis_attempts = 0
+    action_feedback = ""
     loop_guard = ActionLoopGuard()
+    contract = route.get("action_contract")
+    route_facts = RouteFacts(
+        has_reviewer=bool(route.get("reviewer")),
+        action_requirement=action_contract_directive(route, retry=True) or "",
+        contract_capability=bool(isinstance(contract, dict) and contract.get("capability")),
+    )
     while True:
-        finalizing = action_steps >= action_limit or loop_guard.force_synthesis
-        if finalizing:
-            synthesis_attempts += 1
-            if synthesis_attempts > 2:
+        is_final = finalizing(state, loop_guard.force_synthesis)
+        if is_final:
+            state.synthesis_attempts += 1
+            if synthesis_exhausted(state):
                 print("Task action budget reached; final synthesis could not be completed.")
                 return
         native_calls: list[dict[str, Any]] = []
         request_messages, request_tools = routed_messages(
             revision_feedback,
-            finalizing,
-            synthesis_attempts > 1,
+            is_final,
+            state.synthesis_attempts > 1,
         )
+        revision_feedback = ""
         request_retry_used = False
         while True:
             try:
@@ -9717,7 +9731,6 @@ def chat_turn(
                 request_retry_used = True
                 native_calls.clear()
         action_feedback = ""
-        revision_feedback = ""
         call, parse_error = resolve_tool_request(response, native_calls)
         assistant_message: dict[str, Any] = {"role": "assistant", "content": response}
         if native_calls:
@@ -9728,45 +9741,32 @@ def chat_turn(
                 response,
                 dict(getattr(provider, "last_stats", {}) or {}),
             )
-        action_requirement = action_contract_directive(route, retry=True)
-        if (
-            not call
-            and not parse_error
-            and not finalizing
-            and action_steps == 0
-            and action_requirement
-            and not action_contract_repair_attempted
-        ):
-            action_contract_repair_attempted = True
-            action_feedback = action_requirement
+        facts = ResponseFacts(
+            has_call=bool(call),
+            parse_error=parse_error or "",
+            incomplete_reason=incomplete_reason,
+            response_blank=not response.strip(),
+        )
+        action = next_action(state, facts, route_facts, is_final)
+
+        if action is TurnAction.REPAIR_CONTRACT:
+            state.contract_repair_attempted = True
+            action_feedback = route_facts.action_requirement
             continue
-        if incomplete_reason and not completion_repair_attempted:
-            completion_repair_attempted = True
-            route["completion_retry"] = {
-                "attempted": True,
-                "reason": incomplete_reason,
-                "recovered": False,
-            }
+        if action is TurnAction.RETRY_COMPLETION:
+            state.completion_repair_attempted = True
+            route["completion_retry"] = {"attempted": True, "reason": incomplete_reason, "recovered": False}
             revision_feedback = completion_retry_directive(incomplete_reason)
             continue
-        if completion_repair_attempted and not incomplete_reason and not call and not parse_error:
+        if state.completion_repair_attempted and not incomplete_reason and not call and not parse_error:
             retry_record = route.get("completion_retry")
             if isinstance(retry_record, dict):
                 retry_record["recovered"] = True
-        if incomplete_reason and not finalizing:
+        if action is TurnAction.STOP_INCOMPLETE:
             messages.append(assistant_message)
             print(f"Response remained structurally incomplete after one retry: {incomplete_reason}")
             return
-        contract = route.get("action_contract")
-        if (
-            not call
-            and not parse_error
-            and not incomplete_reason
-            and not finalizing
-            and action_steps > 0
-            and isinstance(contract, dict)
-            and contract.get("capability")
-        ):
+        if action is TurnAction.CHECK_COMPLETION:
             try:
                 completion = assess_action_completion(
                     provider,
@@ -9779,58 +9779,62 @@ def chat_turn(
                 completion = {"error": str(exc)}
             if completion:
                 route["action_completion"] = completion
-            enforce_completion = (
+            enforce_completion = bool(
                 completion
                 and not completion.get("error")
                 and not completion.get("complete")
                 and float(completion.get("confidence") or 0) >= 0.65
             )
-            if enforce_completion and action_completion_repairs < 2:
-                action_completion_repairs += 1
+            outcome = completion_arbiter_outcome(state, enforce_completion)
+            if outcome is CompletionOutcome.REPAIR:
+                state.action_completion_repairs += 1
                 action_feedback = action_completion_directive(completion)
                 continue
-            if enforce_completion:
+            if outcome is CompletionOutcome.STOP:
                 reason = str(completion.get("reason") or "completion could not be verified")
                 stopped = f"The requested action did not complete.\n{reason}"
                 messages.append({"role": "assistant", "content": stopped})
                 print(stopped)
                 return
-        if finalizing:
+            action = next_action(state, facts, route_facts, is_final, completion_checked=True)
+
+        if action is TurnAction.SYNTHESIZE_RETRY:
             messages.append(assistant_message)
-            invalid_final = bool(call or parse_error or incomplete_reason or not response.strip())
-            if invalid_final and synthesis_attempts < 2:
-                if call:
-                    messages.append(denied_tool_history_message(call, "because the task action budget is exhausted"))
-                else:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Tool actions are unavailable for this task now. Return a concise final answer "
-                                "using the action results already present."
-                            ),
-                        }
-                    )
-                continue
-            if invalid_final:
-                print("Task action budget reached; the executor did not return a usable final synthesis.")
+            if call:
+                messages.append(denied_tool_history_message(call, "because the task action budget is exhausted"))
             else:
-                print(response)
-            return
-        if parse_error:
-            if not action_repair_attempted:
-                action_repair_attempted = True
-                messages.append(assistant_message)
                 messages.append(
                     {
                         "role": "user",
                         "content": (
-                            "Action request rejected by the runtime: "
-                            f"{parse_error}. Return exactly one corrected tool request and no other text."
+                            "Tool actions are unavailable for this task now. Return a concise final answer "
+                            "using the action results already present."
                         ),
                     }
                 )
-                continue
+            continue
+        if action is TurnAction.FINALIZE_FAIL:
+            messages.append(assistant_message)
+            print("Task action budget reached; the executor did not return a usable final synthesis.")
+            return
+        if action is TurnAction.FINALIZE_DELIVER:
+            messages.append(assistant_message)
+            print(response)
+            return
+        if action is TurnAction.REPAIR_PARSE:
+            state.parse_repair_attempted = True
+            messages.append(assistant_message)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Action request rejected by the runtime: "
+                        f"{parse_error}. Return exactly one corrected tool request and no other text."
+                    ),
+                }
+            )
+            continue
+        if action is TurnAction.BLOCK_PARSE:
             messages.append(assistant_message)
             observe_route_outcome(config, route, -1.0, weight=1.0, source="tool-protocol")
             route["action_parse_error"] = parse_error
@@ -9845,28 +9849,31 @@ def chat_turn(
             )
             print("The requested action stayed malformed after a correction attempt; no action was run.")
             return
-        if not call:
-            if route.get("reviewer") and review_rounds < 2:
-                review_rounds += 1
-                review = orchestrator_review(provider, route, messages, response, config)
-                review["round"] = review_rounds
-                route["review"] = review
-                if review.get("verdict") in {"pass", "revise"}:
-                    observe_route_outcome(
-                        config,
-                        route,
-                        1.0 if review["verdict"] == "pass" else -1.0,
-                        weight=0.75,
-                        source="independent-review",
-                    )
-                if review.get("verdict") == "revise" and review.get("feedback"):
-                    if review_rounds >= 2:
-                        review["unresolved"] = True
-                        print("[review still requests changes; kept the revised answer]")
-                    else:
-                        revision_feedback = str(review["feedback"])
-                        print("[review requested corrections; revising]")
-                        continue
+        if action is TurnAction.REVIEW:
+            state.review_rounds += 1
+            review = orchestrator_review(provider, route, messages, response, config)
+            review["round"] = state.review_rounds
+            route["review"] = review
+            if review.get("verdict") in {"pass", "revise"}:
+                observe_route_outcome(
+                    config,
+                    route,
+                    1.0 if review["verdict"] == "pass" else -1.0,
+                    weight=0.75,
+                    source="independent-review",
+                )
+            outcome = review_outcome(state, str(review.get("verdict") or ""), bool(review.get("feedback")))
+            if outcome is ReviewOutcome.REVISE:
+                revision_feedback = str(review["feedback"])
+                print("[review requested corrections; revising]")
+                continue
+            if outcome is ReviewOutcome.UNRESOLVED:
+                review["unresolved"] = True
+                print("[review still requests changes; kept the revised answer]")
+            print(response)
+            messages.append(assistant_message)
+            return
+        if action is TurnAction.DELIVER:
             print(response)
             messages.append(assistant_message)
             return
@@ -9897,9 +9904,9 @@ def chat_turn(
             print(f"skipped repeat action: {tool_summary(call)}")
             continue
 
-        action_steps += 1
-        route["tool_steps"] = action_steps
-        route["tool_limit"] = action_limit
+        state.action_steps += 1
+        route["tool_steps"] = state.action_steps
+        route["tool_limit"] = state.action_limit
         chat["last_route"] = route
         if call.get("name") == "consult_specialist":
             specialty = coordinator_specialty(call).replace("_", " ")

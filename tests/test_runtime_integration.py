@@ -1903,6 +1903,81 @@ class LoopResilienceTests(unittest.TestCase):
             )
         )
 
+    def test_plain_agent_review_revises_once_then_delivers(self) -> None:
+        class ReviewingProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.answers = ["First draft answer.", "Corrected final answer."]
+                self.reviews = ["VERDICT: REVISE\nFEEDBACK: cite the source file."]
+
+            def chat(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> str:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                return self.answers.pop(0)
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                # The independent reviewer collects its verdict through chat_stream.
+                self.last_stats = {"done_reason": "stop"}
+                yield self.reviews.pop(0) if self.reviews else "VERDICT: PASS"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = coordinator_config(semantic=False)
+            config.update({"model_mode": "direct", "model": "qwen3.5:9b", "agent": True, "auto_compact": False})
+            route = {"reviewer": "qwen3.5:9b", "executor": "qwen3.5:9b", "policy": "quality", "task_kind": "coding"}
+            chat: dict[str, Any] = {"summary": "", "project_root": "", "last_route": route}
+            messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "Explain the router."}]
+            provider = ReviewingProvider()
+            output = io.StringIO()
+            with redirect_stdout(output), patch.object(CORE, "select_orchestrator_route", return_value=route):
+                CORE.chat_turn(provider, "qwen3.5:9b", messages, config, root, chat)
+
+        text = output.getvalue()
+        self.assertIn("review requested corrections; revising", text)
+        self.assertIn("Corrected final answer.", text)
+        assistant_messages = [m for m in messages if m.get("role") == "assistant"]
+        self.assertEqual(assistant_messages[-1]["content"], "Corrected final answer.")
+        # The revised answer is re-reviewed exactly once and, here, accepted.
+        self.assertEqual(chat["last_route"]["review"]["verdict"], "pass")
+        self.assertEqual(chat["last_route"]["review"]["round"], 2)
+
+    def test_plain_agent_executes_a_tool_then_delivers(self) -> None:
+        class ToolThenAnswerProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.responses = ['read_file{"path":"app.py"}', "app.py defines the entry point."]
+
+            def chat(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> str:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                return self.responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+            config = coordinator_config(semantic=False)
+            config.update(
+                {
+                    "model_mode": "direct",
+                    "model": "qwen3.5:9b",
+                    "agent": True,
+                    "auto_compact": False,
+                    "permission_mode": "read-auto",
+                }
+            )
+            chat: dict[str, Any] = {"summary": "", "project_root": "", "last_route": {}}
+            messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "Read app.py"}]
+            provider = ToolThenAnswerProvider()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                CORE.chat_turn(provider, "qwen3.5:9b", messages, config, root, chat)
+
+        text = output.getvalue()
+        self.assertIn("def main()", text)
+        self.assertIn("app.py defines the entry point.", text)
+        tool_results = [m for m in messages if str(m.get("content") or "").startswith("Structured tool result:")]
+        self.assertEqual(len(tool_results), 1)
+
 
 class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_inference_failure_is_available_to_the_follow_up_turn(self) -> None:
