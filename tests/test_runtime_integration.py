@@ -1561,7 +1561,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
             "//server/share/image.png",
         )
         self.assertEqual(
-            CORE.file_url_path("file:///home/user/literal%2520name.png"),
+            CORE.file_url_path("file:///home/user/literal%2520name.png", windows=False),
             "/home/user/literal%20name.png",
         )
 
