@@ -66,6 +66,10 @@ Install Dairack on both machines. The server does not need a separate edition or
 dairack serve --tailscale --name "Home Server"
 ```
 
+On first use, Tailscale may print a tailnet approval URL and wait. Open that URL, enable Serve, and return to the
+terminal; Dairack continues automatically. Non-interactive launches stop with the equivalent setup command instead of
+waiting indefinitely.
+
 The bridge binds to `127.0.0.1:11435`, creates a private bearer token, checks local Ollama, and exposes only the model
 API operations Dairack needs plus read-only hardware metadata. `--tailscale` publishes that loopback service over
 tailnet HTTPS. Keep the process running or place it under the operating system's user service manager.

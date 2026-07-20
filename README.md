@@ -90,6 +90,9 @@ with Ollama:
 dairack serve --tailscale --name "Home Server"
 ```
 
+The first Tailscale Serve setup may print a one-time tailnet approval URL. Open it while the command waits; Dairack
+continues as soon as Serve is enabled.
+
 Then connect from the computer where you want to work:
 
 **On the client**

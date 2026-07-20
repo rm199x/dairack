@@ -6,7 +6,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from test_models import hardware
 
@@ -181,3 +181,56 @@ class CliTests(unittest.TestCase):
             self.assertEqual(cli.main(["connect", "http://192.168.1.20:11435"]), 2)
         probe.assert_not_called()
         self.assertIn("requires HTTPS", error.getvalue())
+
+    def test_tailscale_serve_exposes_interactive_first_use_flow(self) -> None:
+        serve_result = SimpleNamespace(returncode=0)
+        status_result = SimpleNamespace(
+            returncode=0,
+            stdout='{"Self": {"DNSName": "compute.example.ts.net."}}',
+        )
+        output = io.StringIO()
+        with (
+            patch.object(cli.shutil, "which", return_value="/usr/bin/tailscale"),
+            patch.object(cli, "_interactive_terminal", return_value=True),
+            patch.object(cli.subprocess, "run", side_effect=(serve_result, status_result)) as run,
+            redirect_stdout(output),
+        ):
+            endpoint = cli._tailscale_serve(11435)
+
+        self.assertEqual(endpoint, "https://compute.example.ts.net")
+        self.assertEqual(run.call_args_list[0].args[0], ["/usr/bin/tailscale", "serve", "--bg", "--yes", "11435"])
+        self.assertNotIn("capture_output", run.call_args_list[0].kwargs)
+        self.assertIn("approval URL", output.getvalue())
+
+    def test_tailscale_serve_never_waits_indefinitely_without_a_terminal(self) -> None:
+        command = ["/usr/bin/tailscale", "serve", "--bg", "--yes", "11435"]
+        timeout = cli.subprocess.TimeoutExpired(
+            command,
+            20,
+            output="Serve is not enabled.\nhttps://login.tailscale.com/f/serve?node=test",
+        )
+        with (
+            patch.object(cli.shutil, "which", return_value="/usr/bin/tailscale"),
+            patch.object(cli, "_interactive_terminal", return_value=False),
+            patch.object(cli.subprocess, "run", side_effect=timeout),
+            self.assertRaisesRegex(cli.ComputeError, "interactive first-use approval") as raised,
+        ):
+            cli._tailscale_serve(11435)
+
+        self.assertIn("https://login.tailscale.com/f/serve?node=test", str(raised.exception))
+
+    def test_cancelled_tailscale_setup_closes_bridge_without_traceback(self) -> None:
+        server = MagicMock()
+        server.server_address = ("127.0.0.1", 11435)
+        output = io.StringIO()
+        with (
+            patch.object(cli, "OllamaProvider"),
+            patch.object(cli, "ComputeBridgeServer", return_value=server),
+            patch.object(cli, "_tailscale_serve", side_effect=KeyboardInterrupt),
+            redirect_stdout(output),
+        ):
+            result = cli._run_serve(("--tailscale", "--no-auth"))
+
+        self.assertEqual(result, 130)
+        server.server_close.assert_called_once_with()
+        self.assertIn("STOPPED", output.getvalue())

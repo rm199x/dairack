@@ -256,25 +256,61 @@ def _serve_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _interactive_terminal() -> bool:
+    streams = (sys.stdin, sys.stdout, sys.stderr)
+    return all(bool(getattr(stream, "isatty", lambda: False)()) for stream in streams)
+
+
+def _subprocess_output(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="replace").strip()
+    return (value or "").strip()
+
+
 def _tailscale_serve(port: int) -> str:
     executable = shutil.which("tailscale")
     if not executable:
         raise ComputeError("Tailscale is not installed or is not on PATH")
-    completed = subprocess.run(
-        [executable, "serve", "--bg", str(port)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    command = [executable, "serve", "--bg", "--yes", str(port)]
+    if _interactive_terminal():
+        print("TAILSCALE  Configuring the tailnet HTTPS endpoint...", flush=True)
+        print("           First use may print an approval URL; open it to continue.\n", flush=True)
+        completed = subprocess.run(command, check=False)
+    else:
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired as exc:
+            detail = _subprocess_output(exc.stderr) or _subprocess_output(exc.stdout)
+            message = (
+                "Tailscale Serve needs interactive first-use approval; run "
+                f"`tailscale serve --bg --yes {port}` in a terminal, open the URL it prints, then retry"
+            )
+            if detail:
+                message = f"{message}\n{detail}"
+            raise ComputeError(message) from exc
     if completed.returncode:
-        detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+        detail = (
+            _subprocess_output(getattr(completed, "stderr", None))
+            or _subprocess_output(getattr(completed, "stdout", None))
+            or f"exit {completed.returncode}"
+        )
         raise ComputeError(f"could not configure Tailscale Serve: {detail}")
-    status = subprocess.run(
-        [executable, "status", "--json"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        status = subprocess.run(
+            [executable, "status", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return "the HTTPS URL shown by `tailscale serve status`"
     try:
         payload = json.loads(status.stdout) if status.returncode == 0 else {}
     except json.JSONDecodeError:
@@ -310,6 +346,11 @@ def _run_serve(args: Sequence[str]) -> int:
         )
         port = int(server.server_address[1])
         public_endpoint = _tailscale_serve(port) if options.tailscale else f"http://{options.bind}:{port}"
+    except KeyboardInterrupt:
+        if server is not None:
+            server.server_close()
+        print("\nSTOPPED")
+        return 130
     except (ComputeError, OllamaError, OSError) as exc:
         if server is not None:
             server.server_close()
