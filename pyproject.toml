@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dairack"
+dynamic = ["version"]
+description = "Local-first terminal AI with coordinated local or remote Ollama compute"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Dairack contributors" }]
+keywords = ["ollama", "terminal", "local-ai", "remote-compute", "coding-agent", "tui"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows :: Windows 10",
+  "Operating System :: Microsoft :: Windows :: Windows 11",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+]
+dependencies = [
+  "packaging>=24,<27",
+  "prompt-toolkit>=3.0.52,<4",
+  "textual>=8.2,<9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "pytest>=8.3",
+  "ruff==0.15.22",
+  "twine>=6,<7",
+]
+
+[project.scripts]
+dairack = "dairack.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rm199x/dairack"
+Repository = "https://github.com/rm199x/dairack.git"
+Issues = "https://github.com/rm199x/dairack/issues"
+Documentation = "https://github.com/rm199x/dairack#readme"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.package-data]
+dairack = ["data/*.json"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "dairack.__version__" }
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["B", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"

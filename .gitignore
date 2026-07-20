@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.coverage.*
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.venv/
+build/
+dist/
+wheelhouse/
+*.log
+.DS_Store
+Thumbs.db
+
+# Local product-review material is retained outside the published source tree.
+/dairack-audit-report.md
+/dairack-reaudit.md
+/image*.png

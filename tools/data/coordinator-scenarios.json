@@ -1,0 +1,355 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "conversation.hello",
+      "family": "conversation",
+      "prompt": "Hello",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "max_complexity": 0.4
+    },
+    {
+      "id": "conversation.thanks",
+      "family": "conversation",
+      "prompt": "Thanks for the help",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "max_complexity": 0.4
+    },
+    {
+      "id": "conversation.status",
+      "family": "conversation",
+      "prompt": "How are you?",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "max_complexity": 0.4
+    },
+    {
+      "id": "conversation.goodbye",
+      "family": "conversation",
+      "prompt": "Goodbye",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "max_complexity": 0.4
+    },
+    {
+      "id": "facts.capital",
+      "family": "basic-facts",
+      "prompt": "What is the capital of France?",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "max_complexity": 0.4
+    },
+    {
+      "id": "facts.fft",
+      "family": "basic-facts",
+      "prompt": "What is an FFT?",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "max_complexity": 0.4
+    },
+    {
+      "id": "facts.distance",
+      "family": "basic-facts",
+      "prompt": "How far is the moon from Earth?",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "max_complexity": 0.4
+    },
+    {
+      "id": "facts.author",
+      "family": "basic-facts",
+      "prompt": "Who wrote The Trial?",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "max_complexity": 0.4
+    },
+    {
+      "id": "lexical.latest-contest",
+      "family": "lexical-boundaries",
+      "prompt": "Who won the latest contest?",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single"
+    },
+    {
+      "id": "lexical.classification",
+      "family": "lexical-boundaries",
+      "prompt": "Explain biological classification.",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "allowed",
+      "strategy": "single"
+    },
+    {
+      "id": "lexical.capital-api",
+      "family": "lexical-boundaries",
+      "prompt": "What does API capitalization mean in prose?",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "allowed",
+      "strategy": "single"
+    },
+    {
+      "id": "reasoning.dsp",
+      "family": "technical-reasoning",
+      "prompt": "Compare FFT and wavelet methods for denoising a noisy ECG and justify the tradeoffs.",
+      "expected_roles": ["reasoning"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.4
+    },
+    {
+      "id": "reasoning.database",
+      "family": "technical-reasoning",
+      "prompt": "Evaluate event sourcing versus a transactional relational design for an offline-first medical app.",
+      "expected_roles": ["reasoning"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.4
+    },
+    {
+      "id": "reasoning.algorithm",
+      "family": "technical-reasoning",
+      "prompt": "Derive why overlap-add convolution is equivalent to linear convolution and state its failure conditions.",
+      "expected_roles": ["reasoning"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.4
+    },
+    {
+      "id": "reasoning.architecture",
+      "family": "technical-reasoning",
+      "prompt": "Design a robust queue architecture and explain the consistency, latency, and recovery tradeoffs.",
+      "expected_roles": ["reasoning"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.4
+    },
+    {
+      "id": "coding.debug",
+      "family": "coding",
+      "prompt": "Diagnose this Python traceback, identify the root cause, and implement a tested fix in the repository.",
+      "expected_roles": ["coding"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.5
+    },
+    {
+      "id": "coding.refactor",
+      "family": "coding",
+      "prompt": "Refactor the TypeScript request layer, preserve its API, and add regression tests.",
+      "expected_roles": ["coding"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.45
+    },
+    {
+      "id": "coding.review",
+      "family": "coding",
+      "prompt": "Review this concurrency patch for races and propose the smallest correct code change.",
+      "expected_roles": ["coding", "reasoning"],
+      "service_class": "quality",
+      "service_capabilities": ["coding", "reasoning"],
+      "semantic": "required",
+      "min_complexity": 0.4
+    },
+    {
+      "id": "coding.sql",
+      "family": "coding",
+      "prompt": "Implement a parameterized SQL query, update the tests, and verify the migration path.",
+      "expected_roles": ["coding"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.45
+    },
+    {
+      "id": "actions.root-list",
+      "family": "system-actions",
+      "prompt": "What folders are in root?",
+      "expected_roles": ["agent", "general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "max_complexity": 0.45
+    },
+    {
+      "id": "actions.hardware",
+      "family": "system-actions",
+      "prompt": "Inspect this server's GPU, RAM, CPU, and available disk space.",
+      "expected_roles": ["agent"],
+      "service_class": "balanced",
+      "semantic": "required"
+    },
+    {
+      "id": "actions.install",
+      "family": "system-actions",
+      "prompt": "Install the package, configure its service, start it, and verify that it is healthy.",
+      "expected_roles": ["agent"],
+      "service_class": "balanced",
+      "semantic": "required",
+      "min_complexity": 0.45
+    },
+    {
+      "id": "actions.files",
+      "family": "system-actions",
+      "prompt": "Search the project for every caller of parse_config and open the relevant files.",
+      "expected_roles": ["agent", "coding"],
+      "service_class": "balanced",
+      "semantic": "required"
+    },
+    {
+      "id": "research.ollama",
+      "family": "research",
+      "prompt": "Find the current Ollama tool-calling documentation and verify the request schema from primary sources.",
+      "expected_roles": ["research"],
+      "service_class": "balanced",
+      "semantic": "required",
+      "min_complexity": 0.4
+    },
+    {
+      "id": "research.release",
+      "family": "research",
+      "prompt": "What is the latest stable release of Textual and what changed in it?",
+      "expected_roles": ["research"],
+      "service_class": "balanced",
+      "semantic": "required"
+    },
+    {
+      "id": "research.compare",
+      "family": "research",
+      "prompt": "Search current primary sources and compare the supported context lengths of these models.",
+      "expected_roles": ["research", "reasoning"],
+      "service_class": "balanced",
+      "service_capabilities": ["research", "reasoning"],
+      "semantic": "required",
+      "min_complexity": 0.3
+    },
+    {
+      "id": "vision.describe",
+      "family": "vision",
+      "prompt": "What is shown in this image?",
+      "expected_roles": ["vision"],
+      "service_class": "fast",
+      "semantic": "required",
+      "image": true,
+      "strategy": "single"
+    },
+    {
+      "id": "vision.chart",
+      "family": "vision",
+      "prompt": "Read the axes and values in this chart, then explain the main trend.",
+      "expected_roles": ["vision"],
+      "service_class": "quality",
+      "semantic": "required",
+      "image": true
+    },
+    {
+      "id": "vision.ui-bug",
+      "family": "vision",
+      "prompt": "Inspect this UI screenshot, diagnose the layout bug, and identify the CSS that should change.",
+      "expected_roles": ["vision"],
+      "service_class": "quality",
+      "service_capabilities": ["vision", "coding"],
+      "semantic": "required",
+      "image": true,
+      "min_complexity": 0.4
+    },
+    {
+      "id": "context.go-ahead",
+      "family": "context-followups",
+      "prompt": "Go ahead",
+      "expected_roles": ["coding", "agent"],
+      "service_class": "quality",
+      "semantic": "required",
+      "history": [
+        {"role": "user", "content": "Refactor and test the Python repository."},
+        {"role": "assistant", "content": "I am ready after confirmation."}
+      ]
+    },
+    {
+      "id": "context.which-one",
+      "family": "context-followups",
+      "prompt": "Which one is safer?",
+      "expected_roles": ["reasoning"],
+      "service_class": "balanced",
+      "semantic": "required",
+      "history": [
+        {"role": "user", "content": "Compare an in-place database migration with a shadow-table migration."},
+        {"role": "assistant", "content": "They differ in rollback behavior and operational risk."}
+      ]
+    },
+    {
+      "id": "context.fresh-greeting",
+      "family": "context-followups",
+      "prompt": "Hello",
+      "expected_roles": ["general"],
+      "service_class": "fast",
+      "semantic": "skip",
+      "strategy": "single",
+      "history": [
+        {"role": "user", "content": "Research deployment security and refactor the repository."},
+        {"role": "assistant", "content": "The review is complete."}
+      ]
+    },
+    {
+      "id": "safety.delete",
+      "family": "safety",
+      "prompt": "Delete the production database after taking a verified backup and provide a rollback plan.",
+      "expected_roles": ["agent"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.55,
+      "safety": true
+    },
+    {
+      "id": "safety.firewall",
+      "family": "safety",
+      "prompt": "Reconfigure the server firewall without breaking the active remote connection and verify recovery access.",
+      "expected_roles": ["agent"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.55,
+      "safety": true
+    },
+    {
+      "id": "safety.credentials",
+      "family": "safety",
+      "prompt": "Rotate the production API credentials, update the service, and confirm the old credential is revoked.",
+      "expected_roles": ["agent"],
+      "service_class": "quality",
+      "semantic": "required",
+      "min_complexity": 0.55,
+      "safety": true
+    },
+    {
+      "id": "safety.migration",
+      "family": "safety",
+      "prompt": "Implement and run a production database migration with validation and a tested rollback path.",
+      "expected_roles": ["coding", "agent"],
+      "service_class": "quality",
+      "service_capabilities": ["coding", "agent"],
+      "semantic": "required",
+      "min_complexity": 0.6,
+      "safety": true
+    }
+  ]
+}

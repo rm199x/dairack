@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-07-19",
+  "models": [
+    {
+      "name": "qwen3.5:4b",
+      "label": "Qwen 3.5 4B",
+      "download_gib": 3.4,
+      "minimum_ram_gib": 8,
+      "preferred_vram_gib": 4,
+      "capabilities": ["tools", "thinking", "vision"],
+      "role_scores": {
+        "general": 0.70,
+        "vision": 0.72,
+        "coding": 0.58,
+        "reasoning": 0.60
+      },
+      "source_url": "https://ollama.com/library/qwen3.5/tags"
+    },
+    {
+      "name": "qwen3.5:9b",
+      "label": "Qwen 3.5 9B",
+      "download_gib": 6.6,
+      "minimum_ram_gib": 12,
+      "preferred_vram_gib": 8,
+      "capabilities": ["tools", "thinking", "vision"],
+      "role_scores": {
+        "general": 0.82,
+        "vision": 0.80,
+        "coding": 0.70,
+        "reasoning": 0.73
+      },
+      "source_url": "https://ollama.com/library/qwen3.5/tags"
+    },
+    {
+      "name": "qwen3.5:27b",
+      "label": "Qwen 3.5 27B",
+      "download_gib": 17.0,
+      "minimum_ram_gib": 24,
+      "preferred_vram_gib": 16,
+      "capabilities": ["tools", "thinking", "vision"],
+      "role_scores": {
+        "general": 0.91,
+        "vision": 0.88,
+        "coding": 0.82,
+        "reasoning": 0.88
+      },
+      "source_url": "https://ollama.com/library/qwen3.5/tags"
+    },
+    {
+      "name": "qwen3-coder:30b",
+      "label": "Qwen3 Coder 30B",
+      "download_gib": 19.0,
+      "minimum_ram_gib": 24,
+      "preferred_vram_gib": 16,
+      "capabilities": ["tools"],
+      "role_scores": {
+        "general": 0.78,
+        "coding": 0.94,
+        "agent": 0.92,
+        "reasoning": 0.78
+      },
+      "source_url": "https://ollama.com/library/qwen3-coder/tags"
+    },
+    {
+      "name": "devstral-small-2:latest",
+      "label": "Devstral Small 2 24B",
+      "download_gib": 15.0,
+      "minimum_ram_gib": 24,
+      "preferred_vram_gib": 16,
+      "capabilities": ["tools", "vision"],
+      "role_scores": {
+        "general": 0.78,
+        "vision": 0.80,
+        "coding": 0.92,
+        "agent": 0.94,
+        "reasoning": 0.77
+      },
+      "source_url": "https://ollama.com/library/devstral-small-2"
+    },
+    {
+      "name": "gpt-oss:20b",
+      "label": "GPT-OSS 20B",
+      "download_gib": 14.0,
+      "minimum_ram_gib": 20,
+      "preferred_vram_gib": 12,
+      "capabilities": ["tools", "thinking"],
+      "role_scores": {
+        "general": 0.84,
+        "coding": 0.80,
+        "agent": 0.82,
+        "reasoning": 0.93
+      },
+      "source_url": "https://ollama.com/library/gpt-oss/tags"
+    }
+  ],
+  "bundles": [
+    {
+      "id": "minimal",
+      "label": "Lean",
+      "summary": "One responsive general and vision model",
+      "roles": ["general"],
+      "preferences": {
+        "general": ["qwen3.5:4b", "qwen3.5:9b"]
+      }
+    },
+    {
+      "id": "balanced",
+      "label": "Balanced",
+      "summary": "Fast general work plus a coding and agent specialist",
+      "roles": ["general", "coding"],
+      "preferences": {
+        "general": ["qwen3.5:9b", "qwen3.5:4b"],
+        "coding": ["qwen3-coder:30b", "devstral-small-2:latest", "qwen3.5:9b"]
+      }
+    },
+    {
+      "id": "complete",
+      "label": "Complete",
+      "summary": "General, coding, and independent reasoning coverage",
+      "roles": ["general", "coding", "reasoning"],
+      "preferences": {
+        "general": ["qwen3.5:9b", "qwen3.5:27b"],
+        "coding": ["qwen3-coder:30b", "devstral-small-2:latest"],
+        "reasoning": ["gpt-oss:20b", "qwen3.5:27b"]
+      }
+    }
+  ]
+}

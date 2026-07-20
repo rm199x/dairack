@@ -1,0 +1,127 @@
+# Architecture
+
+## Design Constraints
+
+Dairack is local-first and provider-backed. Models propose work; deterministic code owns hardware detection, routing
+policy, persistence, permission checks, patch application, and UI state. Generated machine policy belongs in user
+configuration, never in source tables keyed to one developer's model collection.
+
+The current source tree is an extraction from a mature single-file installation. New lifecycle and policy code is
+modular. `runtime.py` remains a compatibility core for the established conversation, agent, indexing, and fallback UI
+behavior while those domains are separated behind tests. It should shrink over time; new independent features must
+not be added to it by default.
+
+## Modules
+
+| Module | Ownership |
+| --- | --- |
+| `cli.py` | Stable console entry point and lifecycle subcommands |
+| `paths.py` | XDG, Windows, and portable filesystem layout |
+| `config.py` | Versioned validation and atomic private writes |
+| `hardware.py` | Cross-platform hardware probes and conservative runtime tuning |
+| `models.py` | Provider-neutral metadata, inferred capabilities, registry, and overrides |
+| `catalog.py` + `data/` | Optional versioned recommendations and known-model routing priors |
+| `model_ops.py` | Validated pull/remove operations and transport-neutral progress state |
+| `permissions.py` | Tool classification, project path scope, and interactive credential guards |
+| `network.py` | Resolve-validate-pin HTTP transport, redirect policy, and bounded cancellation |
+| `providers/` | Inference transport contracts and Ollama HTTP adapter |
+| `compute.py` | Compute endpoint policy, private credentials, identity probing, and connection state |
+| `bridge.py` | Authenticated inference-only Ollama proxy and verified server hardware metadata |
+| `coordinator/policy.py` | Named quality/cost policy controls |
+| `coordinator/tuning.py` | Small validated baseline tuning vector |
+| `coordinator/calibration.py` | Bounded per-machine model/role outcome residuals |
+| `ui/textual_app.py` | Textual presentation and interaction layer |
+| `runtime.py` | Compatibility application core pending further domain extraction |
+| `bootstrap.py` | First-run initialization and environment diagnostics |
+| `updates.py` | Cached release discovery and install-owner-aware update commands |
+
+## Initialization Flow
+
+1. Resolve paths and validate `config.json`.
+2. Query Ollama `/api/version`, `/api/tags`, and `/api/show`.
+3. Detect CPU topology, available memory, and supported accelerators.
+4. Normalize provider results into `ModelDescriptor` values.
+5. Infer capability priors from parameter scale and declared features.
+6. Enrich known catalog matches; unknown models remain confidence-labeled inferred profiles.
+7. Generate a conservative runtime profile from model size, context limit, and local memory.
+8. Merge explicit user overrides from the previous registry.
+9. Atomically write `hardware.json`, `models.json`, and validated configuration.
+
+Models that exceed the conservative memory budget are marked `constrained` and are not selected as automatic defaults
+when a recommended model exists. Ollama remains responsible for backend-specific layer placement.
+
+## Request Flow
+
+The coordinator first derives deterministic task signals. Adaptive and quality policies may ask the most efficient
+suitable installed model for a schema-validated semantic assessment when the request warrants it. Capability scores,
+hardware fit, complexity-discounted residency, grounded-research cost, task quality demand, profile confidence, soft
+role preferences, and a small bounded learned residual produce an executor ranking. Semantic output cannot invent an
+image, bypass a capability gate, or force planning/review without supporting deterministic evidence.
+Planning, independent review, and specialist delegation are separate bounded stages, each visible in route state and
+interruptible by the user.
+
+Natural-language compute controls are a closed, schema-validated contract separate from task intent. They are
+confidence-gated, apply to one turn only, and cannot create action authority. A request for higher capacity must pass a
+provider-neutral material-capacity and task-fit check; quality and efficiency controls adjust bounded ranking policy.
+The resolved task is carried to the selected executor, while ordinary model discussion and content styling remain on
+the automatic route.
+
+## Client And Compute Roles
+
+Every installation contains both roles. The ordinary Dairack process is always the client runtime and owns the current
+working directory, tools, permission decisions, chat persistence, project memory, and checkpoints. `dairack serve` is
+an optional compute role on an Ollama host. It exposes a fixed API allowlist and hardware identity; it never executes
+agent tools or opens client paths.
+
+The provider boundary is the network boundary. Local files and images are read by the client, and only request content
+needed for inference is serialized to the configured endpoint. Model-requested actions return to the client, pass
+through the normal permission engine, execute there, and may then be included as bounded evidence in a later request.
+
+Initialization has three hardware modes:
+
+1. Local Ollama uses detected client hardware.
+2. The Dairack compute bridge supplies verified server hardware.
+3. Plain remote Ollama is marked unverified and keeps backend batching, threading, and placement automatic.
+
+Model registries record both the compute endpoint and whether hardware was verified. A remote endpoint is never tuned
+against the client GPU by accident.
+
+Declared modality support is binary. Quality is relative: supporting images does not by itself make a model the best
+visual reasoner. Registry overrides exist because generic metadata cannot replace local benchmarks.
+
+## Security Boundaries
+
+- Model output is untrusted and parsed into a closed tool schema.
+- The default `ask` policy requires user approval for external effects and reads.
+- `read-auto` is limited to active-project structured reads and strictly parsed machine-status commands.
+- Network tools are never included in `read-auto`.
+- Web and update requests connect to the exact public address validated for each redirect hop and enforce size and time budgets.
+- Compute credentials are stored separately from printable configuration and chat state.
+- The compute bridge binds to loopback by default, uses bearer authentication, and has no catch-all proxy route.
+- Patch targets are checked against the working directory, dry-run first, and checkpointed before application.
+- Interactive password prompts are blocked from the embedded command runner.
+- Conversations, checkpoints, configuration, and generated policy are user state and are not package data.
+
+Tool schema and action presentation metadata share one registry. The runtime owns one lifecycle for model-requested and
+direct actions: activity state, cancellation capability, timing, authority, structured history, display, persistence,
+and teardown. UI layers render that contract but do not infer behavior from tool names or user-facing wording.
+
+This is an approval boundary, not an operating-system sandbox. See `SECURITY.md` and `docs/permissions.md`.
+
+Release metadata is also untrusted. Update feeds may provide a version and HTTPS notes link, but never an install
+command or package source. Dairack constructs a pinned command locally for its owning `uv`, `pipx`, or managed Python
+environment and requires confirmation before running it.
+
+## Extension Rules
+
+A new provider implements `providers.base.ModelProvider` and maps its metadata to `ModelDescriptor`. Provider-specific
+identifiers and transport logic stay in the adapter. Routing consumes normalized capabilities only.
+
+New model families normally require no code. Pull the model and refresh the registry. If inference is weak, improve
+generic metadata handling or add an explicit user override; do not add a model-name branch to coordinator code.
+
+Schema changes require a version increment, migration logic, round-trip tests, and preservation of unknown fields
+where practical.
+
+The repository-only coordinator lab in `tools/` runs action-free deterministic and semantic routing scenarios. It is
+excluded from runtime packages. Tuning changes require grouped family holdout results and no safety/modality regression.
