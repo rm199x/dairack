@@ -86,11 +86,21 @@ suitable installed model for a schema-validated semantic assessment when the req
 also declares whether the turn requires a real runtime action; the execution contract rejects prose that merely claims
 an action is underway. Action workflows receive one bounded semantic completion check before they settle. Capability scores,
 hardware fit, complexity-discounted residency, grounded-research cost, task quality demand, profile confidence, soft
-role preferences, and a small bounded learned residual produce an executor ranking. Semantic output cannot invent an
-image, bypass a capability gate, or force planning/review without supporting deterministic evidence.
+role preferences, and a small bounded learned residual produce an executor ranking. A confident semantic assessment
+may promote task signals past the keyword layer and lower — never remove — the deterministic support floors for
+planning and review, so paraphrased and non-English requests are routed on meaning. Semantic output cannot invent an
+image, bypass a capability or vision gate, erase deterministic risk evidence, or create action authority.
 
 Planning, independent review, and specialist delegation are separate bounded stages, each visible in route state and
-interruptible by the user.
+interruptible by the user. The planner receives indexed project context so execution briefs name real files rather
+than guesses. Review verdicts apply only with usable grounded feedback, revisions are announced in the transcript,
+and the revised answer is re-checked once; a still-disputed answer is kept and marked unresolved in route state.
+
+The action loop is bounded and self-correcting: model-emitted action requests are parsed generously (including
+call-style near-misses and unescaped Windows path backslashes), malformed requests get one correction pass and then a
+plain explanation, an identical read repeated with no intervening state change is refused with its prior result,
+persistent repetition forces final synthesis, bounded tool output keeps its beginning and end, a dropped model
+connection retries once silently, and an over-budget request omits project retrieval before failing.
 
 Natural-language compute controls are a closed, schema-validated contract separate from task intent. They are
 confidence-gated, apply to one turn only, and cannot create action authority. A request for higher capacity must pass a

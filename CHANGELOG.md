@@ -85,6 +85,22 @@ semantic versioning after 1.0.
   unexecuted commands or future-work promises from silently ending an agent turn.
 - Windows shell actions now run through PowerShell consistently instead of mixing PowerShell syntax with `cmd.exe`.
 - Fallback upgrades reuse a healthy isolated runtime instead of requiring system `venv` support again.
+- Action requests written as `tool(field=value)` calls or containing unescaped Windows path backslashes now execute
+  instead of failing as invalid protocol, and tool markup that misses the grammar never reaches the visible
+  transcript; a request that stays malformed ends with a plain explanation instead of a raw parser error.
+- Repeated identical reads with no state change in between are refused with the prior result, and persistent
+  repetition ends in final synthesis instead of exhausting the action budget.
+- Bounded tool output keeps its beginning and end so test verdicts and stack-trace roots survive truncation, and a
+  dropped model connection retries once silently before surfacing an error.
+- Independent review re-checks its own revision once, announces revisions in the transcript, applies only verdicts
+  with usable grounded feedback, and now also runs in the fallback terminal interface.
+- The planner stage receives indexed project context, and a confident semantic assessment can qualify paraphrased or
+  non-English requests for planning, review, and specialist signals past the English keyword layer while
+  deterministic vision, risk, and authority gates stay fixed.
+- Over-budget requests omit project retrieval before failing, an unindexed project is announced to the model instead
+  of silently returning no retrieval, complete answers ending in ordinary punctuation are no longer regenerated, web
+  search reports a broken or rate-limited backend distinctly from an empty result set, and web page extraction skips
+  navigation, forms, and footer chrome.
 
 ### Removed
 
