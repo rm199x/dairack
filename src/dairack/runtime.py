@@ -6923,6 +6923,7 @@ class DairackTui:
         self.blocks: list[dict[str, str]] = blocks or []
         self.pending_tool: dict[str, str] | None = None
         self.pending_images: list[Path] = []
+        self._queued_prompts: list[str] = []
         self.model_picker_active = False
         self.model_picker_items: list[ModelInfo] = []
         self.model_picker_index = 0
@@ -7003,9 +7004,15 @@ class DairackTui:
         def _(event: Any) -> None:
             self.move_model_picker(-1)
 
-        @kb.add("c-c")
         @kb.add("c-q")
         def _(event: Any) -> None:
+            event.app.exit()
+
+        @kb.add("c-c")
+        def _(event: Any) -> None:
+            if self.busy:
+                self.request_interrupt()
+                return
             event.app.exit()
 
         @kb.add("c-l")
@@ -7490,21 +7497,34 @@ class DairackTui:
 
     def submit(self) -> None:
         text = self.input.text.strip()
-        self.input.text = ""
         if not text and not self.pending_images:
+            self.input.text = ""
             return
         if not text:
             text = "Analyze the attached image carefully and report the relevant details."
         if self.busy:
-            self.append_system("Still processing. Press Esc to interrupt the current response.")
+            if text.startswith("/"):
+                self.append_system("Still processing. Press Esc to interrupt before running commands.")
+                return
+            self.input.text = ""
+            self._queued_prompts.append(text)
+            self.append_system(
+                f"Queued ({len(self._queued_prompts)}). Sends when the current response completes; Esc stops it."
+            )
             return
+        self.input.text = ""
         if text.startswith("/"):
             self.handle_command(text)
             return
         if self.pending_tool:
             self.append_system("Approve or reject the pending action first with /allow or /deny.")
             return
+        if self._queued_prompts:
+            self._queued_prompts.append(text)
+            text = self._queued_prompts.pop(0)
+        self.dispatch_prompt(text)
 
+    def dispatch_prompt(self, text: str) -> None:
         message: dict[str, Any] = {"role": "user", "content": text}
         if self.pending_images:
             message["image_paths"] = [str(path) for path in self.pending_images]
@@ -7517,6 +7537,30 @@ class DairackTui:
             self.append_user(text)
         self.save_current_chat()
         self.start_generation()
+
+    def restore_draft(self, text: str) -> None:
+        existing = self.input.text
+        combined = text if not existing.strip() else text + "\n" + existing
+        self.input.text = combined.replace("\n", " ")
+        self.app.invalidate()
+
+    def flush_queued_prompt(self, interrupted: bool) -> None:
+        """After a turn ends, send the next queued prompt, or hand queued text back after an interrupt.
+
+        A pending approval holds the queue; the flush after the approval's own
+        continuation worker delivers it instead.
+        """
+        if not self._queued_prompts:
+            return
+        if self.pending_tool:
+            return
+        if interrupted:
+            drained = "\n".join(self._queued_prompts)
+            self._queued_prompts.clear()
+            self.restore_draft(drained)
+            self.append_system("Interrupted; queued input was returned to the input area.")
+            return
+        self.dispatch_prompt(self._queued_prompts.pop(0))
 
     def redraw_transcript(self) -> None:
         if len(self.blocks) > 120:
@@ -8239,8 +8283,10 @@ class DairackTui:
             self.record_runtime_failure(exc)
         finally:
             self.interrupt_requested = False
+            interrupted = self.cancel_event.is_set()
             self.cancel_event.clear()
             self.set_busy(False)
+            self.flush_queued_prompt(interrupted)
 
     def handle_tool_request(self, call: dict[str, str]) -> str:
         call = normalize_coordinator_tool_call(call)

@@ -15,6 +15,7 @@ from textual import on
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
@@ -1454,6 +1455,7 @@ class DairackTextualBase(App[None]):
 
     BINDINGS = [
         Binding("escape", "escape", "Stop", show=False),
+        Binding("ctrl+c", "interrupt_or_clear", "Stop", show=False, priority=True),
         Binding("pageup", "transcript_page(-1)", "Scroll up", show=False, priority=True),
         Binding("pagedown", "transcript_page(1)", "Scroll down", show=False, priority=True),
         Binding("ctrl+end", "tail", "Latest", show=False, priority=True),
@@ -1498,6 +1500,7 @@ class DairackTextualBase(App[None]):
         self.interrupt_requested = False
         self.cancel_event = threading.Event()
         self.pending_tool: dict[str, str] | None = None
+        self._queued_prompts: list[str] = []
         self.model_picker_active = False
         self.model_picker_items: list[Any] = []
         self.model_picker_index = 0
@@ -2546,6 +2549,20 @@ class DairackTextualBase(App[None]):
             self.busy_label = "interrupting"
         self.invalidate()
 
+    def action_interrupt_or_clear(self) -> None:
+        if self.busy:
+            self.request_interrupt()
+            return
+        try:
+            composer = self.query_one("#composer", Composer)
+        except NoMatches:
+            return
+        if composer.text:
+            composer.load_text("")
+            self._resize_composer()
+            return
+        self.set_warning_notice("Nothing is running. Ctrl+Q quits.", seconds=2.0)
+
     def action_escape(self) -> None:
         if self.busy:
             self.request_interrupt()
@@ -2586,22 +2603,40 @@ class DairackTextualBase(App[None]):
             return
         if not text:
             text = "Analyze the attached image carefully and report the relevant details."
+        composer = event.composer
         if self.busy:
-            self.set_warning_notice("Response active. Draft retained; press Esc to stop it.", seconds=3.0)
+            if text.startswith("/"):
+                self.set_warning_notice("Response active. Commands wait until it completes; Esc stops it.", seconds=3.0)
+                return
+            composer.load_text("")
+            self._queued_prompts.append(text)
+            self.set_warning_notice(
+                f"Queued ({len(self._queued_prompts)}). Sends when the current response completes; Esc stops it.",
+                seconds=3.0,
+            )
             return
         if self.pending_tool:
             self.set_warning_notice("Resolve the action request before sending another prompt", seconds=3.0)
             return
 
-        composer = event.composer
         composer.load_text("")
+        if text.startswith("/"):
+            self._history.append(text)
+            self._history_index = len(self._history)
+            self._history_draft = ""
+            self._record_prompt_history(text)
+            self.handle_command(text)
+            return
+        if self._queued_prompts:
+            self._queued_prompts.append(text)
+            text = self._queued_prompts.pop(0)
+        self._send_prompt_text(text)
+
+    def _send_prompt_text(self, text: str) -> None:
         self._history.append(text)
         self._history_index = len(self._history)
         self._history_draft = ""
         self._record_prompt_history(text)
-        if text.startswith("/"):
-            self.handle_command(text)
-            return
         image_paths = [str(path) for path in self._pending_images]
         message: dict[str, Any] = {"role": "user", "content": text}
         if image_paths:
@@ -2616,6 +2651,21 @@ class DairackTextualBase(App[None]):
             self.append_user(text)
         self.save_current_chat()
         self.start_generation()
+
+    def dispatch_prompt(self, text: str) -> None:
+        self._dispatch(self._send_prompt_text, text)
+
+    def restore_draft(self, text: str) -> None:
+        def apply() -> None:
+            try:
+                composer = self.query_one("#composer", Composer)
+            except NoMatches:
+                return
+            remainder = composer.text
+            composer.load_text(text if not remainder.strip() else text + "\n" + remainder)
+            self._resize_composer()
+
+        self._dispatch(apply)
 
     @on(Composer.History)
     def composer_history(self, event: Composer.History) -> None:
@@ -2645,7 +2695,10 @@ class DairackTextualBase(App[None]):
     def _resize_composer(self) -> None:
         if not self._ui_ready:
             return
-        composer = self.query_one("#composer", Composer)
+        try:
+            composer = self.query_one("#composer", Composer)
+        except NoMatches:
+            return
         width = max(20, composer.size.width - 3)
         display_lines = 0
         for line in composer.text.splitlines() or [""]:
@@ -4940,8 +4993,10 @@ class DairackTextualBase(App[None]):
             self.record_runtime_failure(exc)
         finally:
             self.interrupt_requested = False
+            interrupted = self.cancel_event.is_set()
             self.cancel_event.clear()
             self.set_busy(False)
+            self.flush_queued_prompt(interrupted)
 
     def handle_tool_request(self, call: dict[str, str]) -> str:
         call = self.core.normalize_coordinator_tool_call(call)

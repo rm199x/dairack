@@ -2421,6 +2421,118 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("found no blocking issue", transcript)
                 self.assertNotIn("unfinished", transcript)
 
+    async def test_prompt_typed_while_busy_queues_and_sends_when_the_turn_ends(self) -> None:
+        release = threading.Event()
+
+        class GatedProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.round = 0
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                self.round += 1
+                if self.round == 1:
+                    release.wait(timeout=5)
+                    yield "First answer."
+                    return
+                yield "Second answer."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"model_mode": "direct", "model": "qwen3.5:9b", "agent": True, "auto_compact": False})
+            provider = GatedProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(80, 26)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text("first question")
+                await pilot.press("enter")
+                for _ in range(120):
+                    await pilot.pause(0.025)
+                    if app.busy and provider.round == 1:
+                        break
+                self.assertTrue(app.busy)
+
+                app.query_one("#composer", ui.Composer).load_text("second question")
+                await pilot.press("enter")
+                self.assertEqual(app.query_one("#composer", ui.Composer).text, "")
+
+                release.set()
+                for _ in range(200):
+                    await pilot.pause(0.025)
+                    if not app.busy and provider.round == 2:
+                        break
+
+                self.assertFalse(app.busy)
+                self.assertEqual(provider.round, 2)
+                second_request = provider.calls[1]["messages"]
+                self.assertTrue(any("second question" in str(m.get("content") or "") for m in second_request))
+                transcript = app.render_transcript_text()
+                self.assertIn("First answer.", transcript)
+                self.assertIn("Second answer.", transcript)
+
+    async def test_interrupt_returns_queued_input_to_the_composer(self) -> None:
+        release = threading.Event()
+
+        class SlowProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.round = 0
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                self.round += 1
+                yield "Working"
+                release.wait(timeout=5)
+                yield " on it."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"model_mode": "direct", "model": "qwen3.5:9b", "agent": True, "auto_compact": False})
+            provider = SlowProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(80, 26)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text("first question")
+                await pilot.press("enter")
+                for _ in range(120):
+                    await pilot.pause(0.025)
+                    if app.busy and provider.round == 1:
+                        break
+                self.assertTrue(app.busy)
+
+                app.query_one("#composer", ui.Composer).load_text("second question")
+                await pilot.press("enter")
+                await pilot.press("escape")
+                release.set()
+                for _ in range(200):
+                    await pilot.pause(0.025)
+                    if not app.busy and "second question" in app.query_one("#composer", ui.Composer).text:
+                        break
+
+                self.assertFalse(app.busy)
+                # The interrupted turn did not consume the queued prompt; it returned to the composer.
+                self.assertEqual(provider.round, 1)
+                self.assertIn("second question", app.query_one("#composer", ui.Composer).text)
+
     async def test_read_auto_batches_multiple_reads_in_one_response(self) -> None:
         class BatchThenAnswerProvider(FakeProvider):
             def __init__(self) -> None:
