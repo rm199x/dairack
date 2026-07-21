@@ -66,6 +66,12 @@ semantic versioning after 1.0.
 - Reload-aware executor continuity: a resident incumbent survives a cold challenger whose lead is within a margin
   scaled to model size and policy stance, recorded in the route report; a validated `model_keep_alive` setting
   extends provider residency between turns.
+- In-process semantic-assessment cache: identical routing turns reuse the classifier verdict instead of paying a
+  model inference, with caller mutations isolated from the cached copy; each specialist consultation now ranks the
+  model pool exactly once.
+- Coordinator delegation and semantic assessment extracted into `coordinator/delegation.py` and
+  `coordinator/semantic.py`, continuing the module split begun with analysis and ranking while preserving the full
+  runtime API surface.
 - Searchable model-library sections with concise installed-model rows and progressively disclosed profile details.
 
 ### Changed
