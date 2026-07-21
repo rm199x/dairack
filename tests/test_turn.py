@@ -33,6 +33,7 @@ def _decide(
         has_reviewer=bool(facts.get("has_reviewer")),
         action_requirement=str(facts.get("action_requirement") or ""),
         contract_capability=bool(facts.get("contract_capability")),
+        has_recovery_executor=bool(facts.get("has_recovery_executor")),
     )
     return next_action(state, response, route, is_finalizing, completion_checked)
 
@@ -65,6 +66,18 @@ class LadderOrderTests(unittest.TestCase):
         self.assertEqual(_decide(state, incomplete_reason="unclosed fence"), TurnAction.RETRY_COMPLETION)
         state.completion_repair_attempted = True
         self.assertEqual(_decide(state, incomplete_reason="unclosed fence"), TurnAction.STOP_INCOMPLETE)
+
+    def test_completion_retry_can_recover_once_with_an_alternate_executor(self) -> None:
+        state = TurnState(action_limit=12, completion_repair_attempted=True)
+        self.assertEqual(
+            _decide(state, incomplete_reason="empty response", has_recovery_executor=True),
+            TurnAction.RECOVER_EXECUTOR,
+        )
+        state.executor_recovery_attempted = True
+        self.assertEqual(
+            _decide(state, incomplete_reason="empty response", has_recovery_executor=True),
+            TurnAction.STOP_INCOMPLETE,
+        )
 
     def test_completion_arbiter_only_after_a_real_action_under_a_contract(self) -> None:
         after_action = TurnState(action_limit=12, action_steps=1)

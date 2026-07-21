@@ -449,6 +449,57 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertEqual(fitted[-1]["image_paths"], ["/tmp/reference.png"])
         self.assertNotIn(CORE.NATIVE_TOOL_DIRECTIVE, fitted[0]["content"])
 
+    def test_schema_shedding_converts_native_tool_history_to_compatibility_messages(self) -> None:
+        config = {**coordinator_config(semantic=False), "num_ctx": 4096, "context_budget_ratio": 0.82}
+        native_call = {
+            "type": "function",
+            "function": {"name": "list_dir", "arguments": {"path": "."}},
+        }
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": CORE.system_prompt(Path("/tmp"), True)},
+            {"role": "user", "content": "Inspect this project."},
+            {"role": "assistant", "content": "", "tool_calls": [native_call]},
+            {
+                "role": "tool",
+                "tool_name": "list_dir",
+                "content": "Structured tool result:\ntool: list_dir\nexit_code: 0\noutput:\n" + "file.py\n" * 350,
+            },
+        ]
+
+        fitted, request_tools = CORE.fit_agent_request_context_messages(
+            messages,
+            config,
+            CORE.agent_tool_schemas(),
+        )
+
+        self.assertEqual(request_tools, [])
+        self.assertFalse(any(message.get("role") == "tool" for message in fitted))
+        self.assertFalse(any(message.get("tool_calls") for message in fitted))
+        self.assertEqual(fitted[-1]["role"], "user")
+        self.assertIn("Structured tool result:", fitted[-1]["content"])
+
+    def test_active_context_keeps_native_tool_exchange_atomic(self) -> None:
+        config = {**coordinator_config(semantic=False), "num_ctx": 2048, "context_budget_ratio": 0.82}
+        native_call = {
+            "type": "function",
+            "function": {"name": "read_file", "arguments": {"path": "src/app.py"}},
+        }
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old context " * 2000},
+            {"role": "user", "content": "CURRENT_TASK_SENTINEL"},
+            {"role": "assistant", "content": "", "tool_calls": [native_call]},
+            {"role": "tool", "tool_name": "read_file", "content": "Structured tool result:\noutput:\nvalue = 1"},
+        ]
+
+        fitted = CORE.active_context_messages(messages, "", config)
+
+        self.assertEqual([message["role"] for message in fitted[-2:]], ["assistant", "tool"])
+        self.assertEqual(fitted[-2]["tool_calls"], [native_call])
+        self.assertTrue(any(message.get("content") == "CURRENT_TASK_SENTINEL" for message in fitted))
+        self.assertFalse(any(str(message.get("content") or "").startswith("old context") for message in fitted))
+
     def test_runtime_failure_is_context_but_not_a_user_task(self) -> None:
         failure = CORE.runtime_failure_message(
             "Ollama returned HTTP 400: request (8227 tokens) exceeds the available context size (8192 tokens)"
@@ -473,6 +524,79 @@ class CoordinatorRoutingTests(unittest.TestCase):
             report = CORE.context_report(messages, "", config, chat)
         self.assertIn("request window: 8192 tokens / devstral-small-2:latest", report)
         self.assertIn(f"/{CORE.context_budget(runtime)} est tokens", report)
+        self.assertIn("macro memory:", report)
+        self.assertIn("live working set:", report)
+        self.assertIn("answer reserve:", report)
+
+    def test_context_and_tool_result_budgets_scale_with_the_executor_window(self) -> None:
+        messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "inspect this"}]
+        chat = {"summary": "", "summary_upto": 1}
+        small = {"num_ctx": 4096, "context_budget_ratio": 0.82, "agent": False}
+        large = {"num_ctx": 32768, "context_budget_ratio": 0.82, "agent": False}
+
+        small_state = CORE.context_state(messages, "", small, chat)
+        large_state = CORE.context_state(messages, "", large, chat)
+
+        self.assertGreater(large_state["budget"], small_state["budget"])
+        self.assertGreater(large_state["answer_reserve"], small_state["answer_reserve"])
+        self.assertGreater(
+            CORE.tool_result_char_budget(messages, chat, large),
+            CORE.tool_result_char_budget(messages, chat, small),
+        )
+
+    def test_omitted_current_turn_tool_results_leave_a_compact_evidence_ledger(self) -> None:
+        config = {"num_ctx": 2048, "context_budget_ratio": 0.82, "agent": False}
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "CURRENT_TASK"},
+        ]
+        for index in range(5):
+            call = {
+                "type": "function",
+                "function": {"name": "read_file", "arguments": {"path": f"file-{index}.py"}},
+            }
+            messages.extend(
+                [
+                    {"role": "assistant", "content": "", "tool_calls": [call]},
+                    {
+                        "role": "tool",
+                        "tool_name": "read_file",
+                        "content": (
+                            "Structured tool result:\n"
+                            "tool: read_file\n"
+                            f"summary: read file-{index}.py\n"
+                            "exit_code: 0\n"
+                            "output:\n"
+                            f"EVIDENCE_{index} " + "x" * 1400
+                        ),
+                    },
+                ]
+            )
+
+        active = CORE.active_context_messages(messages, "", config)
+        rendered = "\n".join(str(message.get("content") or "") for message in active)
+
+        self.assertIn("CURRENT_TASK", rendered)
+        self.assertIn("Compressed evidence from omitted active tool exchanges", rendered)
+        self.assertIn("EVIDENCE_", rendered)
+        self.assertEqual([message["role"] for message in active[-2:]], ["assistant", "tool"])
+
+    def test_read_file_window_is_clamped_to_the_context_result_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "large.py"
+            source.write_text("\n".join(f"line {index}" for index in range(1, 401)), encoding="utf-8")
+
+            code, output = CORE.execute_tool_call(
+                {"name": "read_file", "path": str(source), "start_line": "101", "max_lines": "200"},
+                root,
+                output_limit=1800,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("lines 101-120 of 400", output)
+        self.assertIn("continue with start_line=121, max_lines=20", output)
+        self.assertNotIn("  121  line 121", output)
 
     def test_project_retrieval_keeps_the_real_user_prompt_after_tool_results(self) -> None:
         messages = [
@@ -1736,6 +1860,14 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertTrue(result["needs_action"])
         self.assertIn("exactly one", CORE.action_completion_directive(result))
 
+    def test_executed_action_requires_followthrough_without_an_explicit_contract(self) -> None:
+        route_state = {"mode": "orchestrator", "action_contract": {}}
+
+        self.assertFalse(CORE.action_completion_required(route_state, 0, True))
+        self.assertTrue(CORE.action_completion_required(route_state, 1, True))
+        self.assertFalse(CORE.action_completion_required(route_state, 1, False))
+        self.assertFalse(CORE.action_completion_required({"mode": "direct"}, 1, True))
+
     def test_find_paths_locates_a_named_unreal_project_without_shell_syntax(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1823,6 +1955,76 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIn("Action result [4]: read_file SECURITY.md -> exit 0", chat["summary"])
         self.assertIn("Denied action [6]: patch", chat["summary"])
         self.assertNotIn("src/dairack/security.py", chat["summary"])
+
+    def test_compacted_context_replaces_covered_messages_with_grounded_memory(self) -> None:
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "OLD_USER_SENTINEL"},
+            {"role": "assistant", "content": "OLD_ASSISTANT_SENTINEL"},
+            {"role": "user", "content": "current request"},
+        ]
+        chat = {
+            "cwd": "/tmp",
+            "summary": "Grounded memory of the earlier exchange.",
+            "summary_upto": 3,
+            "summary_format": CORE.GROUNDED_MEMORY_FORMAT,
+        }
+
+        active = CORE.request_context_messages(
+            messages,
+            chat,
+            coordinator_config(semantic=False),
+            Path("/tmp"),
+            include_retrieval=False,
+        )
+        rendered = "\n".join(str(message.get("content") or "") for message in active)
+
+        self.assertIn("Grounded memory of the earlier exchange", rendered)
+        self.assertIn("current request", rendered)
+        self.assertNotIn("OLD_USER_SENTINEL", rendered)
+        self.assertNotIn("OLD_ASSISTANT_SENTINEL", rendered)
+
+    def test_compaction_reduces_a_token_heavy_tail_until_the_next_request_has_headroom(self) -> None:
+        config = {
+            **coordinator_config(semantic=False),
+            "num_ctx": 4096,
+            "context_budget_ratio": 0.82,
+            "auto_compact_keep_recent": 16,
+        }
+        messages: list[dict[str, Any]] = [{"role": "system", "content": CORE.system_prompt(Path("/tmp"), True)}]
+        for index in range(12):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"task {index}"},
+                    {"role": "assistant", "content": (f"result {index} " * 350).strip()},
+                ]
+            )
+        messages.append({"role": "user", "content": "review the current implementation"})
+        chat = {
+            "cwd": "/tmp",
+            "summary": "",
+            "summary_upto": 1,
+            "summary_format": CORE.GROUNDED_MEMORY_FORMAT,
+        }
+
+        changed, detail = CORE.compact_chat_memory(None, "unused", messages, chat, config)
+        source = CORE.summarized_context_source(messages, chat)
+        active = CORE.active_context_messages(
+            source,
+            chat["summary"],
+            config,
+            summary_required=True,
+        )
+        fitted, _tools = CORE.fit_agent_request_context_messages(active, config, CORE.agent_tool_schemas())
+
+        self.assertTrue(changed)
+        self.assertIn("request", detail)
+        self.assertEqual(chat["summary_upto"], len(messages) - 1)
+        self.assertEqual(source[-1]["content"], "review the current implementation")
+        self.assertLess(sum(CORE.estimate_message_tokens(message) for message in active), CORE.context_budget(config))
+        self.assertTrue(fitted)
+        should, reason = CORE.should_auto_compact(messages, chat, config)
+        self.assertFalse(should, reason)
 
     def test_grounded_memory_retains_action_evidence_and_avoids_duplicate_summary(self) -> None:
         config = {**coordinator_config(), "num_ctx": 4096}
@@ -2337,15 +2539,11 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
             original_select = CORE.select_orchestrator_route
 
-            def select_with_contract(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            def select_without_contract(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 selected = original_select(*args, **kwargs)
                 selected.update(
                     {
-                        "action_contract": {
-                            "capability": "runtime_action",
-                            "preferred_tool": "read_file",
-                            "target": "app.py and other.py",
-                        },
+                        "action_contract": {},
                         "execution_scope": "agentic",
                         "planner": "",
                         "reviewer": "",
@@ -2368,7 +2566,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 },
             ]
             with (
-                patch.object(CORE, "select_orchestrator_route", side_effect=select_with_contract),
+                patch.object(CORE, "select_orchestrator_route", side_effect=select_without_contract),
                 patch.object(CORE, "assess_action_completion", side_effect=assessments) as assess,
             ):
                 async with app.run_test(size=(80, 26)) as pilot:
@@ -2522,6 +2720,125 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 transcript = app.render_transcript_text()
                 self.assertIn("found no blocking issue", transcript)
                 self.assertNotIn("unfinished", transcript)
+
+    async def test_coordinator_recovers_once_with_the_next_ranked_executor_after_blank_retries(self) -> None:
+        class RecoveryProvider(FakeProvider):
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                if model == "qwen3.5:9b":
+                    yield "Recovered answer from the alternate executor."
+                if False:
+                    yield ""
+
+        route = {
+            "mode": "orchestrator",
+            "policy": "adaptive",
+            "task_kind": "code inspection",
+            "executor": "devstral-small-2:latest",
+            "planner": "",
+            "reviewer": "",
+            "strategy": "single",
+            "execution_scope": "conversation",
+            "action_contract": {},
+            "candidates": [
+                {"model": "devstral-small-2:latest", "score": 0.9},
+                {"model": "qwen3.5:9b", "score": 0.8},
+            ],
+            "signals": {},
+            "evidence": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"agent": True, "auto_compact": False})
+            provider = RecoveryProvider(response="")
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            with patch.object(CORE, "select_orchestrator_route", return_value=deepcopy(route)):
+                async with app.run_test(size=(80, 26)) as pilot:
+                    app.query_one("#composer", ui.Composer).load_text("Inspect the implementation")
+                    await pilot.press("enter")
+                    for _ in range(240):
+                        await pilot.pause(0.025)
+                        if not app.busy and len(provider.calls) == 3:
+                            break
+
+                    self.assertFalse(app.busy)
+                    self.assertEqual(
+                        [call["model"] for call in provider.calls],
+                        ["devstral-small-2:latest", "devstral-small-2:latest", "qwen3.5:9b"],
+                    )
+                    self.assertIn("Recovered answer", app.render_transcript_text())
+                    self.assertNotIn("No response was returned", app.render_transcript_text())
+                    recovery = app.chat["last_route"]["executor_recoveries"]
+                    self.assertEqual(recovery[0]["from"], "devstral-small-2:latest")
+                    self.assertEqual(recovery[0]["to"], "qwen3.5:9b")
+
+    async def test_repeated_malformed_tool_output_recovers_on_an_alternate_executor(self) -> None:
+        class ProtocolRecoveryProvider(FakeProvider):
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                if model == "devstral-small-2:latest":
+                    raise CORE.OllamaError(
+                        'Ollama returned HTTP 500: {"error":"XML syntax error on line 4: unexpected EOF"}'
+                    )
+                yield "Recovered after malformed tool output."
+
+        route = {
+            "mode": "orchestrator",
+            "policy": "adaptive",
+            "task_kind": "code inspection",
+            "executor": "devstral-small-2:latest",
+            "planner": "",
+            "reviewer": "",
+            "strategy": "single",
+            "execution_scope": "agentic",
+            "action_contract": {},
+            "candidates": [
+                {"model": "devstral-small-2:latest", "score": 0.9},
+                {"model": "qwen3.5:9b", "score": 0.8},
+            ],
+            "signals": {},
+            "evidence": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"agent": True, "auto_compact": False})
+            provider = ProtocolRecoveryProvider(response="")
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            with patch.object(CORE, "select_orchestrator_route", return_value=deepcopy(route)):
+                async with app.run_test(size=(80, 26)) as pilot:
+                    app.query_one("#composer", ui.Composer).load_text("Inspect the implementation")
+                    await pilot.press("enter")
+                    for _ in range(240):
+                        await pilot.pause(0.025)
+                        if not app.busy and len(provider.calls) == 3:
+                            break
+
+                    self.assertFalse(app.busy)
+                    self.assertEqual(
+                        [call["model"] for call in provider.calls],
+                        ["devstral-small-2:latest", "devstral-small-2:latest", "qwen3.5:9b"],
+                    )
+                    transcript = app.render_transcript_text()
+                    self.assertIn("Recovered after malformed tool output", transcript)
+                    self.assertNotIn("XML syntax error", transcript)
 
     async def test_prompt_typed_while_busy_queues_and_sends_when_the_turn_ends(self) -> None:
         release = threading.Event()

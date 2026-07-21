@@ -103,7 +103,9 @@ The action loop is bounded and self-correcting: model-emitted action requests ar
 call-style near-misses and unescaped Windows path backslashes), malformed requests get one correction pass and then a
 plain explanation, an identical read repeated with no intervening state change is refused with its prior result,
 persistent repetition forces final synthesis, bounded tool output keeps its beginning and end, a dropped model
-connection retries once silently, and an over-budget request omits project retrieval before failing. The decision
+connection retries once silently, and an over-budget request omits project retrieval before failing. A blank or
+structurally incomplete continuation retries once on the same executor; Coordinator may then move once to the next
+pre-ranked eligible executor, while direct mode never switches implicitly. The decision
 ladder that chooses each agent turn's next action lives in one frontend-agnostic core (`turn.py`) used by each
 interface's agent-capable path; direct response paths do not need that ladder. Frontends still own presentation,
 history mutation, and action execution, with conformance tests pinning those adapters to the shared ordering. Under
@@ -114,6 +116,14 @@ content search under the same scope and auto-approval rules as other reads. Its 
 cancellable child process and shares the same generated-state exclusions. Prompts submitted while a turn is active are
 queued and dispatched when it ends. A pending approval holds that queue until the user allows or denies the action; an
 interrupted turn returns queued input to the composer instead of sending it.
+
+Context policy is derived from the active executor's effective runtime profile. The hard model window is divided into
+an input budget and answer reserve; request accounting includes the system foundation, grounded macro memory, the live
+task, tool schemas, and tokenizer/routing uncertainty. Covered history is replaced by deterministic grounded memory,
+not retained beside it. Within a long active task, raw tool exchanges may be shed only after their bounded evidence is
+placed in a task-local ledger, and native call/result pairs remain indivisible. Tool-result and `read_file` line-window
+budgets scale with the same profile, so small contexts advance through explicit chunks while larger verified contexts
+retain more source evidence. Compaction may run between model/action steps but never in the middle of a provider call.
 
 Natural-language compute controls are a closed, schema-validated contract separate from task intent. They are
 confidence-gated, apply to one turn only, and cannot create action authority. A request for higher capacity must pass a

@@ -55,6 +55,15 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertFalse(error)
         self.assertEqual(call, {"name": "read_file", "reason": "", "path": "app.py", "line": "12"})
 
+        call, error = TOOL_REGISTRY.validate(
+            {"name": "read_file", "arguments": {"path": "app.py", "start_line": 80, "max_lines": 40}}
+        )
+        self.assertFalse(error)
+        self.assertEqual(
+            call,
+            {"name": "read_file", "reason": "", "path": "app.py", "start_line": "80", "max_lines": "40"},
+        )
+
     def test_registry_rejects_invalid_arguments_and_closed_enums(self) -> None:
         call, error = TOOL_REGISTRY.validate({"name": "read_file", "arguments": "not json"})
         self.assertIsNone(call)

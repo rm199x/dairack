@@ -161,6 +161,12 @@ your saved configuration.
   supports cancellation. Prompts typed while a response is running queue and send when it completes; an approval holds
   that queue until the action is allowed or denied.
 
+Context handling follows the active model's generated or overridden runtime profile. Dairack reserves answer and
+protocol headroom, compacts covered history into grounded memory before the request becomes unsafe, and retains a
+small evidence ledger when an active tool workflow outgrows its raw transcript. Large files are read through bounded,
+continuable line windows. `/context` shows the current macro memory, live working set, tool interface, reserves, and
+estimated next request.
+
 The interface adapts to compact terminals and settles into a static ready state after startup. Set
 `DAIRACK_REDUCED_MOTION=1` when all non-essential movement should remain disabled.
 

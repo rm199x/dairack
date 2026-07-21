@@ -17,6 +17,7 @@ from enum import Enum
 class TurnAction(str, Enum):
     REPAIR_CONTRACT = "repair_contract"
     RETRY_COMPLETION = "retry_completion"
+    RECOVER_EXECUTOR = "recover_executor"
     STOP_INCOMPLETE = "stop_incomplete"
     CHECK_COMPLETION = "check_completion"
     SYNTHESIZE_RETRY = "synthesize_retry"
@@ -43,6 +44,7 @@ class TurnState:
     review_rounds: int = 0
     contract_repair_attempted: bool = False
     completion_repair_attempted: bool = False
+    executor_recovery_attempted: bool = False
     parse_repair_attempted: bool = False
     action_completion_repairs: int = 0
 
@@ -67,6 +69,7 @@ class RouteFacts:
     has_reviewer: bool = False
     action_requirement: str = ""
     contract_capability: bool = False
+    has_recovery_executor: bool = False
 
 
 REVIEW_ROUND_LIMIT = 2
@@ -111,6 +114,14 @@ def next_action(
 
     if facts.incomplete_reason and not state.completion_repair_attempted:
         return TurnAction.RETRY_COMPLETION
+
+    if (
+        facts.incomplete_reason
+        and not is_finalizing
+        and route.has_recovery_executor
+        and not state.executor_recovery_attempted
+    ):
+        return TurnAction.RECOVER_EXECUTOR
 
     if facts.incomplete_reason and not is_finalizing:
         return TurnAction.STOP_INCOMPLETE

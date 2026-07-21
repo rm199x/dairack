@@ -40,6 +40,17 @@ class HardwareAndModelTests(unittest.TestCase):
         self.assertFalse(constrained.recommended)
         self.assertLess(constrained.num_batch, hybrid.num_batch)
 
+    def test_high_headroom_accelerators_use_larger_declared_context_windows(self) -> None:
+        workstation = hardware(vram_gib=48, ram_gib=128)
+
+        roomy = suggest_runtime(workstation, 12 * GIB, 131_072)
+        weight_heavy = suggest_runtime(workstation, 32 * GIB, 131_072)
+        model_limited = suggest_runtime(workstation, 12 * GIB, 24_576)
+
+        self.assertEqual(roomy.num_ctx, 65_536)
+        self.assertLess(weight_heavy.num_ctx, roomy.num_ctx)
+        self.assertEqual(model_limited.num_ctx, 24_576)
+
     def test_declared_features_and_generic_hints_drive_capabilities(self) -> None:
         profile = hardware()
         utility = ModelDescriptor("utility:8b", 5 * GIB, "8B", "Q4", capabilities=("completion",))

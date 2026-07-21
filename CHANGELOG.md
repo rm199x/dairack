@@ -56,6 +56,8 @@ semantic versioning after 1.0.
 - Prompts typed while a response is active queue and send automatically when the turn completes; interrupting a turn
   returns queued input to the composer, while action approvals hold the queue until explicitly resolved. `Ctrl+C` now
   interrupts the active turn in both terminal interfaces instead of being unbound or exiting mid-stream.
+- Context-aware file windows with explicit line continuations, plus a compact task-evidence ledger that preserves the
+  useful head and tail of older tool results when their raw exchanges no longer fit the active request.
 
 ### Changed
 
@@ -124,6 +126,15 @@ semantic versioning after 1.0.
   of silently returning no retrieval, complete answers ending in ordinary punctuation are no longer regenerated, web
   search reports a broken or rate-limited backend distinctly from an empty result set, and web page extraction skips
   navigation, forms, and footer chrome.
+- Context pressure now measures the next provider payload, including durable memory, live work, tool schemas, routing
+  and tokenizer headroom, and a reserved answer region. Compaction replaces covered history instead of retaining it
+  beside the summary, runs between action steps, and scales its working set and tool-result budget to each executor's
+  effective context profile.
+- A blank or structurally incomplete continuation retries once on the same executor, then Coordinator may use one
+  pre-ranked alternate executor. Repeated malformed Ollama tool output follows the same bounded recovery path; direct
+  model mode never switches models implicitly.
+- Automatic accelerator profiles can use 32K or 64K declared context windows on verified high-headroom hardware;
+  hybrid, constrained, unverified-remote, and model-limited profiles retain conservative bounds.
 
 ### Removed
 

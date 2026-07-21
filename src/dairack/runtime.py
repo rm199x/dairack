@@ -2383,6 +2383,16 @@ def format_route_report(route: dict[str, Any] | None) -> str:
         lines.append(f"Planner: {route['planner']}")
     if route.get("reviewer"):
         lines.append(f"Reviewer: {route['reviewer']}")
+    recoveries = route.get("executor_recoveries")
+    if isinstance(recoveries, list):
+        for recovery in recoveries:
+            if not isinstance(recovery, dict):
+                continue
+            lines.append(
+                "Executor recovery: "
+                f"{recovery.get('from') or '(unknown)'} > {recovery.get('to') or '(unknown)'} | "
+                f"{recovery.get('reason') or 'unusable continuation'}"
+            )
     if route.get("preferred_model"):
         lines.append(f"Preference: {route.get('preference_role')} > {route.get('preferred_model')} (soft)")
     routing_control = route.get("routing_control")
@@ -2470,6 +2480,54 @@ def format_route_report(route: dict[str, Any] | None) -> str:
     if isinstance(evidence, list) and evidence:
         lines.append("Signals: " + " | ".join(str(item) for item in evidence[:5]))
     return "\n".join(lines)
+
+
+def coordinator_recovery_executor(route: dict[str, Any], failed_model: str) -> str:
+    """Return the next pre-ranked eligible executor, only in Coordinator mode."""
+    if str(route.get("mode") or "") != "orchestrator":
+        return ""
+    excluded = {failed_model.strip().lower()}
+    recoveries = route.get("executor_recoveries")
+    if isinstance(recoveries, list):
+        for recovery in recoveries:
+            if not isinstance(recovery, dict):
+                continue
+            excluded.add(str(recovery.get("from") or "").strip().lower())
+            excluded.add(str(recovery.get("to") or "").strip().lower())
+    candidates = route.get("candidates")
+    if not isinstance(candidates, list):
+        return ""
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        model = str(candidate.get("model") or "").strip()
+        if model and model.lower() not in excluded:
+            return model
+    return ""
+
+
+def record_executor_recovery(route: dict[str, Any], failed_model: str, replacement: str, reason: str) -> None:
+    recoveries = route.setdefault("executor_recoveries", [])
+    if not isinstance(recoveries, list):
+        recoveries = []
+        route["executor_recoveries"] = recoveries
+    recoveries.append(
+        {
+            "from": failed_model,
+            "to": replacement,
+            "reason": truncate(reason, 180),
+            "at": now_iso(),
+        }
+    )
+    route["executor"] = replacement
+
+
+def executor_recovery_directive(reason: str) -> str:
+    return (
+        "Continue the original user task from the action evidence already present. The previous executor returned "
+        f"no usable continuation ({truncate(reason, 140)}). Complete the task without mentioning executor recovery, "
+        "internal routing, or this directive. Request another tool only when the evidence genuinely requires it."
+    )
 
 
 def format_route_history(chat: dict[str, Any], limit: int = 12) -> str:
@@ -2814,8 +2872,13 @@ def assess_action_completion(
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     contract = route.get("action_contract")
-    if not isinstance(contract, dict) or not contract.get("capability") or not candidate.strip():
+    if not candidate.strip():
         return {}
+    if not isinstance(contract, dict) or not contract.get("capability"):
+        contract = {
+            "capability": "agent_followthrough",
+            "reason": "the executor already initiated runtime actions and must resolve their outcome",
+        }
     semantic = route.get("semantic_assessment")
     model = str(semantic.get("model") or "") if isinstance(semantic, dict) else ""
     model = model or str(route.get("executor") or config.get("model") or "")
@@ -2892,6 +2955,13 @@ def assess_action_completion(
         "reason": truncate(str(parsed.get("reason") or "completion unclear"), 180),
         "model": model,
     }
+
+
+def action_completion_required(route: dict[str, Any], action_steps: int, agent_enabled: bool) -> bool:
+    if not agent_enabled or str(route.get("mode") or "") != "orchestrator":
+        return False
+    contract = route.get("action_contract")
+    return action_steps > 0 or bool(isinstance(contract, dict) and contract.get("capability"))
 
 
 def action_completion_directive(assessment: dict[str, Any]) -> str:
@@ -3655,22 +3725,84 @@ def context_budget(config: dict[str, Any]) -> int:
     return max(512, int(num_ctx * ratio))
 
 
+def _context_message_groups(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Keep native tool requests and their results indivisible during context fitting."""
+    groups: list[list[dict[str, Any]]] = []
+    for message in messages:
+        if (
+            str(message.get("role") or "") == "tool"
+            and groups
+            and str(groups[-1][0].get("role") or "") == "assistant"
+            and bool(groups[-1][0].get("tool_calls"))
+        ):
+            groups[-1].append(message)
+        else:
+            groups.append([message])
+    return groups
+
+
+def _context_tool_evidence(content: str) -> str:
+    """Reduce one structured result to evidence that survives micro-context shedding."""
+    metadata, separator, output = content.partition("\noutput:\n")
+    fields: dict[str, str] = {}
+    for line in metadata.splitlines()[1:]:
+        key, marker, value = line.partition(":")
+        if marker:
+            fields[key.strip().lower()] = " ".join(value.split())
+    metadata_lines = metadata.splitlines()
+    label = fields.get("summary") or fields.get("tool") or (metadata_lines[0] if metadata_lines else "tool result")
+    if fields.get("exit_code"):
+        label += f" / exit {fields['exit_code']}"
+    if not separator:
+        return label[:360]
+    evidence = [" ".join(line.split()) for line in output.splitlines() if line.strip()]
+    selected = evidence[:2]
+    if len(evidence) > 2:
+        selected.extend(line for line in evidence[-2:] if line not in selected)
+    suffix = " | " + " | ".join(selected) if selected else ""
+    return (label + suffix)[:520]
+
+
+def _omitted_tool_ledger(
+    groups: list[list[dict[str, Any]]],
+    kept_indices: set[int],
+    budget: int,
+) -> str:
+    entries: list[str] = []
+    for index, group in enumerate(groups):
+        if index in kept_indices:
+            continue
+        for message in group:
+            content = str(message.get("content") or "")
+            if message.get("role") == "tool" or content.startswith(TOOL_RESULT_PREFIXES):
+                entries.append("- " + _context_tool_evidence(content))
+    if not entries:
+        return ""
+    max_chars = max(480, min(1800, int(budget * 0.22)))
+    rendered = "Compressed evidence from omitted active tool exchanges:\n" + "\n".join(entries[-8:])
+    return truncate_middle(rendered, max_chars)
+
+
 def active_context_messages(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     summary: str,
     config: dict[str, Any],
     reserve_tokens: int = 0,
-) -> list[dict[str, str]]:
+    summary_required: bool = False,
+) -> list[dict[str, Any]]:
     if not messages:
         return []
     budget = max(512, context_budget(config) - max(0, int(reserve_tokens)))
-    if summary.strip() and sum(estimate_message_tokens(message) for message in messages) <= budget:
+    if (
+        summary.strip()
+        and not summary_required
+        and sum(estimate_message_tokens(message) for message in messages) <= budget
+    ):
         return list(messages)
     system = messages[0]
-    kept: list[dict[str, str]] = []
     running = estimate_message_tokens(system)
 
-    summary_message: dict[str, str] | None = None
+    summary_message: dict[str, Any] | None = None
     if summary.strip():
         summary_text = truncate(summary.strip(), max(1200, budget * 2))
         summary_message = {
@@ -3679,19 +3811,49 @@ def active_context_messages(
         }
         running += estimate_message_tokens(summary_message)
 
-    for message in reversed(messages[1:]):
-        cost = estimate_message_tokens(message)
-        if kept and running + cost > budget:
-            break
-        kept.append(message)
-        running += cost
+    groups = _context_message_groups(messages[1:])
+    task_group = -1
+    for index, group in enumerate(groups):
+        if any(
+            message.get("role") == "user"
+            and str(message.get("content") or "").strip()
+            and not str(message.get("content") or "").startswith(TOOL_RESULT_PREFIXES)
+            for message in group
+        ):
+            task_group = index
+    required = {index for index in (len(groups) - 1, task_group) if index >= 0}
+    durable_prefixes = (
+        "Persistent summary of earlier conversation:",
+        "Compressed evidence from omitted active tool exchanges:",
+    )
+    required.update(
+        index
+        for index, group in enumerate(groups)
+        if group
+        and group[0].get("role") == "system"
+        and str(group[0].get("content") or "").startswith(durable_prefixes)
+    )
+    priority = [
+        *sorted(required, reverse=True),
+        *(index for index in range(len(groups) - 1, -1, -1) if index not in required),
+    ]
+    kept_indices: set[int] = set()
+    for index in priority:
+        group = groups[index]
+        cost = sum(estimate_message_tokens(message) for message in group)
+        if index in required or running + cost <= budget:
+            kept_indices.add(index)
+            running += cost
 
-    omitted = max(0, len(messages) - 1 - len(kept))
+    omitted = max(0, len(messages) - 1 - sum(len(groups[index]) for index in kept_indices))
 
-    def build_selected() -> list[dict[str, str]]:
+    def build_selected() -> list[dict[str, Any]]:
         selected = [system]
         if summary_message:
             selected.append(summary_message)
+        ledger = _omitted_tool_ledger(groups, kept_indices, budget)
+        if ledger:
+            selected.append({"role": "system", "content": ledger})
         if omitted:
             selected.append(
                 {
@@ -3702,15 +3864,32 @@ def active_context_messages(
                     ),
                 }
             )
-        selected.extend(reversed(kept))
+        for index in sorted(kept_indices):
+            selected.extend(groups[index])
         return selected
 
     selected = build_selected()
-    while len(kept) > 1 and sum(estimate_message_tokens(message) for message in selected) > budget:
-        kept.pop()
-        omitted += 1
+    removable = sorted(kept_indices - required)
+    while removable and sum(estimate_message_tokens(message) for message in selected) > budget:
+        index = removable.pop(0)
+        kept_indices.remove(index)
+        omitted += len(groups[index])
         selected = build_selected()
     return selected
+
+
+def summarized_context_source(
+    messages: list[dict[str, Any]],
+    chat: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return saved history not already represented by grounded memory."""
+    if not messages:
+        return []
+    summary = str(chat.get("summary") or "").strip()
+    if not summary:
+        return list(messages)
+    upto = min(max(1, chat_summary_upto(chat)), len(messages))
+    return [messages[0], *messages[upto:]]
 
 
 class RequestContextError(ValueError):
@@ -3725,7 +3904,7 @@ def fit_request_context_messages(
     """Fit the final provider payload, including tool schemas and tokenizer uncertainty."""
     canonical = canonicalize_messages(messages)
     tool_tokens = estimate_tokens(json.dumps(tools, sort_keys=True)) if tools else 0
-    tokenizer_headroom = max(256, int(int(config.get("num_ctx") or 4096) * 0.04))
+    tokenizer_headroom, _routing_headroom = context_request_headroom(config)
     reserve_tokens = tool_tokens + tokenizer_headroom
     fitted = active_context_messages(
         canonical,
@@ -3756,6 +3935,34 @@ def strip_tool_catalog_for_native(content: str) -> str:
     return content[:start] + content[end:]
 
 
+def compatibility_tool_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert native tool history into the text protocol before schemas are shed.
+
+    A provider request without native schemas must not contain native assistant
+    calls or ``tool`` roles. Structured results remain model-visible as user
+    messages, preserving evidence without violating the provider protocol.
+    """
+    compatible: list[dict[str, Any]] = []
+    for message in canonicalize_messages(messages):
+        role = str(message.get("role") or "")
+        if role == "assistant" and message.get("tool_calls"):
+            content = str(message.get("content") or "").strip()
+            if content:
+                compatible.append({key: value for key, value in message.items() if key != "tool_calls"})
+            continue
+        if role == "tool":
+            compatible.append(
+                {
+                    key: value
+                    for key, value in {**message, "role": "user"}.items()
+                    if key not in {"tool_name", "tool_call_id", "name"}
+                }
+            )
+            continue
+        compatible.append(dict(message))
+    return compatible
+
+
 def fit_agent_request_context_messages(
     messages: list[dict[str, Any]],
     config: dict[str, Any],
@@ -3774,7 +3981,7 @@ def fit_agent_request_context_messages(
             return fit_request_context_messages(native_request, config, native_tools), native_tools
         except RequestContextError:
             pass
-    return fit_request_context_messages(messages, config), []
+    return fit_request_context_messages(compatibility_tool_history_messages(messages), config), []
 
 
 def context_report(
@@ -3783,17 +3990,24 @@ def context_report(
     config: dict[str, Any],
     chat: dict[str, Any] | None = None,
 ) -> str:
-    runtime, executor = context_runtime_config(config, chat)
-    active = active_context_messages(messages, summary, runtime)
+    state = context_state(messages, summary, config, chat)
+    runtime = state["runtime"]
+    executor = str(state["executor"])
     saved_tokens = sum(estimate_message_tokens(message) for message in messages)
-    active_tokens = sum(estimate_message_tokens(message) for message in active)
     saved_chat_messages = sum(1 for message in messages[1:] if message.get("role") in {"user", "assistant"})
-    active_chat_messages = sum(1 for message in active if message.get("role") in {"user", "assistant"})
+    active_chat_messages = sum(1 for message in state["messages"] if message.get("role") in {"user", "assistant"})
     omitted = max(0, saved_chat_messages - active_chat_messages)
     lines = [
         f"saved messages: {len(messages)} ({saved_tokens} est tokens)",
         f"request window: {int(runtime.get('num_ctx') or 4096)} tokens" + (f" / {executor}" if executor else ""),
-        f"active context: {len(active)} messages ({active_tokens}/{context_budget(runtime)} est tokens)",
+        f"next request: {state['mode']} {state['request_tokens']}/{state['budget']} est tokens "
+        f"({state['ratio'] * 100:.0f}%)",
+        f"macro memory: {state['macro_tokens']} est tokens",
+        f"live working set: {state['micro_tokens']} est tokens / {active_chat_messages} messages",
+        f"runtime foundation: {state['foundation_tokens']} est tokens",
+        f"tool interface: {state['tool_tokens']} est tokens",
+        f"safety headroom: {state['headroom_tokens']} est tokens",
+        f"answer reserve: {state['answer_reserve']} tokens",
         f"omitted from active request: {omitted} messages",
         f"summary: {'yes' if summary.strip() else 'no'}",
     ]
@@ -3820,6 +4034,160 @@ def compact_candidate_range(
     return start, end
 
 
+def _latest_task_message_index(messages: list[dict[str, Any]]) -> int:
+    for index in range(len(messages) - 1, 0, -1):
+        message = messages[index]
+        content = str(message.get("content") or "").strip()
+        if message.get("role") == "user" and content and not content.startswith(TOOL_RESULT_PREFIXES):
+            return index
+    return len(messages)
+
+
+def _coherent_compaction_end(messages: list[dict[str, Any]], end: int, maximum: int) -> int:
+    """Do not split an assistant native call from its contiguous tool results."""
+    bounded = min(max(1, end), maximum)
+    if bounded < maximum and str(messages[bounded].get("role") or "") == "tool":
+        while bounded < maximum and str(messages[bounded].get("role") or "") == "tool":
+            bounded += 1
+    return bounded
+
+
+def _summary_context_message(summary: str, config: dict[str, Any]) -> dict[str, Any]:
+    budget = context_budget(config)
+    return {
+        "role": "system",
+        "content": "Persistent summary of earlier conversation:\n" + truncate(summary.strip(), max(1200, budget * 2)),
+    }
+
+
+def _request_payload_estimates(
+    source: list[dict[str, Any]],
+    summary: str,
+    config: dict[str, Any],
+) -> tuple[int, int]:
+    """Estimate native and compatibility payloads with per-turn routing headroom."""
+    summary_message = _summary_context_message(summary, config) if summary.strip() else None
+    compatibility = compatibility_tool_history_messages(source)
+    if summary_message:
+        compatibility.insert(min(1, len(compatibility)), summary_message)
+
+    native = canonicalize_messages(source, [NATIVE_TOOL_DIRECTIVE])
+    if native and native[0].get("role") == "system":
+        native[0] = {
+            **native[0],
+            "content": strip_tool_catalog_for_native(str(native[0].get("content") or "")),
+        }
+    if summary_message:
+        native.insert(min(1, len(native)), summary_message)
+
+    tokenizer_headroom, routing_headroom = context_request_headroom(config)
+    common_reserve = tokenizer_headroom + routing_headroom
+    compatibility_estimate = sum(estimate_message_tokens(message) for message in compatibility) + common_reserve
+    native_estimate = compatibility_estimate
+    if config_bool(config, "agent", True):
+        native_estimate = (
+            sum(estimate_message_tokens(message) for message in native)
+            + estimate_tokens(json.dumps(agent_tool_schemas(), sort_keys=True))
+            + common_reserve
+        )
+    return native_estimate, compatibility_estimate
+
+
+def context_request_headroom(config: dict[str, Any]) -> tuple[int, int]:
+    """Return tokenizer uncertainty and per-turn routing reserve for one model profile."""
+    num_ctx = int(config.get("num_ctx") or 4096)
+    return max(256, int(num_ctx * 0.04)), max(160, int(num_ctx * 0.03))
+
+
+def context_state(
+    messages: list[dict[str, Any]],
+    summary: str,
+    config: dict[str, Any],
+    chat: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Describe the next safe provider payload using the selected model's runtime profile."""
+    runtime, executor = context_runtime_config(config, chat)
+    source = summarized_context_source(messages, chat or {})
+    active = active_context_messages(source, summary, runtime, summary_required=bool(summary.strip()))
+    requested_tools = (
+        list(tools) if tools is not None else agent_tool_schemas() if config_bool(runtime, "agent", True) else []
+    )
+    try:
+        fitted, fitted_tools = fit_agent_request_context_messages(active, runtime, requested_tools)
+    except RequestContextError:
+        fitted = active
+        fitted_tools = []
+
+    tokenizer_headroom, routing_headroom = context_request_headroom(runtime)
+    headroom_tokens = tokenizer_headroom + routing_headroom
+    tool_tokens = estimate_tokens(json.dumps(fitted_tools, sort_keys=True)) if fitted_tools else 0
+    message_tokens = sum(estimate_message_tokens(message) for message in fitted)
+    macro_tokens = sum(
+        estimate_message_tokens(message)
+        for message in fitted
+        if str(message.get("content") or "").startswith("Persistent summary of earlier conversation:")
+    )
+    foundation_tokens = estimate_message_tokens(fitted[0]) if fitted else 0
+    micro_tokens = max(0, message_tokens - foundation_tokens - macro_tokens)
+    budget = context_budget(runtime)
+    request_tokens = message_tokens + tool_tokens + headroom_tokens
+    mode = "native" if fitted_tools else "compatibility" if config_bool(runtime, "agent", True) else "conversation"
+    num_ctx = int(runtime.get("num_ctx") or 4096)
+    return {
+        "runtime": runtime,
+        "executor": executor,
+        "messages": fitted,
+        "mode": mode,
+        "budget": budget,
+        "request_tokens": request_tokens,
+        "ratio": min(1.0, request_tokens / max(1, budget)),
+        "macro_tokens": macro_tokens,
+        "micro_tokens": micro_tokens,
+        "foundation_tokens": foundation_tokens,
+        "tool_tokens": tool_tokens,
+        "headroom_tokens": headroom_tokens,
+        "answer_reserve": max(0, num_ctx - budget),
+    }
+
+
+def token_aware_compaction_range(
+    messages: list[dict[str, Any]],
+    chat: dict[str, Any],
+    config: dict[str, Any],
+    keep_recent: int,
+) -> tuple[int, int, str, str, int]:
+    """Choose the deepest safe summary boundary while preserving the active user task."""
+    start, initial_end = compact_candidate_range(messages, chat, keep_recent)
+    maximum = max(start, _latest_task_message_index(messages))
+    end = _coherent_compaction_end(messages, initial_end, maximum)
+    if end <= start and maximum > start:
+        end = _coherent_compaction_end(messages, start + 1, maximum)
+    budget = context_budget(config)
+    trigger_ratio = config_float(config, "auto_compact_trigger_ratio", 0.88, 0.50, 1.50)
+    target = min(budget, int(budget * trigger_ratio))
+    selected_summary = ""
+    selected_mode = "constrained"
+    selected_estimate = 0
+
+    while end > start:
+        summary = grounded_memory_summary(messages, end, config, chat)
+        source = [messages[0], *messages[end:]]
+        native_estimate, compatibility_estimate = _request_payload_estimates(source, summary, config)
+        selected_summary = summary
+        if not config_bool(config, "agent", True) or native_estimate <= target:
+            selected_mode = "native" if config_bool(config, "agent", True) else "conversation"
+            selected_estimate = native_estimate if config_bool(config, "agent", True) else compatibility_estimate
+            break
+        selected_mode = "compatibility" if compatibility_estimate <= target else "constrained"
+        selected_estimate = compatibility_estimate
+        if end >= maximum:
+            break
+        end = _coherent_compaction_end(messages, end + 1, maximum)
+
+    return start, end, selected_summary, selected_mode, selected_estimate
+
+
 def compact_range_text(messages: list[dict[str, str]], start: int, end: int) -> str:
     old = messages[start:end]
     parts: list[str] = []
@@ -3842,26 +4210,32 @@ def should_auto_compact(
     min_messages = config_int(config, "auto_compact_min_messages", 10, 4, 80)
     start, end = compact_candidate_range(messages, chat, keep_recent)
     compactable = end - start
+    pressure_compactable = max(0, _latest_task_message_index(messages) - start)
     legacy_summary = bool(str(chat.get("summary") or "").strip()) and (
         str(chat.get("summary_format") or "") != GROUNDED_MEMORY_FORMAT
     )
     if legacy_summary and end > 1:
         return True, "upgrading model-written memory to grounded memory"
+
+    source = summarized_context_source(messages, chat)
+    summary = str(chat.get("summary") or "")
+    native_estimate, compatibility_estimate = _request_payload_estimates(source, summary, config)
+    budget = context_budget(config)
+    request_tokens = native_estimate if config_bool(config, "agent", True) else compatibility_estimate
+    trigger_ratio = config_float(config, "auto_compact_trigger_ratio", 0.88, 0.50, 1.50)
+    trigger_tokens = int(budget * trigger_ratio)
+    if pressure_compactable > 0 and request_tokens >= trigger_tokens:
+        return True, f"active request {request_tokens}/{trigger_tokens} est tokens"
     if compactable < min_messages:
         return False, f"waiting for {min_messages - compactable} more compactable messages"
 
-    saved_tokens = sum(estimate_message_tokens(message) for message in messages)
-    trigger_ratio = config_float(config, "auto_compact_trigger_ratio", 0.88, 0.50, 1.50)
-    trigger_tokens = int(context_budget(config) * trigger_ratio)
-    active = active_context_messages(messages, chat.get("summary", ""), config)
-    saved_chat_messages = sum(1 for message in messages[1:] if message.get("role") in {"user", "assistant"})
+    active = active_context_messages(source, summary, config, summary_required=bool(summary.strip()))
+    saved_chat_messages = sum(1 for message in source[1:] if message.get("role") in {"user", "assistant"})
     active_chat_messages = sum(1 for message in active if message.get("role") in {"user", "assistant"})
     omitted = max(0, saved_chat_messages - active_chat_messages)
-    if saved_tokens >= trigger_tokens:
-        return True, f"saved context {saved_tokens}/{trigger_tokens} est tokens"
     if omitted > 0:
         return True, f"{omitted} saved messages outside active context"
-    return False, f"below trigger {saved_tokens}/{trigger_tokens} est tokens"
+    return False, f"below trigger {request_tokens}/{trigger_tokens} est tokens"
 
 
 def _grounded_excerpt(value: Any, limit: int) -> str:
@@ -4005,10 +4379,14 @@ def compact_chat_memory(
     if keep_recent is None:
         keep_recent = config_int(config, "auto_compact_keep_recent", 16, 4, 120)
     keep_recent = max(4, min(120, keep_recent))
-    start, end = compact_candidate_range(messages, chat, keep_recent)
+    start, end, summary, request_mode, request_tokens = token_aware_compaction_range(
+        messages,
+        chat,
+        config,
+        keep_recent,
+    )
     if end <= start:
         return False, "nothing new enough to compact"
-    summary = grounded_memory_summary(messages, end, config, chat)
     chat["summary"] = summary
     chat["summary_upto"] = end
     chat["summary_format"] = GROUNDED_MEMORY_FORMAT
@@ -4016,7 +4394,8 @@ def compact_chat_memory(
     return True, (
         f"rebuilt grounded memory through message {end - 1}; "
         f"kept recent {len(messages) - end}; "
-        f"summary {estimate_tokens(summary)} est tokens"
+        f"summary {estimate_tokens(summary)} est tokens; "
+        f"{request_mode} request {request_tokens}/{context_budget(config)} est tokens"
     )
 
 
@@ -4779,6 +5158,27 @@ def truncate_middle(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     )
 
 
+def tool_result_char_budget(
+    messages: list[dict[str, Any]],
+    chat: dict[str, Any],
+    config: dict[str, Any],
+) -> int:
+    """Scale one tool result to the active model while preserving room for continuation."""
+    state = context_state(messages, str(chat.get("summary") or ""), config, chat)
+    budget = int(state["budget"])
+    free_tokens = max(0, budget - int(state["request_tokens"]))
+    target_tokens = max(384, min(MAX_TOOL_OUTPUT // 4, int(budget * 0.18)))
+    if free_tokens:
+        target_tokens = min(target_tokens, max(384, free_tokens - max(96, int(budget * 0.02))))
+    return max(1536, min(MAX_TOOL_OUTPUT, target_tokens * 4))
+
+
+def bounded_tool_output(output: str, limit: int) -> str:
+    if not output:
+        return "(no output)"
+    return truncate_middle(output, max(512, min(MAX_TOOL_OUTPUT, limit)))
+
+
 REPEATABLE_READ_TOOLS = frozenset(
     {"read_file", "list_dir", "find_paths", "grep", "hardware_status", "search_project", "web_search", "web_open"}
 )
@@ -4857,9 +5257,25 @@ def transient_stream_error(exc: BaseException) -> bool:
                 "http 502",
                 "http 503",
                 "http 504",
+                "xml syntax error",
             )
         )
     return isinstance(exc, (TimeoutError, ConnectionError))
+
+
+def recoverable_model_protocol_error(exc: BaseException) -> bool:
+    """Recognize malformed model tool output that may recover on another executor."""
+    if not isinstance(exc, OllamaError):
+        return False
+    text = str(exc).lower()
+    return bool(
+        "http 500" in text
+        and (
+            "xml syntax error" in text
+            or "tool call" in text
+            and any(marker in text for marker in ("parse", "malformed", "unexpected eof"))
+        )
+    )
 
 
 def strip_tool_markup(text: str) -> str:
@@ -5001,6 +5417,8 @@ def normalize_coordinator_tool_call(call: dict[str, str]) -> dict[str, str]:
             or "Inspect this image and report details relevant to the current task."
         )
         normalized.pop("line", None)
+        normalized.pop("start_line", None)
+        normalized.pop("max_lines", None)
         normalized.pop("query", None)
     return normalized
 
@@ -5025,8 +5443,11 @@ def tool_presentation(call: dict[str, str]) -> dict[str, Any]:
     target = str(call.get(target_field) or "").strip() if target_field else ""
     if call.get("name") in {"list_dir", "index_project", "grep"} and not target:
         target = "."
-    if call.get("name") == "read_file" and call.get("line"):
-        target += f":{call['line']}"
+    if call.get("name") == "read_file":
+        if call.get("line"):
+            target += f":{call['line']}"
+        elif call.get("start_line"):
+            target += f":{call['start_line']}+"
     if call.get("name") == "patch":
         additions, deletions, files = patch_stats(call.get("patch", ""))
         noun = "file" if files == 1 else "files"
@@ -5140,7 +5561,13 @@ def tool_summary(call: dict[str, str]) -> str:
     return f"{call.get('name') or 'tool'} {target}".rstrip()
 
 
-def open_file_preview(cwd: Path, value: str, line: int | None = None, max_lines: int = 260) -> tuple[int, str]:
+def open_file_preview(
+    cwd: Path,
+    value: str,
+    line: int | None = None,
+    max_lines: int = 260,
+    start_line: int | None = None,
+) -> tuple[int, str]:
     path = resolve_user_path(cwd, value)
     if not path.exists():
         return 1, f"not found: {path}"
@@ -5154,6 +5581,7 @@ def open_file_preview(cwd: Path, value: str, line: int | None = None, max_lines:
     except Exception as exc:
         return 1, f"could not read {path}: {exc}"
 
+    max_lines = max(1, min(260, max_lines))
     lines = text.splitlines()
     total = len(lines)
     if line is not None:
@@ -5163,6 +5591,13 @@ def open_file_preview(cwd: Path, value: str, line: int | None = None, max_lines:
         start = max(1, line - half)
         end = min(total, start + max_lines - 1)
         start = max(1, end - max_lines + 1)
+    elif start_line is not None:
+        if start_line < 1:
+            return 1, "start_line must be >= 1"
+        if total and start_line > total:
+            return 1, f"start_line {start_line} exceeds file length {total}"
+        start = start_line
+        end = min(total, start + max_lines - 1)
     else:
         start = 1
         end = min(total, max_lines)
@@ -5174,7 +5609,7 @@ def open_file_preview(cwd: Path, value: str, line: int | None = None, max_lines:
     else:
         rendered.append("(empty file)")
     if end < total:
-        rendered.append(f"...[{total - end} lines not shown]")
+        rendered.append(f"...[{total - end} lines remain; continue with start_line={end + 1}, max_lines={max_lines}]")
     return 0, "\n".join(rendered)
 
 
@@ -6124,7 +6559,9 @@ def request_context_messages(
     cwd: Path,
     include_retrieval: bool = True,
 ) -> list[dict[str, str]]:
-    active = active_context_messages(messages, chat.get("summary", ""), config)
+    source = summarized_context_source(messages, chat)
+    summary = str(chat.get("summary") or "")
+    active = active_context_messages(source, summary, config, summary_required=bool(summary.strip()))
     project_root = project_scope_for_chat(chat, cwd)
     retrieved = (
         retrieved_project_context(
@@ -6593,6 +7030,7 @@ def execute_tool_call(
     project_root: Path | None = None,
     cancel_event: threading.Event | None = None,
     enforce_project_scope: bool = False,
+    output_limit: int | None = None,
 ) -> tuple[int, str]:
     scope = project_root or cwd
     if cancel_event and cancel_event.is_set():
@@ -6615,10 +7053,25 @@ def execute_tool_call(
                 line = int(call["line"])
             except ValueError:
                 return 1, "line must be an integer"
+        start_line = None
+        if call.get("start_line"):
+            try:
+                start_line = int(call["start_line"])
+            except ValueError:
+                return 1, "start_line must be an integer"
+        max_lines = 260
+        if call.get("max_lines"):
+            try:
+                max_lines = int(call["max_lines"])
+            except ValueError:
+                return 1, "max_lines must be an integer"
+        if output_limit is not None:
+            context_lines = max(20, min(260, (max(512, output_limit) - 320) // 72))
+            max_lines = min(max_lines, context_lines)
         target = resolve_user_path(scope, call.get("path", "."))
         if enforce_project_scope and not path_within(target, scope):
             return 1, f"read-auto scope blocked: {target}"
-        return open_file_preview(scope, str(target), line=line)
+        return open_file_preview(scope, str(target), line=line, max_lines=max_lines, start_line=start_line)
     if call.get("name") == "list_dir":
         target = resolve_user_path(scope, call.get("path", "."))
         if enforce_project_scope and not path_within(target, scope):
@@ -7780,7 +8233,6 @@ class DairackTui:
         if not should:
             return True
         self.set_busy(True, "auto compacting")
-        self.append_system(f"auto compact started\n{reason}")
         try:
             changed, detail = compact_chat_memory(
                 self.provider,
@@ -7795,7 +8247,13 @@ class DairackTui:
                 self.append_system("auto compact interrupted")
                 self.save_current_chat()
                 return False
-            self.append_system(("auto compact updated\n" if changed else "auto compact skipped\n") + detail)
+            if changed:
+                self.chat["last_compaction"] = {"at": now_iso(), "reason": reason, "detail": detail}
+                notice = getattr(self, "set_notice", None)
+                if callable(notice):
+                    notice("Context compacted")
+                else:
+                    self.append_system("context compacted\n" + detail)
             self.save_current_chat()
             return True
         except Exception as exc:
@@ -7887,13 +8345,12 @@ class DairackTui:
             runtime = self._route_config
             if route is None or runtime is None:
                 raise RuntimeError("route initialization failed")
-            if not self.maybe_auto_compact(runtime, str(route["executor"])):
-                return
             repairing_action = False
             action_repair_attempted = False
             action_contract_repair_attempted = False
             action_completion_repairs = 0
             completion_repair_attempted = False
+            executor_recovery_attempted = False
             completion_feedback = ""
             action_feedback = ""
             revision_feedback = ""
@@ -7902,6 +8359,8 @@ class DairackTui:
                 if self.cancel_event.is_set():
                     self.append_system("Interrupted.")
                     self.save_current_chat()
+                    return
+                if not self.maybe_auto_compact(runtime, str(route["executor"])):
                     return
                 action_limit = agent_action_limit(self.config)
                 finalizing = self._agent_steps_used >= action_limit or self._loop_guard.force_synthesis
@@ -7986,6 +8445,7 @@ class DairackTui:
                 if finalizing:
                     self.set_busy(True, f"synthesizing / {executor}")
                 stream_retry_used = False
+                generation_error: Exception | None = None
                 while True:
                     try:
                         for chunk in self.provider.chat_stream(
@@ -8008,13 +8468,35 @@ class DairackTui:
                         break
                     except Exception as exc:
                         if stream_retry_used or self.cancel_event.is_set() or not transient_stream_error(exc):
-                            raise
+                            generation_error = exc
+                            break
                         stream_retry_used = True
                         assistant_text = ""
                         native_calls.clear()
                         first_chunk = True
                         self.replace_last_assistant_text("")
                         self.set_busy(True, f"reconnecting / {executor}")
+                if generation_error is not None:
+                    replacement = (
+                        coordinator_recovery_executor(route, executor)
+                        if not executor_recovery_attempted and recoverable_model_protocol_error(generation_error)
+                        else ""
+                    )
+                    if replacement:
+                        executor_recovery_attempted = True
+                        reason = str(generation_error)
+                        record_executor_recovery(route, executor, replacement, reason)
+                        self._route_config = runtime_config_for_model(self.config, replacement)
+                        runtime = self._route_config
+                        completion_repair_attempted = False
+                        completion_feedback = executor_recovery_directive(reason)
+                        repairing_action = True
+                        self.replace_last_assistant_text("")
+                        self.set_busy(True, f"recovering / {replacement}")
+                        self.chat["last_route"] = route
+                        self.save_current_chat()
+                        continue
+                    raise generation_error
                 if not self.cancel_event.is_set() and self.maybe_run_read_batch(
                     native_calls,
                     assistant_text,
@@ -8055,7 +8537,6 @@ class DairackTui:
                 if not call and not parse_error:
                     incomplete_reason = response_incomplete_reason(assistant_text, stats)
                 agent_enabled = bool(self.config.get("agent"))
-                contract = route.get("action_contract")
                 state = TurnState(
                     action_limit=action_limit,
                     action_steps=self._agent_steps_used,
@@ -8063,6 +8544,7 @@ class DairackTui:
                     review_rounds=self._route_review_rounds,
                     contract_repair_attempted=action_contract_repair_attempted,
                     completion_repair_attempted=completion_repair_attempted,
+                    executor_recovery_attempted=executor_recovery_attempted,
                     parse_repair_attempted=action_repair_attempted,
                     action_completion_repairs=action_completion_repairs,
                 )
@@ -8072,12 +8554,20 @@ class DairackTui:
                     incomplete_reason=incomplete_reason,
                     response_blank=not assistant_text.strip(),
                 )
+                recovery_executor = (
+                    coordinator_recovery_executor(route, executor)
+                    if incomplete_reason and not finalizing and not executor_recovery_attempted
+                    else ""
+                )
                 route_facts = RouteFacts(
                     has_reviewer=bool(route.get("reviewer")) and bool(assistant_text.strip()),
                     action_requirement=(action_contract_directive(route, retry=True) or "") if agent_enabled else "",
-                    contract_capability=bool(
-                        agent_enabled and isinstance(contract, dict) and contract.get("capability")
+                    contract_capability=action_completion_required(
+                        route,
+                        self._agent_steps_used,
+                        agent_enabled,
                     ),
+                    has_recovery_executor=bool(recovery_executor),
                 )
                 if completion_repair_attempted and not incomplete_reason and not call and not parse_error:
                     retry_record = route.get("completion_retry")
@@ -8108,6 +8598,22 @@ class DairackTui:
                     repairing_action = True
                     self.replace_last_assistant_text("Completing response...")
                     self.set_busy(True, f"completing / {executor}")
+                    self.save_current_chat()
+                    continue
+                if action is TurnAction.RECOVER_EXECUTOR:
+                    executor_recovery_attempted = True
+                    if self.messages and self.messages[-1].get("role") == "assistant":
+                        self.messages.pop()
+                    reason = incomplete_reason or "unusable continuation"
+                    record_executor_recovery(route, executor, recovery_executor, reason)
+                    self._route_config = runtime_config_for_model(self.config, recovery_executor)
+                    runtime = self._route_config
+                    completion_repair_attempted = False
+                    completion_feedback = executor_recovery_directive(reason)
+                    repairing_action = True
+                    self.replace_last_assistant_text("")
+                    self.set_busy(True, f"recovering / {recovery_executor}")
+                    self.chat["last_route"] = route
                     self.save_current_chat()
                     continue
                 if action is TurnAction.STOP_INCOMPLETE:
@@ -8411,6 +8917,11 @@ class DairackTui:
         else:
             self.set_busy(True, tool_activity_label(call, step_label))
         started = time.monotonic()
+        result_limit = tool_result_char_budget(
+            self.messages,
+            self.chat,
+            self._route_config or context_runtime_config(self.config, self.chat)[0],
+        )
         try:
             try:
                 project_root = project_scope_for_chat(self.chat, self.cwd)
@@ -8446,11 +8957,12 @@ class DairackTui:
                         project_root,
                         self.cancel_event,
                         enforce_project_scope=approved_by == "read-auto",
+                        output_limit=result_limit,
                     )
                     remember_indexed_project(self.chat, self.cwd, call, code, project_root)
             except Exception as exc:
                 code, output = 1, f"action failed: {exc}"
-            result = truncate_middle(output) if output else "(no output)"
+            result = bounded_tool_output(output, result_limit)
             result += self._loop_guard.record(call, result)
             elapsed = time.monotonic() - started
             if call.get("name") == "consult_specialist":
@@ -9069,7 +9581,11 @@ class DairackTui:
             except Exception as exc:
                 code, output = 1, f"action failed: {exc}"
             finally:
-                result = truncate(output) if output else "(no output)"
+                runtime = getattr(self, "_route_config", None) or context_runtime_config(self.config, self.chat)[0]
+                result = bounded_tool_output(
+                    output,
+                    tool_result_char_budget(self.messages, self.chat, runtime),
+                )
                 try:
                     if record_history:
                         self.messages.append(tool_history_message(call, code, result))
@@ -9814,13 +10330,13 @@ def chat_turn(
     revision_feedback = ""
     action_feedback = ""
     loop_guard = ActionLoopGuard()
-    contract = route.get("action_contract")
-    route_facts = RouteFacts(
-        has_reviewer=bool(route.get("reviewer")),
-        action_requirement=action_contract_directive(route, retry=True) or "",
-        contract_capability=bool(isinstance(contract, dict) and contract.get("capability")),
-    )
     while True:
+        try:
+            changed, detail = auto_compact_if_needed(provider, executor, messages, chat, runtime)
+            if changed:
+                print(f"[context compacted] {detail}")
+        except Exception as exc:
+            print(f"[context compaction skipped] {exc}")
         is_final = finalizing(state, loop_guard.force_synthesis)
         if is_final:
             state.synthesis_attempts += 1
@@ -9835,6 +10351,7 @@ def chat_turn(
         )
         revision_feedback = ""
         request_retry_used = False
+        generation_error: Exception | None = None
         while True:
             try:
                 response = provider.chat(
@@ -9850,9 +10367,28 @@ def chat_turn(
                 break
             except Exception as exc:
                 if request_retry_used or not transient_stream_error(exc):
-                    raise
+                    generation_error = exc
+                    break
                 request_retry_used = True
                 native_calls.clear()
+        if generation_error is not None:
+            replacement = (
+                coordinator_recovery_executor(route, executor)
+                if not state.executor_recovery_attempted and recoverable_model_protocol_error(generation_error)
+                else ""
+            )
+            if replacement:
+                state.executor_recovery_attempted = True
+                reason = str(generation_error)
+                record_executor_recovery(route, executor, replacement, reason)
+                executor = replacement
+                runtime = runtime_config_for_model(config, replacement)
+                native_tools = native_tools_for(provider, replacement, True, route)
+                state.completion_repair_attempted = False
+                action_feedback = executor_recovery_directive(reason)
+                chat["last_route"] = route
+                continue
+            raise generation_error
         action_feedback = ""
         call, parse_error = resolve_tool_request(response, native_calls)
         assistant_message: dict[str, Any] = {"role": "assistant", "content": response}
@@ -9870,6 +10406,17 @@ def chat_turn(
             incomplete_reason=incomplete_reason,
             response_blank=not response.strip(),
         )
+        recovery_executor = (
+            coordinator_recovery_executor(route, executor)
+            if incomplete_reason and not is_final and not state.executor_recovery_attempted
+            else ""
+        )
+        route_facts = RouteFacts(
+            has_reviewer=bool(route.get("reviewer")),
+            action_requirement=action_contract_directive(route, retry=True) or "",
+            contract_capability=action_completion_required(route, state.action_steps, True),
+            has_recovery_executor=bool(recovery_executor),
+        )
         action = next_action(state, facts, route_facts, is_final)
 
         if action is TurnAction.REPAIR_CONTRACT:
@@ -9880,6 +10427,17 @@ def chat_turn(
             state.completion_repair_attempted = True
             route["completion_retry"] = {"attempted": True, "reason": incomplete_reason, "recovered": False}
             revision_feedback = completion_retry_directive(incomplete_reason)
+            continue
+        if action is TurnAction.RECOVER_EXECUTOR:
+            state.executor_recovery_attempted = True
+            reason = incomplete_reason or "unusable continuation"
+            record_executor_recovery(route, executor, recovery_executor, reason)
+            executor = recovery_executor
+            runtime = runtime_config_for_model(config, recovery_executor)
+            native_tools = native_tools_for(provider, recovery_executor, True, route)
+            state.completion_repair_attempted = False
+            action_feedback = executor_recovery_directive(reason)
+            chat["last_route"] = route
             continue
         if state.completion_repair_attempted and not incomplete_reason and not call and not parse_error:
             retry_record = route.get("completion_retry")
@@ -10046,14 +10604,18 @@ def chat_turn(
             if record:
                 print(ansi(f"[specialist {record.get('specialist')} / {record.get('seconds', 0):.1f}s]", "36;1"))
         else:
+            result_limit = tool_result_char_budget(messages, chat, runtime)
             code, output = execute_tool_call(
                 call,
                 cwd,
                 project_root,
                 enforce_project_scope=mode == "read-auto" and auto_approved,
+                output_limit=result_limit,
             )
             remember_indexed_project(chat, cwd, call, code, project_root)
-        result = truncate_middle(output) if output else "(no output)"
+        if call.get("name") == "consult_specialist":
+            result_limit = tool_result_char_budget(messages, chat, runtime)
+        result = bounded_tool_output(output, result_limit)
         result += loop_guard.record(call, result)
         print(f"\n{tool_summary(call)}")
         print(result)

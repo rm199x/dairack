@@ -1825,14 +1825,40 @@ class DairackTextualBase(App[None]):
 
     def _context_values(self) -> tuple[int, int, float]:
         runtime = self._route_config or self.config
-        active = self.core.active_context_messages(
-            self.messages,
-            str(self.chat.get("summary") or ""),
-            runtime,
+        summary = str(self.chat.get("summary") or "")
+        last = self.messages[-1] if self.messages else {}
+        route = self._active_route or self._last_route or {}
+        tools = (
+            []
+            if not runtime.get("agent") or self.core.is_direct_answer_route(route)
+            else self.core.agent_tool_schemas()
         )
-        used = sum(self.core.estimate_message_tokens(message) for message in active)
-        budget = self.core.context_budget(runtime)
-        return used, budget, min(1.0, used / max(1, budget))
+        cache_key = (
+            len(self.messages),
+            str(last.get("role") or ""),
+            len(str(last.get("content") or "")),
+            bool(last.get("tool_calls")),
+            summary,
+            int(self.chat.get("summary_upto") or 0),
+            str(route.get("executor") or ""),
+            int(runtime.get("num_ctx") or 4096),
+            float(runtime.get("context_budget_ratio") or 0.82),
+            bool(runtime.get("agent")),
+            bool(tools),
+        )
+        if cache_key == getattr(self, "_context_cache_key", None):
+            return self._context_cache_value
+        state = self.core.context_state(
+            self.messages,
+            summary,
+            runtime,
+            self.chat,
+            tools,
+        )
+        value = int(state["request_tokens"]), int(state["budget"]), float(state["ratio"])
+        self._context_cache_key = cache_key
+        self._context_cache_value = value
+        return value
 
     def _orchestrator_enabled(self) -> bool:
         return str(self.config.get("model_mode") or "direct") == "orchestrator"
@@ -4560,8 +4586,6 @@ class DairackTextualBase(App[None]):
     def generate_worker(self) -> None:
         try:
             route, runtime = self._prepare_active_route()
-            if not self.maybe_auto_compact(runtime, str(route["executor"])):
-                return
             if self.cancel_event.is_set():
                 self.append_warning("Interrupted during coordination.")
                 self.save_current_chat()
@@ -4571,11 +4595,14 @@ class DairackTextualBase(App[None]):
             action_contract_repair_attempted = False
             action_completion_repairs = 0
             completion_repair_attempted = False
+            executor_recovery_attempted = False
             synthesis_attempts = 0
             while True:
                 if self.cancel_event.is_set():
                     self.append_warning("Interrupted.")
                     self.save_current_chat()
+                    return
+                if not self.maybe_auto_compact(runtime, str(route["executor"])):
                     return
                 action_limit = self.core.agent_action_limit(self.config)
                 finalizing = self._agent_steps_used >= action_limit or self._loop_guard.force_synthesis
@@ -4609,9 +4636,10 @@ class DairackTextualBase(App[None]):
                     finalizing: bool = finalizing,
                     action_limit: int = action_limit,
                     synthesis_attempts: int = synthesis_attempts,
+                    active_runtime: dict[str, Any] = runtime,
                 ) -> list[dict[str, str]]:
                     built = self._orchestrated_request_messages(
-                        runtime,
+                        active_runtime,
                         revision_feedback,
                         action_feedback,
                         include_retrieval,
@@ -4661,6 +4689,7 @@ class DairackTextualBase(App[None]):
                 )
                 execution_started = time.monotonic()
                 stream_retry_used = False
+                generation_error: Exception | None = None
                 while True:
                     try:
                         for chunk in self.provider.chat_stream(
@@ -4685,13 +4714,36 @@ class DairackTextualBase(App[None]):
                         break
                     except Exception as exc:
                         if stream_retry_used or self.cancel_event.is_set() or not self.core.transient_stream_error(exc):
-                            raise
+                            generation_error = exc
+                            break
                         stream_retry_used = True
                         assistant_text = ""
                         native_calls.clear()
                         first_chunk = True
                         self.replace_last_assistant_text("")
                         self.set_busy(True, f"reconnecting / {executor}")
+                if generation_error is not None:
+                    replacement = (
+                        self.core.coordinator_recovery_executor(route, executor)
+                        if not executor_recovery_attempted
+                        and self.core.recoverable_model_protocol_error(generation_error)
+                        else ""
+                    )
+                    if replacement:
+                        executor_recovery_attempted = True
+                        reason = str(generation_error)
+                        self.core.record_executor_recovery(route, executor, replacement, reason)
+                        self._route_config = self.core.runtime_config_for_model(self.config, replacement)
+                        runtime = self._route_config
+                        completion_repair_attempted = False
+                        self._route_feedback = self.core.executor_recovery_directive(reason)
+                        repairing_action = True
+                        self.replace_last_assistant_text("")
+                        self.set_busy(True, f"recovering / {replacement}")
+                        self.chat["last_route"] = route
+                        self.save_current_chat()
+                        continue
+                    raise generation_error
                 timings = route.setdefault("timings", {})
                 timings["execute"] = round(float(timings.get("execute") or 0) + time.monotonic() - execution_started, 3)
                 route["passes"] = int(route.get("passes") or 0) + 1
@@ -4747,7 +4799,6 @@ class DairackTextualBase(App[None]):
                         self._executor_stats,
                     )
                 agent_enabled = bool(self.config.get("agent"))
-                contract = route.get("action_contract")
                 state = self.core.TurnState(
                     action_limit=action_limit,
                     action_steps=self._agent_steps_used,
@@ -4755,6 +4806,7 @@ class DairackTextualBase(App[None]):
                     review_rounds=self._route_review_rounds,
                     contract_repair_attempted=action_contract_repair_attempted,
                     completion_repair_attempted=completion_repair_attempted,
+                    executor_recovery_attempted=executor_recovery_attempted,
                     parse_repair_attempted=action_repair_attempted,
                     action_completion_repairs=action_completion_repairs,
                 )
@@ -4764,14 +4816,22 @@ class DairackTextualBase(App[None]):
                     incomplete_reason=incomplete_reason,
                     response_blank=not assistant_text.strip(),
                 )
+                recovery_executor = (
+                    self.core.coordinator_recovery_executor(route, executor)
+                    if incomplete_reason and not finalizing and not executor_recovery_attempted
+                    else ""
+                )
                 route_facts = self.core.RouteFacts(
                     has_reviewer=bool(route.get("reviewer")) and bool(assistant_text.strip()),
                     action_requirement=(
                         (self.core.action_contract_directive(route, retry=True) or "") if agent_enabled else ""
                     ),
-                    contract_capability=bool(
-                        agent_enabled and isinstance(contract, dict) and contract.get("capability")
+                    contract_capability=self.core.action_completion_required(
+                        route,
+                        self._agent_steps_used,
+                        agent_enabled,
                     ),
+                    has_recovery_executor=bool(recovery_executor),
                 )
                 if completion_repair_attempted and not incomplete_reason and not call and not parse_error:
                     retry_record = route.get("completion_retry")
@@ -4801,6 +4861,22 @@ class DairackTextualBase(App[None]):
                     self._route_feedback = self.core.completion_retry_directive(incomplete_reason)
                     self.replace_last_assistant_text("Completing response...")
                     self.set_busy(True, f"completing / {executor}")
+                    self.save_current_chat()
+                    continue
+                if action is self.core.TurnAction.RECOVER_EXECUTOR:
+                    executor_recovery_attempted = True
+                    if self.messages and self.messages[-1].get("role") == "assistant":
+                        self.messages.pop()
+                    reason = incomplete_reason or "unusable continuation"
+                    self.core.record_executor_recovery(route, executor, recovery_executor, reason)
+                    self._route_config = self.core.runtime_config_for_model(self.config, recovery_executor)
+                    runtime = self._route_config
+                    completion_repair_attempted = False
+                    self._route_feedback = self.core.executor_recovery_directive(reason)
+                    repairing_action = True
+                    self.replace_last_assistant_text("")
+                    self.set_busy(True, f"recovering / {recovery_executor}")
+                    self.chat["last_route"] = route
                     self.save_current_chat()
                     continue
                 if action is self.core.TurnAction.STOP_INCOMPLETE:

@@ -237,10 +237,16 @@ TOOL_REGISTRY = ToolRegistry(
         ),
         ToolSpec(
             "read_file",
-            "Read a text file, optionally centered around a line number.",
+            "Read a bounded text-file window, optionally centered on or starting at a line number.",
             {
                 "path": {"type": "string", "description": "File path."},
-                "line": {"type": "integer", "minimum": 1, "description": "Optional line number."},
+                "line": {"type": "integer", "minimum": 1, "description": "Optional center line."},
+                "start_line": {"type": "integer", "minimum": 1, "description": "Optional first line."},
+                "max_lines": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum lines to return; the runtime may lower this to fit context safely.",
+                },
             },
             required=("path",),
             body_field="path",

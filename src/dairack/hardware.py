@@ -410,7 +410,14 @@ def suggest_runtime(
         rationale = "model weights exceed the conservative local memory budget"
     elif vram and size <= vram * 0.82:
         fit = "accelerator"
-        context = 16_384 if size <= vram * 0.58 and vram >= 12 * GIB else 8192
+        if vram >= 48 * GIB and size <= vram * 0.45:
+            context = 65_536
+        elif vram >= 24 * GIB and size <= vram * 0.50:
+            context = 32_768
+        elif vram >= 12 * GIB and size <= vram * 0.58:
+            context = 16_384
+        else:
+            context = 8192
         batch = 512 if size <= vram * 0.58 else 384
         rationale = "model fits in accelerator memory with a safety reserve"
     elif vram:
