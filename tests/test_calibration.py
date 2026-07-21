@@ -11,6 +11,7 @@ from dairack.coordinator.calibration import (
     MAX_EVIDENCE,
     MAX_TOTAL_ADJUSTMENT,
     adjustment,
+    estimate,
     load_state,
     observe,
     report,
@@ -56,9 +57,40 @@ class CoordinatorCalibrationTests(unittest.TestCase):
             self.assertEqual(coarse, 0.0)
             self.assertLess(matched, 0.0)
             self.assertEqual(unseen, coarse)
-            # Evidence reported is the coarse superset either way.
-            self.assertEqual(coarse_evidence, matched_evidence)
+            self.assertEqual(coarse_evidence, 12.0)
+            self.assertEqual(matched_evidence, 6.0)
             self.assertGreaterEqual(matched, -MAX_TOTAL_ADJUSTMENT)
+
+    def test_kind_estimate_interpolates_instead_of_adding_duplicate_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "learning.json"
+            observe(path, "model:a", "agent", 1, weight=3, source="feedback", kind="coding agent")
+            state = load_state(path)
+
+            coarse, _ = adjustment(state, "model:a", "agent")
+            refined = estimate(state, "model:a", "agent", "coding agent")
+
+            self.assertAlmostEqual(coarse, 0.02)
+            self.assertAlmostEqual(refined.value, 0.0244444444)
+            self.assertLess(refined.value, 0.0366666667)  # Former additive parent + child result.
+            self.assertEqual(refined.role_evidence, 3.0)
+            self.assertEqual(refined.kind_evidence, 3.0)
+            self.assertAlmostEqual(refined.kind_weight, 1 / 3)
+
+    def test_kind_refinement_does_not_change_an_unseen_sibling(self) -> None:
+        state = {
+            "records": {
+                "model:a|agent": {"positive": 48, "negative": 48},
+                "model:a|agent|coding agent": {"positive": 96, "negative": 0},
+            }
+        }
+
+        matching = estimate(state, "model:a", "agent", "coding agent")
+        sibling = estimate(state, "model:a", "agent", "system agent")
+
+        self.assertGreater(matching.value, MAX_ADJUSTMENT)
+        self.assertEqual(sibling.value, 0.0)
+        self.assertEqual(sibling.kind_evidence, 0.0)
 
     def test_kind_component_is_bounded_and_needs_minimum_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -82,6 +114,9 @@ class CoordinatorCalibrationTests(unittest.TestCase):
             observe(path, "model:a", "coding", -1, weight=3, source="feedback", kind="coding agent")
             rendered = report(path)
             self.assertIn("model:a  /  coding  /  coding agent", rendered)
+            self.assertIn("role evidence 3.0", rendered)
+            self.assertIn("kind evidence 3.0", rendered)
+            self.assertIn("mix 33%", rendered)
 
     def test_corrupt_record_values_fail_neutral(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

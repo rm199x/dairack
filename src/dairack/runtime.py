@@ -47,9 +47,9 @@ from .config import (
     save_config as save_app_config,
 )
 from .coordinator.calibration import MAX_TOTAL_ADJUSTMENT as MAX_LEARNED_ADJUSTMENT
-from .coordinator.calibration import adjustment as calibration_adjustment
+from .coordinator.calibration import estimate as calibration_estimate
 from .coordinator.calibration import load_state as load_calibration_state
-from .coordinator.calibration import observe as observe_calibration
+from .coordinator.calibration import observe_estimate as observe_calibration
 from .coordinator.calibration import report as calibration_report
 from .coordinator.calibration import reset as reset_calibration
 from .coordinator.control import RoutingControl, materially_larger
@@ -90,6 +90,7 @@ from .permissions import (
     is_read_only_tool_call as _is_read_only_tool_call,
 )
 from .providers.ollama import OllamaError, OllamaProvider
+from .search import RG_EXCLUSION_GLOBS
 from .tool_protocol import TOOL_REGISTRY, decode_text_tool_call, strip_tool_protocol
 from .turn import (
     CompletionOutcome,
@@ -117,6 +118,7 @@ INDEX_DB_PATH = PATHS.index_file
 CHECKPOINT_DIR = PATHS.checkpoints_dir
 APP_DATA_DIR = PATHS.data_dir
 DEFAULT_TIMEOUT = 120
+SEARCH_TIMEOUT = 30
 SENSITIVE_CHILD_ENV_KEYS = {"DAIRACK_COMPUTE_TOKEN", "ASUSAI_COMPUTE_TOKEN"}
 NATIVE_TOOL_DIRECTIVE = (
     "Function tools are active through the provider API for this request. Return actions through the native "
@@ -147,16 +149,7 @@ COORDINATOR_TOKEN_BUDGETS = {
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 MAX_ATTACHED_IMAGES = 4
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
-SEARCH_GLOBS = [
-    "!.git/**",
-    "!.codex/sessions/**",
-    "!.cache/**",
-    "!.local/share/dairack/vendor/**",
-    "!node_modules/**",
-    "!.venv/**",
-    "!venv/**",
-    "!__pycache__/**",
-]
+SEARCH_GLOBS = RG_EXCLUSION_GLOBS
 SLASH_COMMANDS = [
     "/help",
     "/exit",
@@ -2105,7 +2098,8 @@ def select_orchestrator_route(
                 continue
             metadata = model_capability_metadata(model)
             profile_confidence = float(metadata.get("confidence") or 0.5)
-            raw_learned, learning_evidence = calibration_adjustment(learning_state, model.name, role, kind)
+            calibration = calibration_estimate(learning_state, model.name, role, kind)
+            raw_learned = calibration.value
             learned = _effective_learning_adjustment(active_signals, active_complexity, raw_learned)
             score = _orchestrator_candidate_score(
                 model,
@@ -2131,7 +2125,10 @@ def select_orchestrator_route(
                     "confidence": profile_confidence,
                     "profile_source": str(metadata.get("source") or "inferred"),
                     "learned_adjustment": learned,
-                    "learning_evidence": learning_evidence,
+                    "learning_evidence": calibration.effective_evidence,
+                    "learning_role_evidence": calibration.role_evidence,
+                    "learning_kind_evidence": calibration.kind_evidence,
+                    "learning_kind_weight": calibration.kind_weight,
                     "learning_guarded": bool(raw_learned and not learned),
                 }
             )
@@ -2357,6 +2354,9 @@ def select_orchestrator_route(
                 "profile_source": item.get("profile_source") or "inferred",
                 "learned_adjustment": round(float(item.get("learned_adjustment") or 0), 4),
                 "learning_evidence": round(float(item.get("learning_evidence") or 0), 2),
+                "learning_role_evidence": round(float(item.get("learning_role_evidence") or 0), 2),
+                "learning_kind_evidence": round(float(item.get("learning_kind_evidence") or 0), 2),
+                "learning_kind_weight": round(float(item.get("learning_kind_weight") or 0), 3),
                 "learning_guarded": bool(item.get("learning_guarded")),
             }
             for item in scored
@@ -2454,6 +2454,13 @@ def format_route_report(route: dict[str, Any] | None) -> str:
             )
             learned = float(item.get("learned_adjustment") or 0)
             learned_note = f" / learned {learned:+.3f}" if learned else ""
+            role_evidence = float(item.get("learning_role_evidence") or 0)
+            kind_evidence = float(item.get("learning_kind_evidence") or 0)
+            kind_weight = float(item.get("learning_kind_weight") or 0)
+            if learned and kind_evidence:
+                learned_note += f" (role {role_evidence:.1f}, kind {kind_evidence:.1f}, mix {kind_weight * 100:.0f}%)"
+            elif learned and role_evidence:
+                learned_note += f" (role {role_evidence:.1f})"
             rendered.append(
                 f"{item.get('model')} {float(item.get('score') or 0):.3f}{resident}{confidence_note}{learned_note}"
             )
@@ -2638,8 +2645,9 @@ def observe_route_outcome(
     role = str(route.get("preference_role") or _coordinator_task_role(route.get("signals") or {}))
     kind = str(route.get("task_kind") or "")
     model = str(route["executor"])
-    learned, evidence = observe_calibration(
-        coordinator_learning_path(),
+    learning_path = coordinator_learning_path()
+    calibration = observe_calibration(
+        learning_path,
         model,
         role,
         reward,
@@ -2647,17 +2655,24 @@ def observe_route_outcome(
         source=source,
         kind=kind,
     )
+    learned = calibration.value
     events.append(
         {
             "source": source,
             "reward": round(float(reward), 3),
             "weight": round(float(weight), 3),
             "adjustment": round(learned, 4),
-            "evidence": round(evidence, 2),
+            "evidence": round(calibration.effective_evidence, 2),
+            "role_evidence": round(calibration.role_evidence, 2),
+            "kind_evidence": round(calibration.kind_evidence, 2),
+            "kind_weight": round(calibration.kind_weight, 3),
         }
     )
     scope = f"{role} / {kind}" if kind else role
-    return f"Learning recorded: {model} / {scope} / adjustment {learned:+.3f} / evidence {evidence:.1f}"
+    evidence = f"role {calibration.role_evidence:.1f}"
+    if kind:
+        evidence += f" / kind {calibration.kind_evidence:.1f} / mix {calibration.kind_weight * 100:.0f}%"
+    return f"Learning recorded: {model} / {scope} / adjustment {learned:+.3f} / {evidence}"
 
 
 def record_route_feedback(config: dict[str, Any], route: dict[str, Any] | None, value: str) -> str:
@@ -4926,9 +4941,10 @@ def read_only_batch(
     """Return validated calls when a response is a batch of independently auto-approvable reads.
 
     A non-empty result is only returned when there is more than one native call and every one of
-    them would auto-run on its own as an in-scope, read-only action. Any write, network, shell,
-    coordinator, or out-of-scope call — or any parse failure — yields an empty list, so the caller
-    falls back to strict single-action handling. This never widens what may run without approval.
+    them would auto-run on its own as an in-scope, read-only action. Any write, network,
+    non-read shell, coordinator, or out-of-scope call — or any parse failure — yields an empty
+    list, so the caller falls back to strict single-action handling. This never widens what may
+    run without approval.
     """
     if len(native_calls) < 2:
         return []
@@ -5007,7 +5023,7 @@ def tool_presentation(call: dict[str, str]) -> dict[str, Any]:
     presentation = TOOL_REGISTRY.presentation(call.get("name"))
     target_field = str(presentation.get("target_field") or "")
     target = str(call.get(target_field) or "").strip() if target_field else ""
-    if call.get("name") in {"list_dir", "index_project"} and not target:
+    if call.get("name") in {"list_dir", "index_project", "grep"} and not target:
         target = "."
     if call.get("name") == "read_file" and call.get("line"):
         target += f":{call['line']}"
@@ -5016,7 +5032,17 @@ def tool_presentation(call: dict[str, str]) -> dict[str, Any]:
         noun = "file" if files == 1 else "files"
         target = f"{files} {noun}, +{additions} -{deletions}"
     presentation["target"] = target
+    presentation["details"] = [
+        (str(label), str(call.get(str(field)) or "").strip())
+        for field, label in presentation.get("detail_fields") or ()
+        if str(call.get(str(field)) or "").strip()
+    ]
     return presentation
+
+
+def _append_presentation_details(lines: list[str], presentation: dict[str, Any]) -> None:
+    for label, value in presentation.get("details") or ():
+        lines.append(f"{label}  {value}")
 
 
 def tool_activity_label(call: dict[str, str], step_label: str = "") -> str:
@@ -5040,6 +5066,7 @@ def tool_request_display(call: dict[str, str]) -> str:
         lines.append("$ " + target)
     elif target:
         lines.append(f"{presentation['target_label']}  {target}")
+    _append_presentation_details(lines, presentation)
     return "\n".join(lines)
 
 
@@ -5076,6 +5103,7 @@ def tool_result_display(
         lines.append("$ " + target)
     elif target:
         lines.append(f"{presentation['target_label']}  {target}")
+    _append_presentation_details(lines, presentation)
     lines.extend((f"ACCESS  {_tool_access_label(approved_by)}", "RESULT", result or "(no output)"))
     return "\n".join(lines)
 
@@ -5088,6 +5116,7 @@ def tool_denied_display(call: dict[str, str], reason: str, state: str = "DENIED"
         lines.append("$ " + target)
     elif target:
         lines.append(f"{presentation['target_label']}  {target}")
+    _append_presentation_details(lines, presentation)
     lines.append(f"REASON  {reason}")
     return "\n".join(lines)
 
@@ -5104,6 +5133,8 @@ def tool_summary(call: dict[str, str]) -> str:
         return f"coordinator delegate {specialty}{target} | {call.get('task', '')[:100]}"
     if call.get("name") == "find_paths":
         return f"find {call.get('query', '')[:80]} under {call.get('path', '')[:100]}"
+    if call.get("name") == "grep":
+        return f"grep {call.get('query', '')[:80]} under {call.get('path') or '.'}"
     presentation = tool_presentation(call)
     target = truncate(collapse_ws(str(presentation.get("target") or "")), 140).splitlines()[0]
     return f"{call.get('name') or 'tool'} {target}".rstrip()
@@ -5152,55 +5183,7 @@ def search_files(
     pattern: str,
     cancel_event: threading.Event | None = None,
 ) -> tuple[int, str]:
-    cmd = ["rg", "-n", "--hidden"]
-    for glob in SEARCH_GLOBS:
-        cmd.extend(["--glob", glob])
-    cmd.extend([pattern, "."])
-    if shutil.which("rg"):
-        code, output = run_argv(cmd, cwd, cancel_event=cancel_event)
-        if code == 1 and not output:
-            return 1, "no matches"
-        return code, output
-    else:
-        try:
-            expression = re.compile(pattern)
-        except re.error as exc:
-            return 2, f"invalid search expression: {exc}"
-        excluded = {".git", ".cache", "node_modules", ".venv", "venv", "__pycache__"}
-        matches: list[str] = []
-        output_chars = 0
-        visited = 0
-        for root, directories, filenames in os.walk(cwd, onerror=lambda _error: None):
-            if cancel_event and cancel_event.is_set():
-                return 130, "project search interrupted"
-            directories[:] = [name for name in directories if name not in excluded]
-            for filename in filenames:
-                if cancel_event and cancel_event.is_set():
-                    return 130, "project search interrupted"
-                visited += 1
-                if visited > MAX_INDEX_FILES:
-                    suffix = f"...[search stopped after {MAX_INDEX_FILES} files]"
-                    matches.append(suffix)
-                    return (0 if len(matches) > 1 else 1), "\n".join(matches)
-                path = Path(root) / filename
-                try:
-                    if path.stat().st_size > MAX_INDEX_FILE_BYTES:
-                        continue
-                    data = path.read_bytes()
-                except OSError:
-                    continue
-                if b"\x00" in data[:4096]:
-                    continue
-                relative = path.relative_to(cwd)
-                for number, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
-                    if expression.search(line):
-                        rendered = f"{relative}:{number}:{line}"
-                        matches.append(rendered)
-                        output_chars += len(rendered) + 1
-                        if output_chars >= MAX_TOOL_OUTPUT:
-                            matches.append("...[results truncated]")
-                            return 0, "\n".join(matches)
-        return (0, "\n".join(matches)) if matches else (1, "no matches")
+    return grep_target(cwd, pattern, cancel_event=cancel_event)
 
 
 def grep_target(
@@ -5208,27 +5191,49 @@ def grep_target(
     pattern: str,
     cancel_event: threading.Event | None = None,
 ) -> tuple[int, str]:
-    """Content-search a directory tree or a single file for the agent grep tool."""
-    if target.is_file():
-        try:
-            expression = re.compile(pattern)
-        except re.error as exc:
-            return 2, f"invalid search expression: {exc}"
-        try:
-            data = target.read_bytes()
-        except OSError as exc:
-            return 1, f"could not read {target}: {exc}"
-        if b"\x00" in data[:4096]:
-            return 1, f"binary file not searched: {target}"
-        matches = [
-            f"{target.name}:{number}:{line}"
-            for number, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1)
-            if expression.search(line)
-        ]
-        return (0, "\n".join(matches)) if matches else (1, "no matches")
-    if not target.is_dir():
+    """Search a file or directory through one bounded, cancellable backend contract."""
+    target = target.resolve()
+    if "\x00" in pattern:
+        return 2, "invalid search expression: null bytes are not supported"
+    if not target.exists() or not (target.is_file() or target.is_dir()):
         return 1, f"search root not found: {target}"
-    return search_files(target, pattern, cancel_event=cancel_event)
+    ripgrep = shutil.which("rg")
+    if ripgrep:
+        command = [ripgrep, "-n", "--with-filename", "--hidden"]
+        for glob in SEARCH_GLOBS:
+            command.extend(["--glob", glob])
+        workdir = target if target.is_dir() else target.parent
+        search_path = "." if target.is_dir() else target.name
+        command.extend(["--", pattern, search_path])
+    else:
+        workdir = target if target.is_dir() else target.parent
+        command = [
+            sys.executable,
+            "-m",
+            "dairack.search",
+            "--max-output",
+            str(MAX_TOOL_OUTPUT),
+            "--max-file-bytes",
+            str(MAX_INDEX_FILE_BYTES),
+            "--max-files",
+            str(MAX_INDEX_FILES),
+            "--",
+            pattern,
+            str(target),
+        ]
+
+    code, output = run_argv(
+        command,
+        workdir,
+        timeout=SEARCH_TIMEOUT,
+        cancel_event=cancel_event,
+    )
+    if code == 1 and not output:
+        return 1, "no matches"
+    lowered = output.lower()
+    if code == 2 and "regex" in lowered and "invalid search expression" not in lowered:
+        return 2, "invalid search expression:\n" + output
+    return code, output
 
 
 def list_directory(cwd: Path, value: str = ".") -> tuple[int, str]:
@@ -7512,13 +7517,19 @@ class DairackTui:
                 f"Queued ({len(self._queued_prompts)}). Sends when the current response completes; Esc stops it."
             )
             return
-        self.input.text = ""
-        if text.startswith("/"):
-            self.handle_command(text)
-            return
         if self.pending_tool:
+            command = text.split(maxsplit=1)[0].lower() if text.startswith("/") else ""
+            if command in {"/allow", "/approve", "/deny"}:
+                self.input.text = ""
+                self.handle_command(text)
+                return
             self.append_system("Approve or reject the pending action first with /allow or /deny.")
             return
+        if text.startswith("/"):
+            self.input.text = ""
+            self.handle_command(text)
+            return
+        self.input.text = ""
         if self._queued_prompts:
             self._queued_prompts.append(text)
             text = self._queued_prompts.pop(0)
@@ -8004,7 +8015,11 @@ class DairackTui:
                         first_chunk = True
                         self.replace_last_assistant_text("")
                         self.set_busy(True, f"reconnecting / {executor}")
-                if not self.cancel_event.is_set() and self.maybe_run_read_batch(native_calls, assistant_text):
+                if not self.cancel_event.is_set() and self.maybe_run_read_batch(
+                    native_calls,
+                    assistant_text,
+                    finalizing=finalizing,
+                ):
                     self.set_busy(True, "continuing")
                     continue
                 call, parse_error = resolve_tool_request(assistant_text, native_calls)
@@ -8325,15 +8340,26 @@ class DairackTui:
         self.app.invalidate()
         return "pending"
 
-    def maybe_run_read_batch(self, native_calls: list[dict[str, Any]], assistant_text: str) -> bool:
+    def maybe_run_read_batch(
+        self,
+        native_calls: list[dict[str, Any]],
+        assistant_text: str,
+        *,
+        finalizing: bool = False,
+    ) -> bool:
         """Execute a response's calls together when they are all auto-approvable reads.
 
         Returns True when a batch ran, so the caller continues to the next generation instead
         of the single-action path. Each call still passes through run_tool_call, so the loop
         guard, action budget, and read-auto scope checks apply exactly as for one call. Gated to
-        read-auto: in ask/deny modes this returns False and normal per-action handling applies.
+        read-auto while agent mode is active and the turn still accepts actions. In ask/deny,
+        agent-off, or final-synthesis states this returns False and strict handling applies.
         """
-        if str(self.config.get("permission_mode") or "ask") != "read-auto":
+        if (
+            not bool(self.config.get("agent"))
+            or finalizing
+            or str(self.config.get("permission_mode") or "ask") != "read-auto"
+        ):
             return False
         project_root = project_scope_for_chat(self.chat, self.cwd)
         batch = read_only_batch(native_calls, self.cwd, project_root)
@@ -8462,6 +8488,7 @@ class DairackTui:
             except Exception as exc:
                 self.append_error(str(exc))
                 self.set_busy(False)
+                self.flush_queued_prompt(False)
 
         self.start_worker(worker, "dairack-action")
 
@@ -8481,6 +8508,7 @@ class DairackTui:
         self.save_current_chat()
         self.app.layout.focus(self.input)
         self.app.invalidate()
+        self.flush_queued_prompt(False)
 
     def handle_command(self, line: str) -> None:
         try:

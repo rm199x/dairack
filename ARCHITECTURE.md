@@ -48,6 +48,7 @@ change.
 | `hardware.py` | Cross-platform hardware probes and conservative runtime tuning |
 | `machine.py` | Authoritative client/compute identity map and user-facing hardware status |
 | `file_discovery.py` | Bounded cross-platform discovery of named client paths |
+| `search.py` | Canonical search exclusions and isolated bounded fallback when ripgrep is unavailable |
 | `models.py` | Provider-neutral metadata, inferred capabilities, registry, and overrides |
 | `catalog.py` + `data/` | Optional versioned recommendations and known-model routing priors |
 | `model_ops.py` | Validated pull/remove operations and transport-neutral progress state |
@@ -85,12 +86,13 @@ when a recommended model exists. Ollama remains responsible for backend-specific
 The coordinator first derives deterministic task signals. Adaptive and quality policies may ask the most efficient
 suitable installed model for a schema-validated semantic assessment when the request warrants it. That assessment
 also declares whether the turn requires a real runtime action; the execution contract rejects prose that merely claims
-an action is underway. Action workflows receive one bounded semantic completion check before they settle. Capability scores,
-hardware fit, complexity-discounted residency, grounded-research cost, task quality demand, profile confidence, soft
-role preferences, and a small bounded learned residual produce an executor ranking. A confident semantic assessment
-may promote task signals past the keyword layer and lower — never remove — the deterministic support floors for
-planning and review, so paraphrased and non-English requests are routed on meaning. Semantic output cannot invent an
-image, bypass a capability or vision gate, erase deterministic risk evidence, or create action authority.
+an action is underway. Action workflows receive one bounded semantic completion check before they settle. Capability
+scores, hardware fit, complexity-discounted residency, grounded-research cost, task quality demand, profile confidence,
+soft role preferences, and a small bounded learned estimate produce an executor ranking. Learning shares evidence at
+the model/role level, then interpolates toward a task-kind estimate as its own evidence matures. A confident semantic
+assessment may promote task signals past the keyword layer and lower — never remove — the deterministic support
+floors for planning and review, so paraphrased and non-English requests are routed on meaning. Semantic output cannot
+invent an image, bypass a capability or vision gate, erase deterministic risk evidence, or create action authority.
 
 Planning, independent review, and specialist delegation are separate bounded stages, each visible in route state and
 interruptible by the user. The planner receives indexed project context so execution briefs name real files rather
@@ -102,13 +104,16 @@ call-style near-misses and unescaped Windows path backslashes), malformed reques
 plain explanation, an identical read repeated with no intervening state change is refused with its prior result,
 persistent repetition forces final synthesis, bounded tool output keeps its beginning and end, a dropped model
 connection retries once silently, and an over-budget request omits project retrieval before failing. The decision
-ladder that chooses each turn's next action lives in one frontend-agnostic core (`turn.py`) that every interface
-drives, so the Textual, fallback-terminal, and plain-CLI paths cannot diverge. Under `read-auto`, a response that
-returns several independently auto-approvable in-scope reads runs them together in one turn; the batch is gated so it
-can never execute anything that would not auto-run on its own. A ripgrep-backed `grep` tool gives the agent live
-content search under the same scope and auto-approval rules as other reads. Prompts submitted while a turn is active
-are queued and dispatched when it ends; an interrupted turn returns queued input to the composer instead of sending
-it.
+ladder that chooses each agent turn's next action lives in one frontend-agnostic core (`turn.py`) used by each
+interface's agent-capable path; direct response paths do not need that ladder. Frontends still own presentation,
+history mutation, and action execution, with conformance tests pinning those adapters to the shared ordering. Under
+`read-auto`, a response that returns several independently auto-approvable
+in-scope reads runs them together in one turn. Batching is disabled when agent mode is off or final synthesis has begun,
+and it cannot execute anything that would not auto-run on its own. A ripgrep-backed `grep` tool gives the agent live
+content search under the same scope and auto-approval rules as other reads. Its no-ripgrep fallback runs as a bounded,
+cancellable child process and shares the same generated-state exclusions. Prompts submitted while a turn is active are
+queued and dispatched when it ends. A pending approval holds that queue until the user allows or denies the action; an
+interrupted turn returns queued input to the composer instead of sending it.
 
 Natural-language compute controls are a closed, schema-validated contract separate from task intent. They are
 confidence-gated, apply to one turn only, and cannot create action authority. A request for higher capacity must pass a

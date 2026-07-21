@@ -26,6 +26,7 @@ class ToolSpec:
     activity: str = "Running action"
     target_field: str = ""
     target_label: str = "TARGET"
+    detail_fields: tuple[tuple[str, str], ...] = ()
     risk: str = "read"
     interruptible: bool = False
 
@@ -78,6 +79,7 @@ class ToolRegistry:
                 "activity": "Running action",
                 "target_field": "",
                 "target_label": "TARGET",
+                "detail_fields": (),
                 "risk": "system",
                 "interruptible": False,
             }
@@ -87,6 +89,7 @@ class ToolRegistry:
             "activity": spec.activity,
             "target_field": spec.target_field,
             "target_label": spec.target_label,
+            "detail_fields": spec.detail_fields,
             "risk": spec.risk,
             "interruptible": spec.interruptible,
         }
@@ -286,8 +289,9 @@ TOOL_REGISTRY = ToolRegistry(
             body_field="query",
             display_name="Content search",
             activity="Searching file contents",
-            target_field="query",
-            target_label="QUERY",
+            target_field="path",
+            target_label="ROOT",
+            detail_fields=(("query", "QUERY"),),
             interruptible=True,
         ),
         ToolSpec(

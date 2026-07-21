@@ -646,6 +646,7 @@ class ApprovalScreen(ModalScreen[str]):
             "read_file": "ALLOW READ",
             "list_dir": "ALLOW READ",
             "find_paths": "ALLOW SEARCH",
+            "grep": "ALLOW SEARCH",
             "hardware_status": "ALLOW READ",
             "search_project": "ALLOW SEARCH",
             "index_project": "BUILD INDEX",
@@ -678,6 +679,9 @@ class ApprovalScreen(ModalScreen[str]):
             target = str(presentation.get("target") or "")
             preview = Text(f"{presentation['target_label']}  ", style=f"bold {PALETTE['quiet']}")
             preview.append_text(styled_line_with_urls(target or "(default)", PALETTE["paper"]))
+            for label, value in presentation.get("details") or ():
+                preview.append(f"\n{label}  ", style=f"bold {PALETTE['quiet']}")
+                preview.append_text(styled_line_with_urls(str(value), PALETTE["paper"]))
 
         with Vertical(id="approval-dialog", classes="dialog"):
             yield Static(title, classes="dialog-title")
@@ -4691,7 +4695,11 @@ class DairackTextualBase(App[None]):
                 timings = route.setdefault("timings", {})
                 timings["execute"] = round(float(timings.get("execute") or 0) + time.monotonic() - execution_started, 3)
                 route["passes"] = int(route.get("passes") or 0) + 1
-                if not self.cancel_event.is_set() and self.maybe_run_read_batch(native_calls, assistant_text):
+                if not self.cancel_event.is_set() and self.maybe_run_read_batch(
+                    native_calls,
+                    assistant_text,
+                    finalizing=finalizing,
+                ):
                     self.set_busy(True, "continuing")
                     continue
                 visible_text = self._visible_stream_text(assistant_text)
@@ -5029,10 +5037,15 @@ class DairackTextualBase(App[None]):
         if approval_diff:
             self.append_diff(approval_diff)
         self.save_current_chat()
+        # Hold the queue before crossing onto the UI thread. The generation worker's
+        # finally block may run before the modal callback is dispatched.
+        self.pending_tool = call
         self._dispatch(self._show_approval_main, call)
         return "pending"
 
     def _show_approval_main(self, call: dict[str, str]) -> None:
+        if self.pending_tool != call:
+            return
         project_root = self.core.project_scope_for_chat(self.chat, self.cwd)
         allow_read_auto = self.core.is_read_only_tool_call(call) and self.core.is_auto_approvable_tool_call(
             call,
@@ -5041,7 +5054,6 @@ class DairackTextualBase(App[None]):
         )
         screen = ApprovalScreen(self.core, call, allow_read_auto)
         self.push_screen(screen, self._approval_result)
-        self.pending_tool = call
 
     def _approval_result(self, result: str | None) -> None:
         call = self.pending_tool
@@ -5071,6 +5083,7 @@ class DairackTextualBase(App[None]):
             except Exception as exc:
                 self.append_error(str(exc))
                 self.set_busy(False)
+                self.flush_queued_prompt(False)
 
         self.start_worker(worker, "dairack-action")
 
@@ -5089,6 +5102,7 @@ class DairackTextualBase(App[None]):
                 )
             )
             self.save_current_chat()
+            self.set_busy(True, "continuing")
             self.start_worker(self.generate_worker, "dairack-continue")
             return
         step_label = f"{self._agent_steps_used}/{self.core.agent_action_limit(self.config)}"
@@ -5142,6 +5156,7 @@ class DairackTextualBase(App[None]):
         self.save_current_chat()
         self.query_one("#composer", Composer).focus()
         self.set_warning_notice("Action denied")
+        self.flush_queued_prompt(False)
 
 
 def build_textual_app(

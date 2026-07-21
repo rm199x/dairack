@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -90,13 +91,17 @@ class PermissionBoundaryTests(unittest.TestCase):
             # A single call is never a batch.
             self.assertEqual(runtime.read_only_batch([native("read_file", path="a.py")], project, project), [])
 
-            # Any write, shell, network, or out-of-scope member disqualifies the whole batch.
+            # Any write, non-read shell, network, or out-of-scope member disqualifies the whole batch.
             self.assertEqual(
                 runtime.read_only_batch(
                     [native("read_file", path="a.py"), native("shell", cmd="rm -rf .")], project, project
                 ),
                 [],
             )
+            status_batch = runtime.read_only_batch(
+                [native("read_file", path="a.py"), native("shell", cmd="free -h")], project, project
+            )
+            self.assertEqual([call["name"] for call in status_batch], ["read_file", "shell"])
             self.assertEqual(
                 runtime.read_only_batch(
                     [native("read_file", path="a.py"), native("web_search", query="x")], project, project
@@ -172,6 +177,55 @@ class PermissionBoundaryTests(unittest.TestCase):
                 [native("read_file", path="a.py"), native("grep", query="alpha")], project, project
             )
             self.assertEqual([entry["name"] for entry in batch], ["read_file", "grep"])
+
+    def test_grep_fallback_matches_ripgrep_exclusions_and_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / "src").mkdir()
+            (project / "src" / "visible.py").write_text("PRIVATE_SENTINEL\n", encoding="ascii")
+            sessions = project / ".codex" / "sessions"
+            sessions.mkdir(parents=True)
+            (sessions / "chat.txt").write_text("PRIVATE_SENTINEL\n", encoding="ascii")
+            vendor = project / ".local" / "share" / "dairack" / "vendor"
+            vendor.mkdir(parents=True)
+            (vendor / "payload.txt").write_text("PRIVATE_SENTINEL\n", encoding="ascii")
+            outside = Path(directory) / "outside.txt"
+            outside.write_text("PRIVATE_SENTINEL\n", encoding="ascii")
+            linked = project / "linked-secret.txt"
+            try:
+                linked.symlink_to(outside)
+            except OSError:
+                linked = None
+
+            code, output = runtime.grep_target(project, "PRIVATE_SENTINEL")
+            self.assertEqual(code, 0)
+            self.assertIn("visible.py:1", output)
+            self.assertNotIn("sessions", output)
+            self.assertNotIn("vendor", output)
+
+            with patch.object(runtime.shutil, "which", return_value=None):
+                code, output = runtime.grep_target(project, "PRIVATE_SENTINEL")
+                self.assertEqual(code, 0)
+                self.assertIn("src", output)
+                self.assertIn("visible.py:1", output)
+                self.assertNotIn("sessions", output)
+                self.assertNotIn("vendor", output)
+                if linked is not None:
+                    self.assertNotIn("linked-secret", output)
+
+                oversized = project / "large.txt"
+                oversized.write_text("MATCH " * 20, encoding="ascii")
+                with patch.object(runtime, "MAX_INDEX_FILE_BYTES", 16):
+                    code, output = runtime.grep_target(oversized, "MATCH")
+                self.assertEqual(code, 1)
+                self.assertIn("exceeds search limit", output)
+
+                cancelled = threading.Event()
+                cancelled.set()
+                code, output = runtime.grep_target(project, "PRIVATE_SENTINEL", cancelled)
+                self.assertEqual(code, 130)
+                self.assertIn("interrupted", output)
 
     def test_read_auto_rejects_traversal_and_symlink_scope_escapes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

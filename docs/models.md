@@ -63,7 +63,8 @@ Selection follows four fixed boundaries:
 1. The executor must support the input modality and required transport features.
 2. Missing preferred roles fall back to the best suitable installed model.
 3. Semantic assessment can refine a task signal but cannot grant tools, invent an image, or bypass policy limits.
-4. Local outcome learning is evidence-gated and capped; it adjusts ranking rather than replacing capability profiles.
+4. Local outcome learning is evidence-gated and capped. A shared model/role estimate backs off toward a task-kind
+   estimate only as that kind accumulates evidence; learning adjusts ranking rather than replacing capability profiles.
 
 There is no required coordinator model. When semantic assessment is useful, Dairack selects an efficient suitable model
 from the active registry and requests a schema-validated result.

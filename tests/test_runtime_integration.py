@@ -685,6 +685,39 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertTrue(candidates["qwen3-coder:30b"]["learning_guarded"])
         self.assertEqual(candidates["qwen3-coder:30b"]["learned_adjustment"], 0.0)
 
+    def test_task_kind_learning_changes_only_the_matching_route(self) -> None:
+        learned_state = {
+            "records": {
+                "qwen3-coder:30b|agent": {"positive": 48, "negative": 48},
+                "qwen3-coder:30b|agent|coding agent": {"positive": 96, "negative": 0},
+            }
+        }
+        config = coordinator_config(semantic=False)
+        with patch.object(CORE, "load_calibration_state", return_value=learned_state):
+            matching = route(
+                FakeProvider(()),
+                "Inspect this repository, edit the Python implementation, run tests, and fix the bug.",
+                config,
+            )
+            sibling = route(FakeProvider(()), "Write a Python function to parse JSON.", config)
+
+        self.assertEqual(matching["task_kind"], "coding agent")
+        self.assertEqual(matching["executor"], "qwen3-coder:30b")
+        matching_candidate = next(
+            candidate for candidate in matching["candidates"] if candidate["model"] == "qwen3-coder:30b"
+        )
+        self.assertEqual(matching_candidate["learning_role_evidence"], 96.0)
+        self.assertEqual(matching_candidate["learning_kind_evidence"], 96.0)
+        self.assertGreater(matching_candidate["learning_kind_weight"], 0.9)
+
+        self.assertEqual(sibling["task_kind"], "coding")
+        self.assertEqual(sibling["executor"], "qwen3.5:9b")
+        sibling_candidate = next(
+            candidate for candidate in sibling["candidates"] if candidate["model"] == "qwen3-coder:30b"
+        )
+        self.assertEqual(sibling_candidate["learned_adjustment"], 0.0)
+        self.assertEqual(sibling_candidate["learning_kind_evidence"], 0.0)
+
     def test_primary_command_surface_uses_canonical_product_vocabulary(self) -> None:
         self.assertIn("/library", CORE.SLASH_COMMANDS)
         self.assertIn("/library", CORE.PRIMARY_HELP_TEXT)
@@ -1516,6 +1549,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
             {"name": "patch", "patch": "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+new\n"},
             {"name": "read_file", "path": "src/main.py", "line": "12"},
             {"name": "list_dir", "path": "src"},
+            {"name": "grep", "query": "permission policy", "path": "src"},
             {"name": "search_project", "query": "permission policy"},
             {"name": "index_project", "path": "."},
             {"name": "consult_specialist", "task": "Review this boundary"},
@@ -1535,6 +1569,14 @@ class CoordinatorRoutingTests(unittest.TestCase):
                 self.assertTrue("COMPLETE" in result or "APPLIED" in result)
                 self.assertIn("ACCESS  READ-AUTO", result)
                 self.assertIn("RESULT\nevidence", result)
+
+        grep_call = {"name": "grep", "query": "password|token", "path": "src"}
+        grep_request = CORE.tool_request_display(grep_call)
+        grep_result = CORE.tool_result_display(grep_call, 0, "match", "approved", 0.1)
+        self.assertIn("ROOT  src", grep_request)
+        self.assertIn("QUERY  password|token", grep_request)
+        self.assertIn("ROOT  src", grep_result)
+        self.assertIn("QUERY  password|token", grep_result)
 
     def test_cancellable_process_runner_stops_the_process_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1809,6 +1851,66 @@ class CoordinatorRoutingTests(unittest.TestCase):
 
 
 class LoopResilienceTests(unittest.TestCase):
+    def test_read_batch_rejects_provider_calls_when_agent_is_off_or_finalizing(self) -> None:
+        tui = object.__new__(CORE.DairackTui)
+        tui.config = {"agent": False, "permission_mode": "read-auto"}
+        native_calls = [
+            {"function": {"name": "read_file", "arguments": {"path": "a.py"}}},
+            {"function": {"name": "list_dir", "arguments": {"path": "."}}},
+        ]
+
+        with patch.object(CORE, "read_only_batch") as read_batch:
+            self.assertFalse(tui.maybe_run_read_batch(native_calls, ""))
+            read_batch.assert_not_called()
+
+            tui.config["agent"] = True
+            self.assertFalse(tui.maybe_run_read_batch(native_calls, "", finalizing=True))
+            read_batch.assert_not_called()
+
+    def test_fallback_keeps_input_while_an_action_awaits_approval(self) -> None:
+        tui = object.__new__(CORE.DairackTui)
+        tui.input = SimpleNamespace(text="follow-up question")
+        tui.pending_images = []
+        tui.busy = False
+        tui.pending_tool = {"name": "read_file", "path": "a.py"}
+        tui._queued_prompts = []
+        tui.append_system = Mock()
+
+        tui.submit()
+
+        self.assertEqual(tui.input.text, "follow-up question")
+        tui.append_system.assert_called_once_with("Approve or reject the pending action first with /allow or /deny.")
+
+        tui.append_system.reset_mock()
+        tui.handle_command = Mock()
+        tui.input.text = "/help"
+        tui.submit()
+        self.assertEqual(tui.input.text, "/help")
+        tui.handle_command.assert_not_called()
+
+        tui.input.text = "/deny"
+        tui.submit()
+        self.assertEqual(tui.input.text, "")
+        tui.handle_command.assert_called_once_with("/deny")
+
+    def test_fallback_denial_releases_the_held_prompt_queue(self) -> None:
+        tui = object.__new__(CORE.DairackTui)
+        tui.pending_tool = {"name": "read_file", "path": "a.py"}
+        tui.messages = []
+        tui.append_action = Mock()
+        tui.save_current_chat = Mock()
+        tui.flush_queued_prompt = Mock()
+        tui.input = object()
+        tui.app = SimpleNamespace(
+            layout=SimpleNamespace(focus=Mock()),
+            invalidate=Mock(),
+        )
+
+        tui.deny_pending_tool()
+
+        self.assertIsNone(tui.pending_tool)
+        tui.flush_queued_prompt.assert_called_once_with(False)
+
     def test_truncate_middle_retains_head_and_tail(self) -> None:
         text = "start-" + "x" * 50000 + "-end"
         bounded = CORE.truncate_middle(text, 2000)
@@ -2533,6 +2635,147 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(provider.round, 1)
                 self.assertIn("second question", app.query_one("#composer", ui.Composer).text)
 
+    async def test_pending_approval_holds_then_denial_releases_the_prompt_queue(self) -> None:
+        release = threading.Event()
+
+        class ApprovalProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.round = 0
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                self.round += 1
+                if self.round == 1:
+                    release.wait(timeout=5)
+                    sink = kwargs.get("tool_call_sink")
+                    if callable(sink):
+                        sink({"function": {"name": "list_dir", "arguments": {"path": "/"}}})
+                    return
+                yield "Second answer."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"model_mode": "direct", "model": "qwen3.5:9b", "agent": True, "auto_compact": False})
+            provider = ApprovalProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(80, 26)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text("inspect root")
+                await pilot.press("enter")
+                for _ in range(120):
+                    await pilot.pause(0.025)
+                    if app.busy and provider.round == 1:
+                        break
+
+                app.query_one("#composer", ui.Composer).load_text("second question")
+                await pilot.press("enter")
+                release.set()
+                for _ in range(160):
+                    await pilot.pause(0.025)
+                    if isinstance(app.screen, ui.ApprovalScreen):
+                        break
+
+                self.assertIsInstance(app.screen, ui.ApprovalScreen)
+                self.assertEqual(provider.round, 1)
+                self.assertEqual(app._queued_prompts, ["second question"])
+                await pilot.pause(0.1)
+                self.assertEqual(provider.round, 1)
+
+                await pilot.press("escape")
+                for _ in range(160):
+                    await pilot.pause(0.025)
+                    if not app.busy and provider.round == 2:
+                        break
+
+                self.assertEqual(provider.round, 2)
+                self.assertEqual(app._queued_prompts, [])
+                self.assertTrue(
+                    any(
+                        "second question" in str(message.get("content") or "")
+                        for message in provider.calls[1]["messages"]
+                    )
+                )
+
+    async def test_approved_action_finishes_its_turn_before_releasing_the_prompt_queue(self) -> None:
+        release = threading.Event()
+
+        class ApprovalProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.round = 0
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                self.round += 1
+                if self.round == 1:
+                    release.wait(timeout=5)
+                    sink = kwargs.get("tool_call_sink")
+                    if callable(sink):
+                        sink({"function": {"name": "list_dir", "arguments": {"path": "."}}})
+                    return
+                yield "Inspection complete." if self.round == 2 else "Second answer."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"model_mode": "direct", "model": "qwen3.5:9b", "agent": True, "auto_compact": False})
+            provider = ApprovalProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(80, 26)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text("inspect project")
+                await pilot.press("enter")
+                for _ in range(120):
+                    await pilot.pause(0.025)
+                    if app.busy and provider.round == 1:
+                        break
+                app.query_one("#composer", ui.Composer).load_text("second question")
+                await pilot.press("enter")
+                release.set()
+                for _ in range(160):
+                    await pilot.pause(0.025)
+                    if isinstance(app.screen, ui.ApprovalScreen):
+                        break
+
+                self.assertEqual(provider.round, 1)
+                await pilot.press("a")
+                for _ in range(240):
+                    await pilot.pause(0.025)
+                    if not app.busy and provider.round == 3:
+                        break
+
+                self.assertEqual(provider.round, 3)
+                self.assertFalse(
+                    any(
+                        "second question" in str(message.get("content") or "")
+                        for message in provider.calls[1]["messages"]
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        "second question" in str(message.get("content") or "")
+                        for message in provider.calls[2]["messages"]
+                    )
+                )
+
     async def test_read_auto_batches_multiple_reads_in_one_response(self) -> None:
         class BatchThenAnswerProvider(FakeProvider):
             def __init__(self) -> None:
@@ -3026,6 +3269,24 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsInstance(app.screen, ui.ApprovalScreen)
                     self.assertEqual(len(app.screen.query("#read-auto")), 1)
                     self.assertTrue(app.screen.query_one("#approve", ui.Button).has_focus)
+                    await pilot.press("escape")
+                    await pilot.pause(0.05)
+
+                    grep_call = {
+                        "name": "grep",
+                        "query": "password|token",
+                        "path": "src",
+                        "reason": "inspect credential handling",
+                    }
+                    app.pending_tool = grep_call
+                    app._show_approval_main(grep_call)
+                    await pilot.pause(0.05)
+                    approval = app.screen
+                    self.assertIsInstance(approval, ui.ApprovalScreen)
+                    preview = str(approval.query_one(".approval-code", ui.Static).render())
+                    self.assertIn("ROOT  src", preview)
+                    self.assertIn("QUERY  password|token", preview)
+                    self.assertEqual(str(approval.query_one("#approve", ui.Button).label), "ALLOW SEARCH")
                     await pilot.press("escape")
                     await pilot.pause(0.05)
 
