@@ -34,6 +34,7 @@ def reset_assessment_cache() -> None:
 
 
 def _assessment_cache_key(
+    provider_scope: str,
     model: str,
     config: dict[str, Any],
     task: str,
@@ -43,6 +44,7 @@ def _assessment_cache_key(
 ) -> str:
     payload = "\x1f".join(
         (
+            provider_scope,
             model,
             str(config.get("num_ctx") or ""),
             str(float(getattr(tuning, "intent_floor_strength", 0) or 0)),
@@ -66,7 +68,13 @@ def assessment(
 ) -> dict[str, Any]:
     if not model or not task.strip():
         return {}
-    cache_key = _assessment_cache_key(model, config, task, context, observations, tuning)
+    provider_scope = "|".join(
+        (
+            f"{type(provider).__module__}.{type(provider).__qualname__}",
+            str(getattr(provider, "host", "") or "").rstrip("/").lower(),
+        )
+    )
+    cache_key = _assessment_cache_key(provider_scope, model, config, task, context, observations, tuning)
     with _semantic_assessment_cache_lock:
         cached = _semantic_assessment_cache.get(cache_key)
         if cached is not None:

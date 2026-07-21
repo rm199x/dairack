@@ -203,6 +203,8 @@ class OllamaProvider:
         self.current_stats: dict[str, Any] = {}
         self.last_stats: dict[str, Any] = {}
         self._show_cache: dict[str, dict[str, Any]] = {}
+        self._model_inventory: tuple[ModelDescriptor, ...] | None = None
+        self._model_inventory_at = 0.0
 
     def url(self, path: str) -> str:
         return f"{self.host}{path}"
@@ -306,7 +308,21 @@ class OllamaProvider:
                     capabilities=tuple(str(value).lower() for value in capabilities),
                 )
             )
+        self._model_inventory = tuple(result)
+        self._model_inventory_at = time.monotonic()
         return result
+
+    def recent_models(self, max_age: float = 30.0) -> list[ModelDescriptor] | None:
+        if self._model_inventory is None or time.monotonic() - self._model_inventory_at > max(0.0, max_age):
+            return None
+        return list(self._model_inventory)
+
+    def invalidate_model_cache(self) -> None:
+        self._show_cache.clear()
+        self._model_inventory = None
+        self._model_inventory_at = 0.0
+        if hasattr(self, "_dairack_embedding_model"):
+            delattr(self, "_dairack_embedding_model")
 
     def embed(self, model: str, texts: list[str]) -> list[list[float]]:
         payload = self._request("POST", "/api/embed", {"model": model, "input": list(texts)}, timeout=60)

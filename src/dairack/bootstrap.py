@@ -13,7 +13,7 @@ from .catalog import apply_catalog_priors
 from .compute import apply_compute_probe, is_local_endpoint, probe_compute, provider_for_config
 from .config import ConfigError, atomic_write_json, load_config, save_config
 from .hardware import HardwareProfile, detect_hardware, format_hardware
-from .models import ModelRegistry, load_registry, save_registry
+from .models import ModelRegistry, is_chat_model, load_registry, save_registry
 from .paths import PATHS, AppPaths
 from .providers.ollama import OllamaError, OllamaProvider
 
@@ -116,7 +116,7 @@ def initialize(
     )
     apply_catalog_priors(registry)
     config["profile_overrides"] = {}
-    installed_names = set(registry.models)
+    installed_names = {name for name, record in registry.models.items() if is_chat_model(record.descriptor)}
     if not config.get("model") or str(config["model"]) not in installed_names:
         config["model"] = registry.default_model()
     selected = registry.models.get(str(config.get("model") or ""))

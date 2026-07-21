@@ -107,7 +107,9 @@ dairack
 
 The server prints a pairing token, which the client stores separately with private permissions. The interface, project
 files, shell, approvals, chats, indexes, and checkpoints remain on the client. Prompts, selected context, approved tool
-results, and attached images are sent to the inference endpoint because the model needs them to answer.
+results, and attached images are sent to the inference endpoint because the model needs them to answer. When semantic
+retrieval is enabled, `/index` also sends bounded file excerpts to the configured endpoint to create embeddings; set
+`"retrieval_embeddings": false` in the configuration to keep project indexing lexical-only.
 
 The bridge accepts only the model operations Dairack needs plus read-only hardware information. Return to local Ollama
 with `dairack connect local`, or restore the saved server with `dairack connect remote`. Do not expose an unauthenticated
@@ -116,7 +118,9 @@ Ollama endpoint to the public internet.
 ## Models
 
 Any Ollama chat model can be selected directly. Setup inspects the active compute machine, discovers installed models,
-and chooses practical runtime defaults. Adding a model does not require a Dairack source change.
+and chooses practical runtime defaults. Embedding-only utility models remain available to project retrieval but are
+excluded from direct selection, defaults, and Coordinator ranking. Adding a model does not require a Dairack source
+change.
 
 ```bash
 dairack models recommend

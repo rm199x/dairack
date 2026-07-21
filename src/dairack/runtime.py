@@ -163,6 +163,7 @@ from .models import (
     capabilities_for,
     capability_metadata_for,
     clear_runtime_override,
+    is_chat_model,
     load_registry,
     runtime_override_for,
     runtime_profile_for,
@@ -2874,12 +2875,13 @@ def print_help() -> None:
 
 def select_model(provider: OllamaProvider, current: str = "") -> str:
     try:
-        models = provider.list_models()
+        installed_models = provider.list_models()
     except Exception as exc:
         raise SystemExit(f"could not list Ollama models at {provider.host}: {exc}") from exc
 
+    models = [model for model in installed_models if is_chat_model(model)]
     if not models:
-        print("No Ollama models are installed yet.")
+        print("No Ollama chat models are installed yet.")
         name = input("Model to use/pull: ").strip()
         if not name:
             raise SystemExit("no model selected")
@@ -2891,7 +2893,8 @@ def select_model(provider: OllamaProvider, current: str = "") -> str:
         for i, model in enumerate(models, 2):
             marker = "*" if model.name == current else " "
             print(f"  {i}. {marker} {model.label()}")
-        default = current if current else models[0].name
+        installed_names = {model.name.casefold(): model.name for model in models}
+        default = installed_names.get(current.casefold(), models[0].name)
         choice = input(f"model [{default}]: ").strip()
         if not choice:
             return default
@@ -2906,6 +2909,29 @@ def select_model(provider: OllamaProvider, current: str = "") -> str:
         if choice.isdigit() and 2 <= int(choice) <= len(models) + 1:
             return models[int(choice) - 2].name
         return choice
+
+
+def validate_direct_model_choice(provider: Any, choice: str) -> str:
+    """Reject known utility-only models without changing unknown-model behavior."""
+    models: list[Any] | None = None
+    recent_models = getattr(provider, "recent_models", None)
+    if callable(recent_models):
+        try:
+            models = recent_models()
+        except Exception:
+            models = None
+    if models is None:
+        try:
+            models = list(provider.list_models())
+        except Exception:
+            return choice
+    selected = next(
+        (model for model in models if str(getattr(model, "name", "")).casefold() == choice.casefold()),
+        None,
+    )
+    if selected is not None and not is_chat_model(selected):
+        raise ValueError(f"{choice} is a utility model and does not support chat completion")
+    return choice
 
 
 def command_environment() -> dict[str, str]:
@@ -4035,12 +4061,16 @@ def index_project_with_vectors(
     provider: Any | None,
     target: Path,
     cancel_event: threading.Event | None = None,
+    *,
+    enable_embeddings: bool = True,
 ) -> tuple[int, str]:
     """Build the lexical index, then refresh semantic vectors best effort."""
     code, output = build_project_index(target, cancel_event)
-    if code == 0 and provider is not None:
+    if code == 0 and provider is not None and enable_embeddings:
         _vector_code, vector_output = embed_project_vectors(provider, target, cancel_event)
         output = f"{output}\n{vector_output}"
+    elif code == 0 and provider is not None:
+        output = f"{output}\nsemantic vectors: disabled"
     return code, output
 
 
@@ -4272,24 +4302,49 @@ def fresh_index_rows(root: Path, rows: list[tuple[Any, ...]]) -> tuple[list[tupl
 
 
 def embedding_model_for(provider: Any) -> str:
-    """Pick the smallest installed embedding-capable model; cached per provider instance."""
+    """Pick the smallest installed embedding model for the current inventory."""
+    models: list[Any] | None = None
+    recent_models = getattr(provider, "recent_models", None)
+    if callable(recent_models):
+        try:
+            models = recent_models()
+        except Exception:
+            models = None
+    if models is None:
+        try:
+            models = list(provider.list_models())
+        except Exception:
+            return ""
+    signature = tuple(
+        (
+            str(getattr(model, "name", "") or "").lower(),
+            str(getattr(model, "digest", "") or ""),
+            tuple(sorted(str(value).lower() for value in (getattr(model, "capabilities", ()) or ()))),
+        )
+        for model in models
+    )
     cached = getattr(provider, "_dairack_embedding_model", None)
-    if cached is not None:
-        return str(cached)
-    name = ""
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
+        return str(cached[1])
     try:
-        models = provider.list_models()
+        candidates = [
+            model
+            for model in models
+            if "embedding" in {str(value).lower() for value in (getattr(model, "capabilities", ()) or ())}
+        ]
+        name = str(min(candidates, key=lambda model: int(getattr(model, "size", 0) or 0)).name) if candidates else ""
     except Exception:
         return ""
-    candidates = [model for model in models if "embedding" in tuple(getattr(model, "capabilities", ()) or ())]
-    if candidates:
-        name = str(min(candidates, key=lambda model: int(getattr(model, "size", 0) or 0)).name)
-    provider._dairack_embedding_model = name
+    provider._dairack_embedding_model = (signature, name)
     return name
 
 
 def _unit_vector(vector: list[float]) -> list[float]:
-    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    if not vector or any(not math.isfinite(value) for value in vector):
+        raise ValueError("embedding vector is empty or non-finite")
+    norm = math.sqrt(sum(value * value for value in vector))
+    if not math.isfinite(norm) or norm <= 1e-12:
+        raise ValueError("embedding vector has no usable magnitude")
     return [value / norm for value in vector]
 
 
@@ -4393,7 +4448,10 @@ def hybrid_project_search(
         return lexical_code, lexical_output
     try:
         vector_rows = conn.execute(
-            "SELECT path, dim, vector FROM file_vectors WHERE root = ? AND model = ?",
+            "SELECT vectors.path, vectors.dim, vectors.vector, files.mtime, files.size "
+            "FROM file_vectors AS vectors "
+            "JOIN files ON files.root = vectors.root AND files.path = vectors.path "
+            "WHERE vectors.root = ? AND vectors.model = ?",
             (str(root), model),
         ).fetchall()
         if not vector_rows:
@@ -4402,12 +4460,23 @@ def hybrid_project_search(
             query_vector = _unit_vector(provider.embed(model, [query])[0])
         except Exception:
             return lexical_code, lexical_output
-        scored = sorted(
-            ((_vector_dot(bytes(vector), int(dim), query_vector), str(path)) for path, dim, vector in vector_rows),
-            reverse=True,
-        )
-        semantic_ranked = [path for score, path in scored[: max(limit * 3, 12)] if score > 0.0]
         candidates = max(limit * 3, 12)
+        scored = sorted(
+            (
+                (_vector_dot(bytes(vector), int(dim), query_vector), str(path), float(mtime), int(size))
+                for path, dim, vector, mtime, size in vector_rows
+            ),
+            key=lambda item: (-item[0], item[1]),
+        )
+        semantic_ranked: list[str] = []
+        for score, path, mtime, size in scored:
+            if score <= 0.0:
+                break
+            fresh_vector, _stale = fresh_index_rows(root, [(path, "", mtime, size)])
+            if fresh_vector:
+                semantic_ranked.append(path)
+                if len(semantic_ranked) >= candidates:
+                    break
         lexical_ranked: list[str] = []
         if index_has_fts(conn):
             fts = fts_query(query)
@@ -4429,7 +4498,7 @@ def hybrid_project_search(
                 fused[path] = fused.get(path, 0.0) + 1.0 / (60.0 + rank)
         if not fused:
             return lexical_code, lexical_output
-        ordered = [path for path, _score in sorted(fused.items(), key=lambda item: -item[1])][:limit]
+        ordered = [path for path, _score in sorted(fused.items(), key=lambda item: (-item[1], item[0]))]
         placeholders = ",".join("?" for _ in ordered)
         rows = conn.execute(
             f"SELECT path, content, mtime, size FROM files WHERE root = ? AND path IN ({placeholders})",
@@ -4444,7 +4513,7 @@ def hybrid_project_search(
     fresh, stale = fresh_index_rows(root, ordered_rows)
     if not fresh:
         return lexical_code, lexical_output
-    snippets = [make_file_snippet(path, content, query) for path, content in fresh]
+    snippets = [make_file_snippet(path, content, query) for path, content in fresh[:limit]]
     suffix = f"\n\n{stale} stale match(es) omitted; run /index to refresh." if stale else ""
     return 0, f"root: {root}\n\n" + "\n\n---\n\n".join(snippets) + suffix
 
@@ -7391,7 +7460,7 @@ class DairackTui:
 
     def show_models(self) -> None:
         try:
-            models = self.provider.list_models()
+            models = [model for model in self.provider.list_models() if is_chat_model(model)]
         except Exception as exc:
             self.append_error(f"could not list models: {exc}")
             return
@@ -7417,7 +7486,9 @@ class DairackTui:
             self.append_system("Approve or reject the pending action before switching models.")
             return
         try:
-            models = [ModelInfo(name=ORCHESTRATOR_MODEL_ID)] + self.provider.list_models()
+            models = [ModelInfo(name=ORCHESTRATOR_MODEL_ID)] + [
+                model for model in self.provider.list_models() if is_chat_model(model)
+            ]
         except Exception as exc:
             self.append_error(f"could not list models: {exc}")
             return
@@ -7467,6 +7538,11 @@ class DairackTui:
             self.save_current_chat()
             self.app.invalidate()
             return
+        try:
+            choice = validate_direct_model_choice(self.provider, choice)
+        except ValueError as exc:
+            self.append_system(str(exc))
+            return
         self.config["model_mode"] = "direct"
         self._active_route = None
         self._route_config = None
@@ -7483,7 +7559,7 @@ class DairackTui:
         choice = args[0]
         if choice.isdigit():
             try:
-                models = self.provider.list_models()
+                models = [model for model in self.provider.list_models() if is_chat_model(model)]
                 choice = models[int(choice) - 1].name
             except Exception:
                 self.append_system("invalid model number")
@@ -7779,7 +7855,12 @@ class DairackTui:
         call = {"name": "index_project", "path": str(target)}
         self.start_direct_action(
             call,
-            lambda cancel: index_project_with_vectors(self.provider, target, cancel),
+            lambda cancel: index_project_with_vectors(
+                self.provider,
+                target,
+                cancel,
+                enable_embeddings=config_bool(self.config, "retrieval_embeddings", True),
+            ),
             after_result=lambda code, _output: remember_indexed_project(self.chat, self.cwd, call, code),
         )
 
@@ -7973,11 +8054,16 @@ def handle_command(
             return True, cwd
         if model.isdigit():
             try:
-                models = provider.list_models()
+                models = [model for model in provider.list_models() if is_chat_model(model)]
                 model = models[int(model) - 1].name
             except Exception:
                 print("invalid model number")
                 return False, cwd
+        try:
+            model = validate_direct_model_choice(provider, model)
+        except ValueError as exc:
+            print(exc)
+            return False, cwd
         config["model_mode"] = "direct"
         profile_note = apply_model_profile(config, model)
         save_config(config)
@@ -8251,7 +8337,11 @@ def handle_command(
         if not target.exists() or not target.is_dir():
             print(f"not a directory: {target}")
         else:
-            code, output = index_project_with_vectors(provider, target)
+            code, output = index_project_with_vectors(
+                provider,
+                target,
+                enable_embeddings=config_bool(config, "retrieval_embeddings", True),
+            )
             remember_indexed_project(
                 chat,
                 cwd,
@@ -8824,6 +8914,10 @@ def interactive(args: argparse.Namespace, config: dict[str, Any]) -> None:
         ) from exc
 
     if args.model:
+        try:
+            validate_direct_model_choice(provider, args.model)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         config["model_mode"] = "direct"
         apply_model_profile(config, args.model)
     elif args.select:
@@ -8831,6 +8925,10 @@ def interactive(args: argparse.Namespace, config: dict[str, Any]) -> None:
         if selected in {ORCHESTRATOR_MODEL_ID, LEGACY_ORCHESTRATOR_MODEL_ID}:
             config["model_mode"] = "orchestrator"
         else:
+            try:
+                selected = validate_direct_model_choice(provider, selected)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
             config["model_mode"] = "direct"
             apply_model_profile(config, selected)
     elif not config.get("model"):
@@ -8961,6 +9059,11 @@ def one_shot(args: argparse.Namespace, config: dict[str, Any], prompt: str) -> i
         provider = configured_compute_provider(config, PATHS, host=args.host)
     if args.model:
         config = config.copy()
+        try:
+            validate_direct_model_choice(provider, args.model)
+        except ValueError as exc:
+            eprint(str(exc))
+            return 2
         config["model_mode"] = "direct"
         apply_model_profile(config, args.model)
 

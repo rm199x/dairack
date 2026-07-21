@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -91,6 +92,8 @@ STREAM_RENDER_INTERVAL = 0.04
 ACTION_COLLAPSE_LINES = 8
 PATH_SUGGESTION_CACHE_SECONDS = 30.0
 PATH_SUGGESTION_LIMIT = 4000
+PATH_SUGGESTION_VISIT_LIMIT = 12_000
+PATH_SUGGESTION_DEPTH_LIMIT = 12
 PATH_SUGGESTION_TOKEN = re.compile(r"@([A-Za-z0-9_\-./]*)$")
 WELCOME_WORDMARK = "DAIRACK"
 WELCOME_GLYPHS = (
@@ -3103,19 +3106,37 @@ class DairackTextualBase(App[None]):
         cached = getattr(self, "_path_suggestion_cache", None)
         if cached and cached[0] == str(root) and now - cached[1] < PATH_SUGGESTION_CACHE_SECONDS:
             return cached[2]
-        excluded = {".git", ".venv", "venv", "node_modules", "__pycache__", ".cache"}
+        excluded = {str(name).casefold() for name in self.core.INDEX_SKIP_NAMES}
         paths: list[str] = []
-        for base, directories, files in os.walk(root):
-            directories[:] = [name for name in directories if name not in excluded]
-            for name in files:
+        queue: deque[tuple[Path, int]] = deque([(root, 0)])
+        visited = 0
+        while queue and len(paths) < PATH_SUGGESTION_LIMIT and visited < PATH_SUGGESTION_VISIT_LIMIT:
+            base, depth = queue.popleft()
+            try:
+                entries = sorted(os.scandir(base), key=lambda entry: entry.name.casefold())
+            except OSError:
+                continue
+            for entry in entries:
+                visited += 1
+                if visited > PATH_SUGGESTION_VISIT_LIMIT:
+                    break
                 try:
-                    paths.append(str((Path(base) / name).relative_to(root)))
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                    is_file = entry.is_file(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_directory:
+                    if depth < PATH_SUGGESTION_DEPTH_LIMIT and entry.name.casefold() not in excluded:
+                        queue.append((Path(entry.path), depth + 1))
+                    continue
+                if not is_file:
+                    continue
+                try:
+                    paths.append(Path(entry.path).relative_to(root).as_posix())
                 except ValueError:
                     continue
                 if len(paths) >= PATH_SUGGESTION_LIMIT:
                     break
-            if len(paths) >= PATH_SUGGESTION_LIMIT:
-                break
         paths.sort(key=lambda path: (len(path), path.lower()))
         self._path_suggestion_cache = (str(root), now, paths)
         return paths
@@ -4481,7 +4502,7 @@ class DairackTextualBase(App[None]):
 
         def worker() -> None:
             try:
-                models = self.provider.list_models()
+                models = [model for model in self.provider.list_models() if self.core.is_chat_model(model)]
                 self._dispatch(self._show_coordinator_role_models, models)
             except Exception as exc:
                 self.append_error(f"could not list models: {exc}")
@@ -4555,7 +4576,7 @@ class DairackTextualBase(App[None]):
 
         def worker() -> None:
             try:
-                models = self.provider.list_models()
+                models = [model for model in self.provider.list_models() if self.core.is_chat_model(model)]
                 self.model_picker_items = models
                 self._dispatch(self._show_model_picker_main, models)
             except Exception as exc:
@@ -4726,6 +4747,11 @@ class DairackTextualBase(App[None]):
             detail = self.core.orchestrator_status(self.config)
             self.append_system("coordinator selected\n" + detail)
         else:
+            try:
+                choice = self.core.validate_direct_model_choice(self.provider, choice)
+            except ValueError as exc:
+                self.append_system(str(exc))
+                return
             self.config["model_mode"] = "direct"
             profile_note = self.core.apply_model_profile(self.config, choice)
             self.append_system(f"direct model selected: {choice}\n{profile_note}")
@@ -5173,7 +5199,7 @@ class DairackTextualBase(App[None]):
                         first_chunk = True
                         self.replace_last_assistant_text("")
                         self.set_busy(True, f"reconnecting / {executor}")
-                if thinking_parts and not self.cancel_event.is_set():
+                if thinking_parts and generation_error is None and not self.cancel_event.is_set():
                     collected = "".join(thinking_parts).strip()
                     if collected:
                         shown = collected[-1200:]

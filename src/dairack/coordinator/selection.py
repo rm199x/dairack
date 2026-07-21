@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..messages import latest_user_images, latest_user_task
+from ..models import is_chat_model
 from .analysis import (
     analyze_task,
     execution_scope,
@@ -174,7 +175,7 @@ def select_route(
     policy_definition = policy_for(policy)
     tuning = tuning_for_config(config)
     try:
-        models = list(provider.list_models())
+        installed_models = list(provider.list_models())
     except Exception as exc:
         route = direct_route(config)
         route.update(
@@ -189,7 +190,10 @@ def select_route(
             }
         )
         return route
+    models = [model for model in installed_models if is_chat_model(model)]
     if not models:
+        if installed_models:
+            raise RuntimeError("no installed model supports chat completion")
         route = direct_route(config)
         route["prompt"] = latest_user_task(messages)
         route["action_contract"] = action_contract

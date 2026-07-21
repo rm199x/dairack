@@ -86,6 +86,14 @@ semantic versioning after 1.0.
 
 ### Changed
 
+- Embedding-only utility models are excluded from chat defaults, direct selectors, Coordinator routing, and specialist
+  delegation; the compute bridge now explicitly allowlists embedding inference so hybrid retrieval works through the
+  authenticated remote-compute path as well as direct Ollama.
+- Semantic-assessment cache entries are scoped to the configured provider endpoint, and embedding-model cache entries
+  follow the current model inventory. Composer path discovery is entry- and depth-bounded and emits portable `/`
+  separators on Windows.
+- Lexical-only configuration now prevents indexing from requesting embeddings at all. Hybrid retrieval rejects invalid
+  vectors and refills its result window past stale semantic hits instead of silently returning fewer useful matches.
 - Native tool requests no longer embed the prose tool catalog in the system prompt; the schemas are authoritative
   there, keeping native function tools active within the default 4096-token context window. The compatibility text
   protocol retains the catalog.

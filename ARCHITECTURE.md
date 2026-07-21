@@ -153,7 +153,9 @@ delegation, oversight, calibration, control, policy, tuning — with the runtime
 so every interface, test, and the evaluation lab drive one implementation. Project memory is hybrid where hardware
 allows it: `/index` stores per-file embedding vectors beside the lexical index when an embedding-capable model is
 installed, and retrieval fuses bm25 with vector similarity through reciprocal-rank fusion, degrading to pure lexical
-search whenever embeddings are unavailable.
+search whenever embeddings are unavailable. Embedding-only models are utility inference endpoints and are excluded
+from chat defaults, direct selectors, Coordinator ranking, and delegation. With remote compute, bounded source excerpts
+cross the provider boundary for embedding while the index and vectors remain client-owned.
 
 Textual motion is event-driven and monotonic-time based. A one-shot scheduler runs at 20 fps only for short welcome,
 focus, phase, and completion transitions; visible waits update at 10 fps, while settled idle screens retain no motion

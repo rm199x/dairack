@@ -36,6 +36,7 @@ ALLOWED_ROUTES = {
     ("GET", "/api/ps"),
     ("POST", "/api/show"),
     ("POST", "/api/chat"),
+    ("POST", "/api/embed"),
     ("POST", "/api/pull"),
     ("DELETE", "/api/delete"),
 }
@@ -178,7 +179,7 @@ class ComputeBridgeHandler(BaseHTTPRequestHandler):
                 "dairack_version": __version__,
                 "node_name": self.bridge.bridge_config.node_name,
                 "hardware": self.bridge.hardware_profile.to_dict(),
-                "capabilities": {"ollama_proxy": True, "hardware_metadata": True},
+                "capabilities": {"ollama_proxy": True, "embeddings": True, "hardware_metadata": True},
             }
             if legacy:
                 payload["asusai_version"] = __version__

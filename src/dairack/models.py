@@ -16,6 +16,7 @@ from .paths import PATHS, AppPaths
 
 MODEL_REGISTRY_SCHEMA = 2
 CAPABILITY_NAMES = ("code", "agent", "reasoning", "general", "research", "vision", "efficiency")
+CHAT_MODEL_CAPABILITIES = {"completion", "tools", "vision", "thinking"}
 
 
 def parse_parameter_billions(value: str | int | float | None) -> float:
@@ -105,6 +106,18 @@ class ModelDescriptor:
             digest=str(getattr(model, "digest", "") or ""),
             capabilities=tuple(str(item).lower() for item in (getattr(model, "capabilities", ()) or ()) if str(item)),
         )
+
+
+def is_chat_model(model: Any) -> bool:
+    """Return whether provider metadata permits using a model as a chat executor.
+
+    Older providers may omit capabilities, so an empty declaration remains
+    compatible. A non-empty utility-only declaration, such as ``embedding``,
+    must never enter default selection or Coordinator ranking.
+    """
+    descriptor = ModelDescriptor.from_provider_model(model)
+    features = {value.lower() for value in descriptor.capabilities}
+    return not features or bool(features & CHAT_MODEL_CAPABILITIES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,8 +316,11 @@ class ModelRegistry:
     def default_model(self) -> str:
         if not self.models:
             return ""
-        recommended = [record for record in self.models.values() if record.runtime.fit != "constrained"]
-        candidates = recommended or list(self.models.values())
+        chat_models = [record for record in self.models.values() if is_chat_model(record.descriptor)]
+        if not chat_models:
+            return ""
+        recommended = [record for record in chat_models if record.runtime.fit != "constrained"]
+        candidates = recommended or chat_models
         return max(
             candidates,
             key=lambda record: (

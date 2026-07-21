@@ -53,6 +53,14 @@ class FakePlainRemoteOllama(FakeOllama):
         raise OllamaError("not found", 404)
 
 
+class FakeOllamaWithEmbedding(FakeOllama):
+    def list_models(self) -> list[ModelDescriptor]:
+        return [
+            ModelDescriptor("embed", 200_000_000, capabilities=("embedding",)),
+            *super().list_models(),
+        ]
+
+
 class BootstrapTests(unittest.TestCase):
     @patch("dairack.bootstrap.OllamaProvider", FakeOllama)
     @patch("dairack.bootstrap.detect_hardware")
@@ -86,6 +94,24 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(persisted["profile_overrides"], {})
             self.assertTrue(paths.hardware_file.exists())
             self.assertIn("Default model:", result.report())
+
+    @patch("dairack.bootstrap.OllamaProvider", FakeOllamaWithEmbedding)
+    @patch("dairack.bootstrap.detect_hardware")
+    def test_initialize_replaces_an_embedding_only_chat_selection(self, detect: object) -> None:
+        detect.return_value = HardwareProfile(  # type: ignore[attr-defined]
+            "linux", "x86_64", "CPU", 8, 16, 32 * GIB, 24 * GIB
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = AppPaths(root / "config", root / "data", root / "cache", root / "state")
+            config = default_config()
+            config["model"] = "embed"
+            save_config(config, paths)
+
+            result = initialize(paths)
+
+        self.assertNotEqual(result.config["model"], "embed")
+        self.assertIn(result.config["model"], {"fast", "large"})
 
     @patch("dairack.bootstrap.OllamaProvider", FakeOllama)
     @patch("dairack.bootstrap.detect_hardware")

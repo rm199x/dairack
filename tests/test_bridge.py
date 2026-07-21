@@ -48,6 +48,8 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
             )
         elif self.path == "/api/show":
             self._write(b'{"capabilities":["completion"]}')
+        elif self.path == "/api/embed":
+            self._write(b'{"embeddings":[[0.25,0.75]]}')
         else:
             self.send_error(404)
 
@@ -95,6 +97,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(info["service"], "dairack-compute")
         self.assertEqual(info["node_name"], "Test Server")
         self.assertEqual(info["hardware"]["cpu_name"], "Compute CPU")
+        self.assertTrue(info["capabilities"]["embeddings"])
         self.assertEqual(provider.version(), "test-ollama")
 
     def test_legacy_info_endpoint_remains_available_during_migration(self) -> None:
@@ -130,6 +133,12 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(chunks, ["hello"])
         self.assertEqual(provider.last_stats["done_reason"], "stop")
         self.assertIn(("POST", "/api/chat"), FakeOllamaHandler.hits)
+
+    def test_embedding_inference_is_available_through_the_allowlist(self) -> None:
+        provider = OllamaProvider(self.endpoint, "test-token-value-that-is-long")
+
+        self.assertEqual(provider.embed("embed-model", ["project text"]), [[0.25, 0.75]])
+        self.assertIn(("POST", "/api/embed"), FakeOllamaHandler.hits)
 
     def test_unauthenticated_non_loopback_bind_is_rejected(self) -> None:
         with self.assertRaisesRegex(ComputeError, "loopback"):

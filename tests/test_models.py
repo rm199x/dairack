@@ -10,6 +10,7 @@ from dairack.models import (
     ModelRegistry,
     capabilities_for,
     clear_runtime_override,
+    is_chat_model,
     load_registry,
     runtime_override_for,
     save_registry,
@@ -87,6 +88,16 @@ class HardwareAndModelTests(unittest.TestCase):
         registry = ModelRegistry.discover(models, hardware())
         self.assertEqual(registry.models["oversized"].runtime.fit, "constrained")
         self.assertEqual(registry.default_model(), "small")
+
+    def test_embedding_only_models_never_become_chat_defaults(self) -> None:
+        embedding = ModelDescriptor("embed", 200_000_000, capabilities=("embedding",))
+        chat = ModelDescriptor("chat", 5 * GIB, "8B", "Q4", capabilities=("completion",))
+
+        self.assertFalse(is_chat_model(embedding))
+        self.assertTrue(is_chat_model(chat))
+        self.assertTrue(is_chat_model(ModelDescriptor("legacy")))
+        self.assertEqual(ModelRegistry.discover([embedding, chat], hardware()).default_model(), "chat")
+        self.assertEqual(ModelRegistry.discover([embedding], hardware()).default_model(), "")
 
     def test_runtime_override_has_one_canonical_registry_location(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

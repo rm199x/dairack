@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..messages import IMAGE_EXTENSIONS, latest_user_task
+from ..models import is_chat_model
 from ..text import truncate
 from .analysis import analyze_task, is_direct_answer_route, signal_hits
 from .policy import POLICIES as COORDINATOR_POLICY_DEFINITIONS
@@ -144,7 +145,7 @@ def select_specialist(
     if policy not in _runtime().ORCHESTRATOR_POLICIES:
         policy = "adaptive"
     parent = str((parent_route or {}).get("executor") or config.get("model") or "")
-    models = list(provider.list_models())
+    models = [model for model in provider.list_models() if is_chat_model(model)]
     if not models:
         raise RuntimeError("no compute models are available for specialist delegation")
     try:

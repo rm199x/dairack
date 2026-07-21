@@ -273,6 +273,33 @@ def route(
 
 
 class CoordinatorRoutingTests(unittest.TestCase):
+    def test_embedding_only_models_never_enter_chat_routing_or_delegation(self) -> None:
+        class MixedProvider(FakeProvider):
+            def list_models(self) -> list[Any]:
+                return [
+                    CORE.ModelDescriptor(name="embed:latest", size=200_000_000, capabilities=("embedding",)),
+                    *MODELS,
+                ]
+
+        provider = MixedProvider(())
+        config = coordinator_config(semantic=False)
+        decision = route(provider, "Explain this architecture", config)
+
+        with self.assertRaisesRegex(ValueError, "does not support chat completion"):
+            CORE.validate_direct_model_choice(provider, "embed:latest")
+        self.assertEqual(CORE.validate_direct_model_choice(provider, "model-not-yet-listed"), "model-not-yet-listed")
+        with patch("builtins.input", return_value=""):
+            self.assertNotEqual(CORE.select_model(provider, "embed:latest"), "embed:latest")
+        self.assertNotEqual(decision["executor"], "embed:latest")
+        self.assertNotIn("embed:latest", {item["model"] for item in decision["candidates"]})
+        specialist = CORE.select_coordinator_specialist(
+            provider,
+            config,
+            {"name": "consult_specialist", "specialty": "general", "task": "Check the explanation"},
+            decision,
+        )
+        self.assertNotEqual(specialist["specialist"], "embed:latest")
+
     def test_direct_answer_scope_cannot_expose_tools_or_delegate(self) -> None:
         config = coordinator_config(semantic=False)
         for prompt in ("Hello", "Tell me a joke"):
@@ -877,6 +904,11 @@ class CoordinatorRoutingTests(unittest.TestCase):
             (root / "colors.py").write_text("PALETTE = ['red', 'green']\n", encoding="ascii")
             with patch.object(CORE, "INDEX_DB_PATH", Path(directory) / "index.sqlite3"):
                 provider = EmbedProvider()
+                code, output = CORE.index_project_with_vectors(provider, root, enable_embeddings=False)
+                self.assertEqual(code, 0, output)
+                self.assertIn("semantic vectors: disabled", output)
+                self.assertEqual(provider.embed_calls, [])
+
                 code, output = CORE.index_project_with_vectors(provider, root)
                 self.assertEqual(code, 0, output)
                 self.assertIn("semantic vectors: 2 embedded", output)
@@ -898,6 +930,44 @@ class CoordinatorRoutingTests(unittest.TestCase):
                 code, output = CORE.index_project_with_vectors(provider, root)
                 self.assertEqual(code, 0, output)
                 self.assertIn("0 embedded, 2 current", output)
+
+    def test_hybrid_retrieval_refills_candidates_after_stale_vector_hits(self) -> None:
+        class EmbedProvider(FakeProvider):
+            def list_models(self) -> list[Any]:
+                return [CORE.ModelDescriptor(name="embed", size=100_000_000, capabilities=("embedding",))]
+
+            def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+                vectors: list[list[float]] = []
+                for text in texts:
+                    lowered = text.lower()
+                    if "stale_top" in lowered or "login policy" in lowered:
+                        vectors.append([1.0, 0.0])
+                    elif "authorization guidance" in lowered:
+                        vectors.append([0.8, 0.2])
+                    else:
+                        vectors.append([0.0, 1.0])
+                return vectors
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            stale_paths = []
+            for index in range(13):
+                path = root / f"stale_{index:02d}.txt"
+                path.write_text("STALE_TOP\n", encoding="ascii")
+                stale_paths.append(path)
+            (root / "related.txt").write_text("Authorization guidance for protected sessions.\n", encoding="ascii")
+            with patch.object(CORE, "INDEX_DB_PATH", Path(directory) / "index.sqlite3"):
+                code, output = CORE.index_project_with_vectors(EmbedProvider(), root)
+                self.assertEqual(code, 0, output)
+                for path in stale_paths:
+                    path.write_text("STALE_TOP changed after indexing\n", encoding="ascii")
+
+                code, output = CORE.hybrid_project_search(EmbedProvider(), root, "login policy", limit=1)
+
+            self.assertEqual(code, 0, output)
+            self.assertIn("related.txt", output)
+            self.assertNotIn("stale_", output)
 
     def test_stale_index_content_is_not_returned_as_current_project_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1314,6 +1384,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
     def test_semantic_assessment_caches_identical_turns_in_process(self) -> None:
         CORE.reset_semantic_assessment_cache()
         first_provider = FakeProvider()
+        first_provider.host = "https://compute-a.example.test"
         config = coordinator_config()
         messages = [{"role": "user", "content": AMBIGUOUS_TASK}]
         first = CORE.select_orchestrator_route(first_provider, config, messages, Path("/tmp"))
@@ -1321,6 +1392,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
 
         # The identical turn re-routes without a second classifier inference.
         second_provider = FakeProvider()
+        second_provider.host = first_provider.host
         second = CORE.select_orchestrator_route(second_provider, config, messages, Path("/tmp"))
         self.assertEqual(second_provider.calls, [])
         self.assertEqual(second["executor"], first["executor"])
@@ -1328,8 +1400,17 @@ class CoordinatorRoutingTests(unittest.TestCase):
 
         # Caller-side mutation of a returned assessment cannot poison the cache.
         second["semantic_assessment"]["code"] = 99.0
-        third = CORE.select_orchestrator_route(FakeProvider(), config, messages, Path("/tmp"))
+        third_provider = FakeProvider()
+        third_provider.host = first_provider.host
+        third = CORE.select_orchestrator_route(third_provider, config, messages, Path("/tmp"))
         self.assertLessEqual(float(third["semantic_assessment"]["code"]), 1.0)
+
+        # A different inference endpoint gets its own verdict; model names alone
+        # do not make independently hosted model builds equivalent.
+        other_provider = FakeProvider()
+        other_provider.host = "https://compute-b.example.test"
+        CORE.select_orchestrator_route(other_provider, config, messages, Path("/tmp"))
+        self.assertEqual(len(other_provider.calls), 1)
         CORE.reset_semantic_assessment_cache()
 
     def test_semantic_arbitration_and_stage_costs(self) -> None:
@@ -3220,6 +3301,8 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             (root / "auth_notes.md").write_text("tokens\n", encoding="ascii")
             (root / "src").mkdir()
             (root / "src" / "colors.py").write_text("PALETTE = []\n", encoding="ascii")
+            (root / ".venv").mkdir()
+            (root / ".venv" / "hidden.py").write_text("HIDDEN = True\n", encoding="ascii")
             CORE.CONFIG_PATH = root / "config.json"
             CORE.HISTORY_PATH = root / "history"
             CORE.CHAT_DIR = root / "chats"
@@ -3239,6 +3322,10 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 composer.load_text("open @src/col")
                 await pilot.pause(0.05)
                 self.assertEqual(composer.suggestion, "ors.py")
+                candidates = app._project_path_candidates()
+                self.assertIn("src/colors.py", candidates)
+                self.assertFalse(any("\\" in path for path in candidates))
+                self.assertNotIn(".venv/hidden.py", candidates)
 
                 composer.load_text("/mo")
                 await pilot.pause(0.05)

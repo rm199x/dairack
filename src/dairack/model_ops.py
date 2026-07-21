@@ -72,6 +72,12 @@ class PullResult:
 ProgressCallback = Callable[[PullProgress], None]
 
 
+def _invalidate_provider_model_cache(provider: OllamaProvider) -> None:
+    invalidate = getattr(provider, "invalidate_model_cache", None)
+    if callable(invalidate):
+        invalidate()
+
+
 def _progress_from_layers(
     model: str,
     event: Mapping[str, Any],
@@ -127,6 +133,7 @@ def pull_model(
             close()
     if cancel_event and cancel_event.is_set():
         raise TransferCancelled(f"download cancelled: {name}")
+    _invalidate_provider_model_cache(provider)
     return PullResult(
         model=name,
         elapsed=max(0.0, time.monotonic() - started),
@@ -139,4 +146,5 @@ def pull_model(
 def remove_model(provider: OllamaProvider, model: str) -> str:
     name = validate_model_name(model)
     provider.delete(name)
+    _invalidate_provider_model_cache(provider)
     return name

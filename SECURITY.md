@@ -61,7 +61,9 @@ Dairack splits remote operation at the model-provider boundary:
 | Context selection and attachment reads | Read-only hardware identity |
 
 Inference is not private from the compute server. Prompts, system instructions, selected chat context, tool schemas,
-approved tool results, retrieved text, and attached images are sent to the configured endpoint. Use only a server and
+approved tool results, retrieved text, and attached images are sent to the configured endpoint. When semantic retrieval
+is enabled, project indexing also sends bounded per-file excerpts for embedding inference; the index and resulting
+vectors remain on the client. Set `retrieval_embeddings` to `false` for lexical-only indexing. Use only a server and
 network path you trust with that content.
 
 The bridge binds to loopback by default and requires a high-entropy bearer token. Use HTTPS, Tailscale Serve, or another
@@ -69,9 +71,9 @@ authenticated encrypted proxy for remote access. Direct Ollama has no Dairack au
 published openly. Compute connections do not inherit ambient operating-system proxy settings, keeping private routes
 and bearer credentials on the explicitly configured path.
 
-Possession of a bridge token grants inference and the allowlisted model-management operations, including model pull and
-delete. Rotate the server token if it is exposed. The bridge has no catch-all proxy route; adding one requires a
-security review and transport tests.
+Possession of a bridge token grants chat and embedding inference plus the allowlisted model-management operations,
+including model pull and delete. Rotate the server token if it is exposed. The bridge has no catch-all proxy route;
+adding one requires a security review and transport tests.
 
 ## Permission Boundary
 
