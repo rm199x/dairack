@@ -125,6 +125,19 @@ class PathAndConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "reduced_motion"):
                 save_config(config, isolated_paths(Path(directory)))
 
+    def test_model_keep_alive_accepts_durations_and_rejects_noise(self) -> None:
+        self.assertEqual(default_config()["model_keep_alive"], "10m")
+        with tempfile.TemporaryDirectory() as directory:
+            paths = isolated_paths(Path(directory))
+            for value in ("", "0", "-1", "45s", "10m", "1h"):
+                config = default_config()
+                config["model_keep_alive"] = value
+                self.assertEqual(save_config(config, paths)["model_keep_alive"], value)
+            config = default_config()
+            config["model_keep_alive"] = "forever"
+            with self.assertRaisesRegex(ConfigError, "model_keep_alive"):
+                save_config(config, paths)
+
     def test_save_rejects_invalid_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = default_config()

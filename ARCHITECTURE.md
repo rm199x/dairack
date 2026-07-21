@@ -132,6 +132,21 @@ separate until final request fitting; optional retrieval is shed first, macro me
 evidence, and a completed action result is narrowed again when necessary so its continuation request remains valid.
 Compaction may run between model/action steps but never in the middle of a provider call.
 
+The answer reserve is enforced, not advisory: request fitting protects a generation floor that binds exactly when a
+raised budget ratio, a small window, thinking mode, or final synthesis would otherwise let a packed prompt starve the
+response, and every executor request caps `num_predict` at the true window residual so the provider can never
+context-shift the prompt away — truncation surfaces honestly through the turn ladder instead of silently corrupting
+the request. A context-posture directive tells the executor how to work at its tier: small windows get incremental
+guidance (windowed reads continued with `start_line`, narrow tool requests, section-by-section audits carrying only
+conclusions forward), generous windows get whole-file latitude, and the standard tier adds nothing. This mirrors the
+strategies large-context agent CLIs converged on — threshold-triggered compaction that genuinely replaces history,
+recency-first retention, tool-output aging, meters that count schemas and reserves — and extends them for local
+windows orders of magnitude smaller, where partitioning must be enforced rather than assumed. Routing is additionally
+reload-aware: when the previous turn's executor is still resident and a cold challenger leads by less than a margin
+scaled to the incumbent's size and the policy's efficiency stance, the coordinator keeps the incumbent and records the
+decision in the route, so marginal score differences stop paying real model-reload latency; `model_keep_alive` extends
+provider residency between turns.
+
 Textual motion is event-driven and monotonic-time based. A one-shot scheduler runs at 20 fps only for short welcome,
 focus, phase, and completion transitions; visible waits update at 10 fps, while settled idle screens retain no motion
 timer. Signal tracks keep constant glyph geometry and interpolate true-color luminance across fractional cell

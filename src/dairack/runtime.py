@@ -1214,12 +1214,53 @@ def coordinator_semantic_assessment(
     return assessment
 
 
+def _executor_continuity(
+    scored: list[dict[str, Any]],
+    previous_route: dict[str, Any] | None,
+    policy: str,
+    signals: dict[str, float],
+) -> dict[str, Any] | None:
+    """Keep a resident incumbent executor when a cold challenger's lead is within the reload margin.
+
+    Switching models on local hardware pays a real load cost; a marginal score
+    lead does not. The margin scales with the incumbent's size (bigger models
+    cost more to reload) and the policy's efficiency stance, and never applies
+    when the challenger is already resident, when there is no incumbent, or when
+    the task needs vision the incumbent lacks.
+    """
+    if not isinstance(previous_route, dict) or not scored:
+        return None
+    incumbent = str(previous_route.get("executor") or "").strip()
+    if not incumbent or scored[0]["model"].lower() == incumbent.lower():
+        return None
+    entry = next((item for item in scored if str(item["model"]).lower() == incumbent.lower()), None)
+    if entry is None or not entry.get("resident") or scored[0].get("resident"):
+        return None
+    if float(signals.get("vision") or 0) > 0:
+        capabilities = entry.get("capabilities")
+        if not isinstance(capabilities, dict) or float(capabilities.get("vision") or 0) < 0.50:
+            return None
+    size_gb = float(getattr(entry.get("descriptor"), "size", 0) or 0) / 1e9
+    policy_scale = {"efficient": 1.4, "adaptive": 1.0, "quality": 0.5}.get(policy, 1.0)
+    margin = min(0.05, (0.015 + min(0.03, size_gb * 0.0035)) * policy_scale)
+    gap = float(scored[0]["score"]) - float(entry["score"])
+    if gap > margin:
+        return None
+    return {
+        "executor": str(entry["model"]),
+        "over": str(scored[0]["model"]),
+        "gap": round(gap, 4),
+        "margin": round(margin, 4),
+    }
+
+
 def select_orchestrator_route(
     provider: Any,
     config: dict[str, Any],
     messages: list[dict[str, str]],
     cwd: Path,
     cancel_event: threading.Event | None = None,
+    previous_route: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     action_contract = public_web_action_contract(messages)
     if str(config.get("model_mode") or "direct") != "orchestrator":
@@ -1416,6 +1457,9 @@ def select_orchestrator_route(
             assessment["trigger"] = semantic_trigger
             analysis["semantic_assessment"] = assessment
     executor = scored[0]["model"]
+    continuity = _executor_continuity(scored, previous_route, policy, signals)
+    if continuity:
+        executor = continuity["executor"]
     planner = ""
     reviewer = ""
     use_plan = False
@@ -1547,6 +1591,7 @@ def select_orchestrator_route(
             }
             for item in scored
         ],
+        "continuity": continuity or {},
         "delegations": [],
         "created_at": now_iso(),
     }
@@ -1562,6 +1607,14 @@ def format_route_report(route: dict[str, Any] | None) -> str:
     lines = [
         f"COORDINATOR / {policy}",
         f"Task: {route.get('task_kind') or 'general'} | complexity {float(route.get('complexity') or 0) * 100:.0f}% | confidence {float(route.get('confidence') or 0) * 100:.0f}%",
+        *(
+            [
+                f"Continuity: kept resident {continuity['executor']} over {continuity['over']} "
+                f"(gap {float(continuity.get('gap') or 0):.3f} within reload margin {float(continuity.get('margin') or 0):.3f})"
+            ]
+            if (continuity := route.get("continuity"))
+            else []
+        ),
         f"Executor: {route.get('executor') or '(none)'}",
         f"Strategy: {str(route.get('strategy') or 'single').replace('-', ' + ')}",
     ]
@@ -2007,6 +2060,7 @@ def _collect_orchestrator_response(
         think=bool(config.get("think")),
         num_ctx=int(config.get("num_ctx") or 4096),
         num_predict=max_tokens,
+        keep_alive=executor_keep_alive(config),
         cancel_event=cancel_event,
         extra_options=ollama_options(config),
         response_format=response_format,
@@ -3138,13 +3192,20 @@ def fit_request_context_messages(
     messages: list[dict[str, Any]],
     config: dict[str, Any],
     tools: list[dict[str, Any]] | None = None,
+    finalizing: bool = False,
 ) -> list[dict[str, Any]]:
-    """Fit the final provider payload, including tool schemas and tokenizer uncertainty."""
+    """Fit the final provider payload, including tool schemas, tokenizer uncertainty, and generation room.
+
+    Routing headroom is deliberately excluded here: coordinator stages run as
+    separate capped requests and do not share the executor window. The
+    compaction estimator includes it so memory compacts slightly before the
+    fitter would ever fail — intentional hysteresis, not drift.
+    """
     canonical = canonicalize_messages(messages)
     sections = expand_system_messages(canonical)
     tool_tokens = estimate_tokens(json.dumps(tools, sort_keys=True)) if tools else 0
     tokenizer_headroom, _routing_headroom = context_request_headroom(config)
-    reserve_tokens = tool_tokens + tokenizer_headroom
+    reserve_tokens = tool_tokens + tokenizer_headroom + response_token_reserve(config, finalizing)
     fitted = active_context_messages(
         sections,
         "",
@@ -3223,18 +3284,25 @@ def fit_agent_request_context_messages(
     messages: list[dict[str, Any]],
     config: dict[str, Any],
     tools: list[dict[str, Any]] | None,
+    finalizing: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fit a request, preferring native tools but retaining the compatibility protocol when space is tight."""
+    posture = context_posture_directive(config)
+    posture_directives = [posture] if posture else []
     native_tools = list(tools or [])
     if native_tools:
-        native_request = canonicalize_messages(messages, [NATIVE_TOOL_DIRECTIVE])
+        native_request = canonicalize_messages(messages, [NATIVE_TOOL_DIRECTIVE, *posture_directives])
         if native_request and native_request[0].get("role") == "system":
             native_request[0] = strip_native_system_catalog(native_request[0])
         try:
-            return fit_request_context_messages(native_request, config, native_tools), native_tools
+            return (
+                fit_request_context_messages(native_request, config, native_tools, finalizing=finalizing),
+                native_tools,
+            )
         except RequestContextError:
             pass
-    return fit_request_context_messages(compatibility_tool_history_messages(messages), config), []
+    compat = canonicalize_messages(compatibility_tool_history_messages(messages), posture_directives)
+    return fit_request_context_messages(compat, config, finalizing=finalizing), []
 
 
 def context_report(
@@ -3331,7 +3399,7 @@ def _request_payload_estimates(
         native.insert(min(1, len(native)), summary_message)
 
     tokenizer_headroom, routing_headroom = context_request_headroom(config)
-    common_reserve = tokenizer_headroom + routing_headroom
+    common_reserve = tokenizer_headroom + routing_headroom + response_token_reserve(config)
     compatibility_estimate = sum(estimate_message_tokens(message) for message in compatibility) + common_reserve
     native_estimate = compatibility_estimate
     if config_bool(config, "agent", True):
@@ -3347,6 +3415,74 @@ def context_request_headroom(config: dict[str, Any]) -> tuple[int, int]:
     """Return tokenizer uncertainty and per-turn routing reserve for one model profile."""
     num_ctx = int(config.get("num_ctx") or 4096)
     return max(256, int(num_ctx * 0.04)), max(160, int(num_ctx * 0.03))
+
+
+def response_token_reserve(config: dict[str, Any], finalizing: bool = False) -> int:
+    """Extra prompt-budget reserve that guarantees generation room beyond the ratio's residual.
+
+    The budget ratio implicitly leaves ``num_ctx - budget`` for the answer. That
+    residual is adequate for ordinary action turns at default settings, so this
+    returns zero there; it binds when a raised budget ratio, a small window,
+    thinking mode, or final synthesis would otherwise let a packed prompt starve
+    generation into a truncated or empty response.
+    """
+    num_ctx = int(config.get("num_ctx") or 4096)
+    if finalizing:
+        floor = max(512, min(2048, int(num_ctx * 0.24)))
+    else:
+        floor = max(320, min(1024, int(num_ctx * 0.14)))
+    if config_bool(config, "think", False):
+        floor += max(256, int(num_ctx * 0.08))
+    floor = min(floor, int(num_ctx * 0.45))
+    implicit = max(0, num_ctx - context_budget(config))
+    return max(0, floor - implicit)
+
+
+def executor_response_allowance(
+    request_messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    config: dict[str, Any],
+) -> int:
+    """Generation cap for one executor request: the true window residual.
+
+    Passed as num_predict so the provider stops at the boundary instead of
+    context-shifting the prompt away; truncation stays honest and recoverable
+    through the turn ladder rather than silently corrupting the request.
+    """
+    tokenizer_headroom, _routing_headroom = context_request_headroom(config)
+    prompt_tokens = sum(estimate_message_tokens(message) for message in request_messages)
+    if tools:
+        prompt_tokens += estimate_tokens(json.dumps(tools, sort_keys=True))
+    num_ctx = int(config.get("num_ctx") or 4096)
+    return max(256, num_ctx - prompt_tokens - tokenizer_headroom)
+
+
+def executor_keep_alive(config: dict[str, Any]) -> str | None:
+    """Residency hint for executor requests; empty configuration defers to the provider default."""
+    value = str(config.get("model_keep_alive") or "").strip()
+    return value or None
+
+
+def context_posture_directive(config: dict[str, Any]) -> str:
+    """One-line working posture matched to the executor's context tier.
+
+    Small windows get incremental-work guidance (windowed reads, narrow tool
+    requests, section-by-section audits); generous windows get whole-file
+    latitude. The standard tier adds nothing, keeping default prompts lean.
+    """
+    num_ctx = int(config.get("num_ctx") or 4096)
+    if num_ctx < 6144:
+        return (
+            "Context posture: TIGHT. The request window is small: read files in windows and continue with "
+            "start_line, keep each tool request narrow, avoid re-reading unchanged content, and for large "
+            "files work section by section, carrying forward only concise conclusions."
+        )
+    if num_ctx >= 16384:
+        return (
+            "Context posture: ROOMY. The window is generous: prefer whole-file reads and gather related "
+            "evidence together before concluding."
+        )
+    return ""
 
 
 def context_state(
@@ -3374,7 +3510,8 @@ def context_state(
         fitted_tools = []
 
     tokenizer_headroom, routing_headroom = context_request_headroom(runtime)
-    headroom_tokens = tokenizer_headroom + routing_headroom
+    response_reserve = response_token_reserve(runtime)
+    headroom_tokens = tokenizer_headroom + routing_headroom + response_reserve
     tool_tokens = estimate_tokens(json.dumps(fitted_tools, sort_keys=True)) if fitted_tools else 0
     message_tokens = sum(estimate_message_tokens(message) for message in fitted)
     macro_tokens = sum(
@@ -3401,7 +3538,7 @@ def context_state(
         "foundation_tokens": foundation_tokens,
         "tool_tokens": tool_tokens,
         "headroom_tokens": headroom_tokens,
-        "answer_reserve": max(0, num_ctx - budget),
+        "answer_reserve": max(0, num_ctx - budget) + response_reserve,
     }
 
 
@@ -7607,7 +7744,12 @@ class DairackTui:
                 self.set_busy(True, "routing request")
                 project_root = project_scope_for_chat(self.chat, self.cwd)
                 self._active_route = select_orchestrator_route(
-                    self.provider, self.config, self.messages, project_root, self.cancel_event
+                    self.provider,
+                    self.config,
+                    self.messages,
+                    project_root,
+                    self.cancel_event,
+                    previous_route=self.chat.get("last_route"),
                 )
                 self._active_route["tool_steps"] = self._agent_steps_used
                 self._active_route["tool_limit"] = agent_action_limit(self.config)
@@ -7732,6 +7874,7 @@ class DairackTui:
                 if finalizing:
                     self.set_busy(True, f"synthesizing / {executor}")
                 stream_retry_used = False
+                response_allowance = executor_response_allowance(request_messages, native_tools, runtime)
                 generation_error: Exception | None = None
                 while True:
                     try:
@@ -7740,6 +7883,8 @@ class DairackTui:
                             request_messages,
                             think=bool(runtime.get("think")),
                             num_ctx=int(runtime.get("num_ctx") or 4096),
+                            num_predict=response_allowance,
+                            keep_alive=executor_keep_alive(runtime),
                             cancel_event=self.cancel_event,
                             extra_options=ollama_options(runtime),
                             tools=native_tools or None,
@@ -9533,7 +9678,7 @@ def chat_turn(
     chat: dict[str, Any],
 ) -> None:
     project_root = project_scope_for_chat(chat, cwd)
-    route = select_orchestrator_route(provider, config, messages, project_root)
+    route = select_orchestrator_route(provider, config, messages, project_root, previous_route=chat.get("last_route"))
     route["tool_steps"] = 0
     route["tool_limit"] = agent_action_limit(config)
     executor = str(route.get("executor") or model)
@@ -9637,6 +9782,7 @@ def chat_turn(
         )
         revision_feedback = ""
         request_retry_used = False
+        response_allowance = executor_response_allowance(request_messages, request_tools, runtime)
         generation_error: Exception | None = None
         while True:
             try:
@@ -9646,6 +9792,8 @@ def chat_turn(
                     stream=False,
                     think=bool(runtime.get("think")),
                     num_ctx=int(runtime.get("num_ctx") or 4096),
+                    num_predict=response_allowance,
+                    keep_alive=executor_keep_alive(runtime),
                     extra_options=ollama_options(runtime),
                     tools=request_tools or None,
                     tool_call_sink=native_calls.append,

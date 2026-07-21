@@ -4849,7 +4849,12 @@ class DairackTextualBase(App[None]):
             self.set_busy(True, f"routing / {policy}")
             route_started = time.monotonic()
             route = self.core.select_orchestrator_route(
-                self.provider, self.config, self.messages, project_root, self.cancel_event
+                self.provider,
+                self.config,
+                self.messages,
+                project_root,
+                self.cancel_event,
+                previous_route=self.chat.get("last_route"),
             )
             route["timings"] = {"route": round(time.monotonic() - route_started, 3)}
             route["passes"] = 0
@@ -5032,6 +5037,7 @@ class DairackTextualBase(App[None]):
                 )
                 execution_started = time.monotonic()
                 stream_retry_used = False
+                response_allowance = self.core.executor_response_allowance(request_messages, native_tools, runtime)
                 generation_error: Exception | None = None
                 while True:
                     try:
@@ -5040,6 +5046,8 @@ class DairackTextualBase(App[None]):
                             request_messages,
                             think=bool(runtime.get("think")),
                             num_ctx=int(runtime.get("num_ctx") or 4096),
+                            num_predict=response_allowance,
+                            keep_alive=self.core.executor_keep_alive(runtime),
                             cancel_event=self.cancel_event,
                             extra_options=self.core.ollama_options(runtime),
                             tools=native_tools or None,

@@ -58,6 +58,14 @@ semantic versioning after 1.0.
   interrupts the active turn in both terminal interfaces instead of being unbound or exiting mid-stream.
 - Context-aware file windows with explicit line continuations, plus a compact task-evidence ledger that preserves the
   useful head and tail of older tool results when their raw exchanges no longer fit the active request.
+- Enforced generation reserve in request fitting: a response floor that binds when a raised budget ratio, small
+  window, thinking mode, or final synthesis would otherwise starve the answer, with `num_predict` capped at the true
+  window residual on every executor request so the provider can never context-shift the prompt away.
+- Context-posture directive matched to the executor's window tier: tight windows instruct incremental windowed work
+  with `start_line` continuations and section-by-section audits; generous windows get whole-file latitude.
+- Reload-aware executor continuity: a resident incumbent survives a cold challenger whose lead is within a margin
+  scaled to model size and policy stance, recorded in the route report; a validated `model_keep_alive` setting
+  extends provider residency between turns.
 - Searchable model-library sections with concise installed-model rows and progressively disclosed profile details.
 
 ### Changed

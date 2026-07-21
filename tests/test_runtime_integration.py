@@ -467,6 +467,91 @@ class CoordinatorRoutingTests(unittest.TestCase):
             CORE.context_budget(config),
         )
 
+    def test_response_reserve_binds_only_when_generation_room_is_inadequate(self) -> None:
+        healthy = {"num_ctx": 4096, "context_budget_ratio": 0.82}
+        self.assertEqual(CORE.response_token_reserve(healthy), 0)
+        self.assertEqual(CORE.response_token_reserve({"num_ctx": 16384, "context_budget_ratio": 0.82}), 0)
+
+        # A raised ratio, thinking mode, or final synthesis must win room back for generation.
+        self.assertGreater(CORE.response_token_reserve({"num_ctx": 4096, "context_budget_ratio": 0.95}), 0)
+        self.assertGreater(CORE.response_token_reserve({**healthy, "think": True}), 0)
+        self.assertGreater(CORE.response_token_reserve(healthy, finalizing=True), 0)
+
+        # The enforced reserve is visible as real answer room in context accounting.
+        reserved = CORE.response_token_reserve({"num_ctx": 4096, "context_budget_ratio": 0.95})
+        budget = CORE.context_budget({"num_ctx": 4096, "context_budget_ratio": 0.95})
+        self.assertGreaterEqual((4096 - budget) + reserved, 320)
+
+    def test_executor_response_allowance_caps_generation_at_the_residual(self) -> None:
+        config = {"num_ctx": 4096, "context_budget_ratio": 0.82}
+        small = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+        allowance = CORE.executor_response_allowance(small, None, config)
+        prompt = sum(CORE.estimate_message_tokens(message) for message in small)
+        headroom, _ = CORE.context_request_headroom(config)
+        self.assertEqual(allowance, 4096 - prompt - headroom)
+
+        packed = [{"role": "user", "content": "x" * 40_000}]
+        self.assertEqual(CORE.executor_response_allowance(packed, None, config), 256)
+
+    def test_context_posture_directive_matches_window_tiers(self) -> None:
+        tight = {**coordinator_config(semantic=False), "num_ctx": 4096, "context_budget_ratio": 0.82}
+        roomy = {**tight, "num_ctx": 32768}
+        standard = {**tight, "num_ctx": 8192}
+        messages = [
+            {"role": "system", "content": CORE.system_prompt(Path("/tmp"), True, {"model_mode": "direct"})},
+            {"role": "user", "content": "Audit runtime.py"},
+        ]
+
+        fitted, tools = CORE.fit_agent_request_context_messages(messages, tight, CORE.agent_tool_schemas())
+        self.assertTrue(tools)
+        self.assertIn("Context posture: TIGHT", fitted[0]["content"])
+
+        fitted, _ = CORE.fit_agent_request_context_messages(messages, roomy, CORE.agent_tool_schemas())
+        self.assertIn("Context posture: ROOMY", fitted[0]["content"])
+
+        fitted, _ = CORE.fit_agent_request_context_messages(messages, standard, CORE.agent_tool_schemas())
+        self.assertNotIn("Context posture:", fitted[0]["content"])
+
+    def test_executor_continuity_keeps_resident_incumbent_within_margin(self) -> None:
+        descriptor = CORE.ModelDescriptor(name="qwen3.5:9b", size=6_600_000_000)
+        incumbent = {
+            "model": "qwen3.5:9b",
+            "score": 0.700,
+            "resident": True,
+            "descriptor": descriptor,
+            "capabilities": {"vision": 0.0},
+        }
+        challenger = {
+            "model": "big:32b",
+            "score": 0.715,
+            "resident": False,
+            "descriptor": descriptor,
+            "capabilities": {"vision": 0.0},
+        }
+        previous = {"executor": "qwen3.5:9b"}
+        signals = {"vision": 0.0}
+
+        kept = CORE._executor_continuity([challenger, incumbent], previous, "adaptive", signals)
+        self.assertIsNotNone(kept)
+        self.assertEqual(kept["executor"], "qwen3.5:9b")
+        self.assertEqual(kept["over"], "big:32b")
+
+        # A decisive lead, a resident challenger, an unloaded incumbent, a vision
+        # requirement the incumbent cannot serve, or no incumbent all disable it.
+        decisive = {**challenger, "score": 0.850}
+        self.assertIsNone(CORE._executor_continuity([decisive, incumbent], previous, "adaptive", signals))
+        warm = {**challenger, "resident": True}
+        self.assertIsNone(CORE._executor_continuity([warm, incumbent], previous, "adaptive", signals))
+        cold_incumbent = {**incumbent, "resident": False}
+        self.assertIsNone(CORE._executor_continuity([challenger, cold_incumbent], previous, "adaptive", signals))
+        self.assertIsNone(CORE._executor_continuity([challenger, incumbent], previous, "adaptive", {"vision": 0.8}))
+        self.assertIsNone(CORE._executor_continuity([challenger, incumbent], None, "adaptive", signals))
+
+        # A moderate lead stays sticky under adaptive but switches under quality's tighter margin.
+        moderate = {**challenger, "score": 0.725}
+        self.assertIsNotNone(CORE._executor_continuity([moderate, incumbent], previous, "adaptive", signals))
+        self.assertIsNone(CORE._executor_continuity([moderate, incumbent], previous, "quality", signals))
+
     def test_final_request_fit_fails_locally_when_latest_turn_cannot_fit(self) -> None:
         config = {**coordinator_config(semantic=False), "num_ctx": 1024, "context_budget_ratio": 0.82}
         messages = [

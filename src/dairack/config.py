@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from copy import deepcopy
 from pathlib import Path
@@ -69,6 +70,7 @@ def default_config() -> dict[str, Any]:
         "update_check_interval_hours": 24,
         "update_index_url": env_value("UPDATE_INDEX_URL", DEFAULT_UPDATE_INDEX_URL).strip(),
         "num_ctx": 4096,
+        "model_keep_alive": "10m",
         "think": False,
         "agent": True,
         "max_agent_steps": 12,
@@ -179,6 +181,10 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
     config["compute_verified_at"] = str(config.get("compute_verified_at") or "").strip()
     config["remote_ollama_host"] = str(config.get("remote_ollama_host") or "").strip()
     config["update_index_url"] = validate_update_url(config.get("update_index_url"))
+    keep_alive = str(config.get("model_keep_alive") or "").strip()
+    if keep_alive and not re.fullmatch(r"(?:0|-1|\d+[smh])", keep_alive):
+        raise ConfigError("model_keep_alive must be empty, 0, -1, or a duration like 10m, 45s, or 1h")
+    config["model_keep_alive"] = keep_alive
     _bounded_int(config, "num_ctx", 512, 1_048_576)
     _bounded_int(config, "max_agent_steps", 1, 64)
     _bounded_int(config, "update_check_interval_hours", 1, 720)
