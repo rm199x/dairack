@@ -145,7 +145,15 @@ windows orders of magnitude smaller, where partitioning must be enforced rather 
 reload-aware: when the previous turn's executor is still resident and a cold challenger leads by less than a margin
 scaled to the incumbent's size and the policy's efficiency stance, the coordinator keeps the incumbent and records the
 decision in the route, so marginal score differences stop paying real model-reload latency; `model_keep_alive` extends
-provider residency between turns.
+provider residency between turns. Identical routing turns reuse a bounded in-process cache of the semantic
+classifier's verdict, and each specialist consultation ranks the model pool exactly once.
+
+The coordinator's algorithms live in `coordinator/` as importable modules — analysis, ranking, selection, semantic,
+delegation, oversight, calibration, control, policy, tuning — with the runtime module re-exporting the legacy names
+so every interface, test, and the evaluation lab drive one implementation. Project memory is hybrid where hardware
+allows it: `/index` stores per-file embedding vectors beside the lexical index when an embedding-capable model is
+installed, and retrieval fuses bm25 with vector similarity through reciprocal-rank fusion, degrading to pure lexical
+search whenever embeddings are unavailable.
 
 Textual motion is event-driven and monotonic-time based. A one-shot scheduler runs at 20 fps only for short welcome,
 focus, phase, and completion transitions; visible waits update at 10 fps, while settled idle screens retain no motion

@@ -71,7 +71,17 @@ semantic versioning after 1.0.
   model pool exactly once.
 - Coordinator delegation and semantic assessment extracted into `coordinator/delegation.py` and
   `coordinator/semantic.py`, continuing the module split begun with analysis and ranking while preserving the full
-  runtime API surface.
+  runtime API surface; route selection and the plan/review/learning/recovery oversight layer followed into
+  `coordinator/selection.py` and `coordinator/oversight.py`, completing the brain's move out of the runtime module.
+- Semantic project retrieval: `/index` also builds per-file embedding vectors when an embedding-capable model is
+  installed, and retrieval fuses lexical bm25 hits with vector similarity so conceptually related files surface even
+  without shared words; with no embedding model, behavior remains exactly lexical.
+- Thinking display: when thinking is enabled, the model's reasoning stream appears as a quiet transcript block after
+  the answer, kept out of provider history.
+- Long action results collapse to their headline with the full output one toggle away; transcript copy and export
+  keep complete fidelity.
+- `@`-path completion in the composer: a trailing `@fragment` ghost-suggests matching project file paths, preferring
+  path prefixes, then basename prefixes, from a briefly cached bounded scan.
 - Searchable model-library sections with concise installed-model rows and progressively disclosed profile details.
 
 ### Changed
