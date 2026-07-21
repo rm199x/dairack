@@ -450,7 +450,7 @@ def plan(
         if message.get("role") == "system":
             continue
         recent.append(f"{str(message.get('role')).upper()}: {truncate(str(message.get('content') or ''), 1800)}")
-    grounding = _runtime().retrieved_project_context(cwd, task, config, cwd)
+    grounding = _runtime().retrieved_project_context(cwd, task, config, cwd, provider=provider)
     grounding_block = (
         f"Indexed project context (may be stale; verify with actions):\n{truncate(grounding, 4200)}\n\n"
         if grounding

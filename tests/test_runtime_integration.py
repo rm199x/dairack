@@ -846,6 +846,59 @@ class CoordinatorRoutingTests(unittest.TestCase):
                 migrated, _, _, _ = CORE.chat_runtime_state(saved_session, home, config)
                 self.assertEqual(migrated["project_root"], "")
 
+    def test_hybrid_retrieval_finds_semantic_matches_beyond_lexical(self) -> None:
+        class EmbedProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(())
+                self.embed_calls: list[list[str]] = []
+
+            def list_models(self) -> list[Any]:
+                return [
+                    CORE.ModelDescriptor(name="nomic-embed", size=200_000_000, capabilities=("embedding",)),
+                    CORE.ModelDescriptor(name="qwen3.5:9b", size=6_600_000_000, capabilities=("completion",)),
+                ]
+
+            def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+                self.embed_calls.append(list(texts))
+
+                def vector(text: str) -> list[float]:
+                    lowered = text.lower()
+                    if "authentication" in lowered or "login" in lowered:
+                        return [1.0, 0.0]
+                    return [0.0, 1.0]
+
+                return [vector(text) for text in texts]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            (root / ".git").mkdir()
+            (root / "auth_notes.md").write_text("Authentication tokens rotate hourly for safety.\n", encoding="ascii")
+            (root / "colors.py").write_text("PALETTE = ['red', 'green']\n", encoding="ascii")
+            with patch.object(CORE, "INDEX_DB_PATH", Path(directory) / "index.sqlite3"):
+                provider = EmbedProvider()
+                code, output = CORE.index_project_with_vectors(provider, root)
+                self.assertEqual(code, 0, output)
+                self.assertIn("semantic vectors: 2 embedded", output)
+
+                # Pure lexical search misses a query with no shared words; the
+                # fused search recovers the semantic neighbor.
+                lexical_code, _ = CORE.search_project_index(root, "login policy")
+                self.assertNotEqual(lexical_code, 0)
+                hybrid_code, hybrid_output = CORE.hybrid_project_search(provider, root, "login policy")
+                self.assertEqual(hybrid_code, 0, hybrid_output)
+                self.assertIn("auth_notes.md", hybrid_output)
+
+                # A provider without an embedding-capable model degrades to exactly
+                # the lexical behavior instead of failing.
+                fallback_code, _ = CORE.hybrid_project_search(FakeProvider(()), root, "login policy")
+                self.assertNotEqual(fallback_code, 0)
+
+                # Re-indexing reuses fresh vectors instead of re-embedding.
+                code, output = CORE.index_project_with_vectors(provider, root)
+                self.assertEqual(code, 0, output)
+                self.assertIn("0 embedded, 2 current", output)
+
     def test_stale_index_content_is_not_returned_as_current_project_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

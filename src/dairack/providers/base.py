@@ -25,6 +25,8 @@ class ModelProvider(Protocol):
 
     def supports(self, model: str, capability: str) -> bool: ...
 
+    def embed(self, model: str, texts: list[str]) -> list[list[float]]: ...
+
     def chat_stream(
         self,
         model: str,

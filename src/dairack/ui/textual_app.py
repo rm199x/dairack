@@ -4911,6 +4911,7 @@ class DairackTextualBase(App[None]):
             runtime,
             self.cwd,
             include_retrieval=include_retrieval,
+            provider=self.provider,
         )
         route = self._active_route or {}
         directives: list[str] = []

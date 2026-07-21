@@ -308,6 +308,13 @@ class OllamaProvider:
             )
         return result
 
+    def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+        payload = self._request("POST", "/api/embed", {"model": model, "input": list(texts)}, timeout=60)
+        embeddings = payload.get("embeddings")
+        if not isinstance(embeddings, list):
+            raise OllamaError("embedding response did not contain embeddings")
+        return [[float(value) for value in row] for row in embeddings if isinstance(row, list)]
+
     def model_features(self, model: str) -> tuple[str, ...]:
         show = self.show_model(model)
         raw = show.get("capabilities")

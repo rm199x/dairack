@@ -17,6 +17,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -3959,6 +3960,12 @@ def _open_index_db_once() -> sqlite3.Connection:
             "CREATE TABLE IF NOT EXISTS project_profiles ("
             "root TEXT PRIMARY KEY, updated_at TEXT NOT NULL, profile_json TEXT NOT NULL, summary TEXT NOT NULL)"
         )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS file_vectors ("
+            "root TEXT NOT NULL, path TEXT NOT NULL, mtime REAL NOT NULL, size INTEGER NOT NULL, "
+            "model TEXT NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL, "
+            "PRIMARY KEY(root, path))"
+        )
         try:
             conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS file_fts USING fts5(root UNINDEXED, path, content)")
         except sqlite3.OperationalError:
@@ -4022,6 +4029,19 @@ def open_index_db(*, repair: bool = False) -> sqlite3.Connection:
 def index_has_fts(conn: sqlite3.Connection) -> bool:
     row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='file_fts'").fetchone()
     return bool(row)
+
+
+def index_project_with_vectors(
+    provider: Any | None,
+    target: Path,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, str]:
+    """Build the lexical index, then refresh semantic vectors best effort."""
+    code, output = build_project_index(target, cancel_event)
+    if code == 0 and provider is not None:
+        _vector_code, vector_output = embed_project_vectors(provider, target, cancel_event)
+        output = f"{output}\n{vector_output}"
+    return code, output
 
 
 def build_project_index(
@@ -4251,6 +4271,184 @@ def fresh_index_rows(root: Path, rows: list[tuple[Any, ...]]) -> tuple[list[tupl
     return fresh, stale
 
 
+def embedding_model_for(provider: Any) -> str:
+    """Pick the smallest installed embedding-capable model; cached per provider instance."""
+    cached = getattr(provider, "_dairack_embedding_model", None)
+    if cached is not None:
+        return str(cached)
+    name = ""
+    try:
+        models = provider.list_models()
+    except Exception:
+        return ""
+    candidates = [model for model in models if "embedding" in tuple(getattr(model, "capabilities", ()) or ())]
+    if candidates:
+        name = str(min(candidates, key=lambda model: int(getattr(model, "size", 0) or 0)).name)
+    provider._dairack_embedding_model = name
+    return name
+
+
+def _unit_vector(vector: list[float]) -> list[float]:
+    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / norm for value in vector]
+
+
+def _pack_vector(vector: list[float]) -> bytes:
+    return struct.pack(f"{len(vector)}f", *vector)
+
+
+def _vector_dot(packed: bytes, dim: int, query: list[float]) -> float:
+    if dim != len(query) or len(packed) != dim * 4:
+        return -1.0
+    return sum(a * b for a, b in zip(struct.unpack(f"{dim}f", packed), query, strict=True))
+
+
+def _embed_document_text(path: str, content: str) -> str:
+    return f"{path}\n{content[:1600]}"
+
+
+def embed_project_vectors(
+    provider: Any,
+    cwd: Path,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, str]:
+    """Build or refresh per-file semantic vectors for the indexed project, best effort."""
+    root = indexed_project_for_cwd(cwd)
+    if root is None:
+        return 1, "No project index found for this directory. Run /index first."
+    model = embedding_model_for(provider)
+    if not model:
+        return 1, "no embedding-capable model installed; retrieval stays lexical"
+    conn = open_index_db()
+    embedded = kept = 0
+    try:
+        files = conn.execute("SELECT path, mtime, size, content FROM files WHERE root = ?", (str(root),)).fetchall()
+        current = {
+            row[0]: (row[1], row[2], row[3])
+            for row in conn.execute(
+                "SELECT path, mtime, size, model FROM file_vectors WHERE root = ?", (str(root),)
+            ).fetchall()
+        }
+        live_paths = {str(path) for path, _mtime, _size, _content in files}
+        removed = [path for path in current if path not in live_paths]
+        for path in removed:
+            conn.execute("DELETE FROM file_vectors WHERE root = ? AND path = ?", (str(root), path))
+        pending: list[tuple[str, float, int, str]] = []
+        for path, mtime, size, content in files:
+            if current.get(str(path)) == (mtime, size, model):
+                kept += 1
+                continue
+            pending.append((str(path), float(mtime), int(size), str(content or "")))
+        for start in range(0, len(pending), 16):
+            if cancel_event and cancel_event.is_set():
+                conn.commit()
+                return 130, "semantic indexing interrupted"
+            batch = pending[start : start + 16]
+            vectors = provider.embed(model, [_embed_document_text(path, content) for path, _m, _s, content in batch])
+            if len(vectors) != len(batch):
+                return 1, "embedding response count mismatch; semantic vectors unchanged"
+            for (path, mtime, size, _content), vector in zip(batch, vectors, strict=True):
+                unit = _unit_vector(vector)
+                conn.execute(
+                    "INSERT OR REPLACE INTO file_vectors (root, path, mtime, size, model, dim, vector) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (str(root), path, mtime, size, model, len(unit), _pack_vector(unit)),
+                )
+                embedded += 1
+        conn.commit()
+    except sqlite3.DatabaseError as exc:
+        return 1, recover_corrupt_index(exc, "semantic indexing")
+    except Exception as exc:
+        return 1, f"semantic indexing unavailable: {exc}"
+    finally:
+        conn.close()
+    return 0, f"semantic vectors: {embedded} embedded, {kept} current, {len(removed)} removed ({model})"
+
+
+def hybrid_project_search(
+    provider: Any,
+    cwd: Path,
+    query: str,
+    limit: int = 8,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, str]:
+    """Fuse lexical bm25 hits with semantic vector hits via reciprocal-rank fusion.
+
+    Falls back to the lexical result whenever a provider, embedding model, or
+    vector table is unavailable, so retrieval never degrades below today's FTS5
+    behavior.
+    """
+    lexical_code, lexical_output = search_project_index(cwd, query, limit=limit, cancel_event=cancel_event)
+    if provider is None:
+        return lexical_code, lexical_output
+    root = indexed_project_for_cwd(cwd)
+    if root is None:
+        return lexical_code, lexical_output
+    model = embedding_model_for(provider)
+    if not model:
+        return lexical_code, lexical_output
+    try:
+        conn = open_index_db()
+    except sqlite3.DatabaseError:
+        return lexical_code, lexical_output
+    try:
+        vector_rows = conn.execute(
+            "SELECT path, dim, vector FROM file_vectors WHERE root = ? AND model = ?",
+            (str(root), model),
+        ).fetchall()
+        if not vector_rows:
+            return lexical_code, lexical_output
+        try:
+            query_vector = _unit_vector(provider.embed(model, [query])[0])
+        except Exception:
+            return lexical_code, lexical_output
+        scored = sorted(
+            ((_vector_dot(bytes(vector), int(dim), query_vector), str(path)) for path, dim, vector in vector_rows),
+            reverse=True,
+        )
+        semantic_ranked = [path for score, path in scored[: max(limit * 3, 12)] if score > 0.0]
+        candidates = max(limit * 3, 12)
+        lexical_ranked: list[str] = []
+        if index_has_fts(conn):
+            fts = fts_query(query)
+            if fts:
+                try:
+                    lexical_ranked = [
+                        str(row[0])
+                        for row in conn.execute(
+                            "SELECT path FROM file_fts WHERE root = ? AND file_fts MATCH ? "
+                            "ORDER BY bm25(file_fts) LIMIT ?",
+                            (str(root), fts, candidates),
+                        ).fetchall()
+                    ]
+                except sqlite3.OperationalError:
+                    lexical_ranked = []
+        fused: dict[str, float] = {}
+        for ranked in (lexical_ranked, semantic_ranked):
+            for rank, path in enumerate(ranked):
+                fused[path] = fused.get(path, 0.0) + 1.0 / (60.0 + rank)
+        if not fused:
+            return lexical_code, lexical_output
+        ordered = [path for path, _score in sorted(fused.items(), key=lambda item: -item[1])][:limit]
+        placeholders = ",".join("?" for _ in ordered)
+        rows = conn.execute(
+            f"SELECT path, content, mtime, size FROM files WHERE root = ? AND path IN ({placeholders})",
+            (str(root), *ordered),
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return lexical_code, lexical_output
+    finally:
+        conn.close()
+    by_path = {str(row[0]): row for row in rows}
+    ordered_rows = [by_path[path] for path in ordered if path in by_path]
+    fresh, stale = fresh_index_rows(root, ordered_rows)
+    if not fresh:
+        return lexical_code, lexical_output
+    snippets = [make_file_snippet(path, content, query) for path, content in fresh]
+    suffix = f"\n\n{stale} stale match(es) omitted; run /index to refresh." if stale else ""
+    return 0, f"root: {root}\n\n" + "\n\n---\n\n".join(snippets) + suffix
+
+
 def search_project_index(
     cwd: Path,
     query: str,
@@ -4472,6 +4670,7 @@ def retrieved_project_context(
     prompt: str,
     config: dict[str, Any],
     project_root: Path | None = None,
+    provider: Any | None = None,
 ) -> str:
     if not config_bool(config, "project_retrieval", True):
         return ""
@@ -4479,7 +4678,10 @@ def retrieved_project_context(
         return ""
     limit = config_int(config, "retrieval_results", 5, 1, 12)
     scope = project_root or cwd
-    code, output = search_project_index(scope, prompt, limit=limit)
+    if provider is not None and config_bool(config, "retrieval_embeddings", True):
+        code, output = hybrid_project_search(provider, scope, prompt, limit=limit)
+    else:
+        code, output = search_project_index(scope, prompt, limit=limit)
     parts: list[str] = []
     profile_code, profile_text = repo_profile_text(scope)
     if profile_code == 0:
@@ -4510,6 +4712,7 @@ def request_context_messages(
     config: dict[str, Any],
     cwd: Path,
     include_retrieval: bool = True,
+    provider: Any | None = None,
 ) -> list[dict[str, str]]:
     source = summarized_context_source(messages, chat)
     summary = str(chat.get("summary") or "")
@@ -4521,6 +4724,7 @@ def request_context_messages(
             latest_user_prompt(messages),
             config,
             project_root,
+            provider=provider,
         )
         if include_retrieval
         else ""
@@ -6342,6 +6546,7 @@ class DairackTui:
                     self.chat,
                     runtime,
                     self.cwd,
+                    provider=self.provider,
                 )
                 directives: list[str] = []
                 directive = coordinator_executor_directive(route, self.config)
@@ -7572,7 +7777,7 @@ class DairackTui:
         call = {"name": "index_project", "path": str(target)}
         self.start_direct_action(
             call,
-            lambda cancel: build_project_index(target, cancel),
+            lambda cancel: index_project_with_vectors(self.provider, target, cancel),
             after_result=lambda code, _output: remember_indexed_project(self.chat, self.cwd, call, code),
         )
 
@@ -8044,7 +8249,7 @@ def handle_command(
         if not target.exists() or not target.is_dir():
             print(f"not a directory: {target}")
         else:
-            code, output = build_project_index(target)
+            code, output = index_project_with_vectors(provider, target)
             remember_indexed_project(
                 chat,
                 cwd,
@@ -8256,7 +8461,7 @@ def chat_turn(
                 )
             )
         request_tools = [] if finalizing else native_tools
-        selected = request_context_messages(messages, chat, runtime, cwd)
+        selected = request_context_messages(messages, chat, runtime, cwd, provider=provider)
         try:
             return fit_agent_request_context_messages(
                 canonicalize_messages(selected, directives), runtime, request_tools
