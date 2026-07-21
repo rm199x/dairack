@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import shlex
 import subprocess
 import threading
@@ -11,7 +12,7 @@ from typing import Any, Iterable
 
 from rich.cells import cell_len
 from rich.text import Text
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
@@ -72,15 +73,18 @@ PALETTE = {
     "signal_wash": "#181610",
 }
 
-UI_TICK_SECONDS = 0.1
-SIGNAL_STEP_HZ = 3.2
-SIGNAL_STEP_SECONDS = 1.0 / SIGNAL_STEP_HZ
-SIGNAL_PULSE_HZ = SIGNAL_STEP_HZ / 4.0
-PHASE_GLINT_SECONDS = SIGNAL_STEP_SECONDS * 2.0
-FOCUS_GLINT_SECONDS = SIGNAL_STEP_SECONDS * 2.0
-COMPLETION_GLINT_SECONDS = SIGNAL_STEP_SECONDS * 3.0
-WORDMARK_REVEAL_HZ = 11.5
-WELCOME_SETTLE_SECONDS = 1.4
+MOTION_FRAME_SECONDS = 0.05
+WAIT_FRAME_SECONDS = 0.1
+SIGNAL_CYCLE_SECONDS = 1.8
+PHASE_SETTLE_SECONDS = 0.18
+FOCUS_SETTLE_SECONDS = 0.16
+COMPLETION_SWEEP_SECONDS = 0.40
+WELCOME_SETTLE_SECONDS = 0.85
+WELCOME_SWEEP_START = 0.08
+WELCOME_SWEEP_SECONDS = 0.46
+WELCOME_TAGLINE_START = 0.40
+WELCOME_READY_START = 0.64
+PROGRESS_RESPONSE_SECONDS = 0.12
 STREAM_RENDER_INTERVAL = 0.04
 WELCOME_WORDMARK = "DAIRACK"
 WELCOME_GLYPHS = (
@@ -95,55 +99,67 @@ WELCOME_GLYPHS = (
 
 
 def mix_color(start: str, end: str, amount: float) -> str:
-    """Interpolate two RGB colors without introducing an animation dependency."""
+    """Interpolate true-color values in linear light."""
+
+    def to_linear(channel: int) -> float:
+        value = channel / 255.0
+        return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+    def to_srgb(value: float) -> int:
+        encoded = 12.92 * value if value <= 0.0031308 else 1.055 * value ** (1.0 / 2.4) - 0.055
+        return round(max(0.0, min(1.0, encoded)) * 255.0)
+
     level = max(0.0, min(1.0, amount))
     left = tuple(int(start[index : index + 2], 16) for index in (1, 3, 5))
     right = tuple(int(end[index : index + 2], 16) for index in (1, 3, 5))
-    channels = tuple(round(a + (b - a) * level) for a, b in zip(left, right, strict=True))
+    channels = tuple(
+        to_srgb(to_linear(a) + (to_linear(b) - to_linear(a)) * level) for a, b in zip(left, right, strict=True)
+    )
     return "#" + "".join(f"{channel:02x}" for channel in channels)
 
 
-def signal_envelope(age: float, duration: float) -> float:
-    """Fast attack and controlled decay for one-shot interface feedback."""
-    if age < 0.0 or duration <= 0.0 or age >= duration:
-        return 0.0
-    phase = age / duration
-    if phase < 0.22:
-        attack = phase / 0.22
-        return attack * attack * (3.0 - 2.0 * attack)
-    decay = (phase - 0.22) / 0.78
-    return (1.0 - decay) ** 2
+def ease_out_cubic(progress: float) -> float:
+    bounded = max(0.0, min(1.0, progress))
+    return 1.0 - (1.0 - bounded) ** 3
 
 
-def append_signal_track(target: Text, width: int, cursor: int, *, wrap: bool = True) -> None:
-    """Render a fixed-width light packet with a restrained spatial falloff."""
+def transition_progress(age: float, duration: float) -> float:
+    if duration <= 0.0:
+        return 1.0
+    return ease_out_cubic(age / duration)
+
+
+def eased_progress(current: float, target: float, elapsed: float, response: float = PROGRESS_RESPONSE_SECONDS) -> float:
+    """Ease toward reported progress without ever moving beyond it."""
+    target = max(0.0, min(1.0, target))
+    current = max(0.0, min(target, current))
+    if elapsed <= 0.0 or current >= target:
+        return current
+    alpha = 1.0 - math.exp(-elapsed / max(0.001, response))
+    value = current + (target - current) * alpha
+    return target if target - value < 0.0005 else min(target, value)
+
+
+def append_signal_track(target: Text, width: int, position: float, *, wrap: bool = True) -> None:
+    """Render a fixed-glyph luminance packet at a fractional cell position."""
     width = max(1, width)
-    cursor = cursor % width if wrap else max(0, min(width - 1, cursor))
+    position = position % width if wrap else max(0.0, min(float(width - 1), position))
     for index in range(width):
-        direct = abs(index - cursor)
+        direct = abs(index - position)
         distance = min(direct, width - direct) if wrap else direct
-        if distance == 0:
-            target.append("=", style=f"bold {PALETTE['signal_peak']} on {PALETTE['signal_core']}")
-        elif distance == 1:
-            target.append("-", style=f"{PALETTE['amber']} on {PALETTE['signal_wash']}")
-        elif distance == 2:
-            target.append("-", style=PALETTE["line_hot"])
-        elif distance == 3 and width >= 12:
-            target.append("-", style=PALETTE["signal_haze"])
-        else:
-            target.append("-", style=PALETTE["line"])
+        intensity = math.exp(-0.5 * (distance / 1.05) ** 2)
+        color = PALETTE["line"] if intensity < 0.02 else mix_color(PALETTE["line"], PALETTE["signal_peak"], intensity)
+        target.append("─", style=color)
 
 
-def signal_pulse(elapsed: float, reduced_motion: bool) -> tuple[str, str]:
+def signal_pulse(elapsed: float, reduced_motion: bool, *, active: bool = True) -> tuple[str, str]:
     if reduced_motion:
-        return "•", PALETTE["amber"]
-    frames = (
-        ("·", PALETTE["signal_haze"]),
-        ("•", PALETTE["brass"]),
-        ("●", PALETTE["signal_peak"]),
-        ("•", PALETTE["amber"]),
-    )
-    return frames[int(max(0.0, elapsed) * SIGNAL_PULSE_HZ * len(frames)) % len(frames)]
+        return "●", PALETTE["amber"]
+    if not active:
+        return "●", PALETTE["amber"]
+    phase = (max(0.0, elapsed) % SIGNAL_CYCLE_SECONDS) / SIGNAL_CYCLE_SECONDS
+    luminance = 0.42 + (1.0 - math.cos(phase * math.tau)) * 0.18
+    return "●", mix_color(PALETTE["signal_haze"], PALETTE["signal_peak"], luminance)
 
 
 LOCKED_THEME = Theme(
@@ -895,7 +911,11 @@ class ModelTransferScreen(ModalScreen[dict[str, Any]]):
         self.error = ""
         self.active_index = 0
         self.progress: PullProgress | None = None
-        self.pulse = 0
+        self._display_percent: float | None = None
+        self._last_progress_tick = 0.0
+        self._completion_sweep_started = 0.0
+        self._feedback_timer: Any | None = None
+        self._feedback_due = 0.0
         self._thread: threading.Thread | None = None
 
     def compose(self) -> ComposeResult:
@@ -925,13 +945,18 @@ class ModelTransferScreen(ModalScreen[dict[str, Any]]):
         apply_modal_responsive_classes(self)
         self._update_plan_detail()
         self.started = time.monotonic()
-        self.set_interval(UI_TICK_SECONDS, self._tick, name="model-transfer-feedback")
+        self._last_progress_tick = self.started
         self._render_progress()
+        self._schedule_tick(self.started)
         self._thread = threading.Thread(target=self._worker, daemon=True, name="dairack-model-transfer")
         self._thread.start()
 
     def on_unmount(self) -> None:
         self.cancel_event.set()
+        if self._feedback_timer is not None:
+            self._feedback_timer.stop()
+            self._feedback_timer = None
+            self._feedback_due = 0.0
 
     def _post(self, callback: Any, *args: Any) -> None:
         try:
@@ -942,11 +967,12 @@ class ModelTransferScreen(ModalScreen[dict[str, Any]]):
     def on_resize(self, _event: Any) -> None:
         apply_modal_responsive_classes(self)
         self._update_plan_detail()
+        self._render_progress()
 
     def _worker(self) -> None:
         try:
             for index, model in enumerate(self.models):
-                self.active_index = index
+                self._post(self._begin_model, index)
                 pull_model(
                     self.provider,
                     model,
@@ -959,9 +985,21 @@ class ModelTransferScreen(ModalScreen[dict[str, Any]]):
         except Exception as exc:
             self._post(self._finish, False, str(exc))
 
+    def _begin_model(self, index: int) -> None:
+        self.active_index = index
+        self.progress = None
+        self._display_percent = index / max(1, len(self.models))
+        now = time.monotonic()
+        self._last_progress_tick = now
+        self._render_progress()
+        self._schedule_tick(now)
+
     def _receive_progress(self, progress: PullProgress) -> None:
         self.progress = progress
+        now = time.monotonic()
+        self._advance_progress(now)
         self._render_progress()
+        self._schedule_tick(now)
 
     def _overall_percent(self) -> float | None:
         if self.complete and self.succeeded:
@@ -974,12 +1012,26 @@ class ModelTransferScreen(ModalScreen[dict[str, Any]]):
         percent = self._overall_percent()
         result = Text("  ")
         if percent is None:
-            append_signal_track(result, width, self.pulse % width)
+            elapsed = max(0.0, time.monotonic() - self.started)
+            position = (elapsed % SIGNAL_CYCLE_SECONDS) / SIGNAL_CYCLE_SECONDS * width
+            append_signal_track(result, width, position)
             result.append("   --.-%", style=PALETTE["quiet"])
             return result
-        filled = round(width * percent)
-        result.append("=" * filled, style=PALETTE["amber"])
-        result.append("-" * (width - filled), style=PALETTE["line"])
+        visible = max(0.0, min(percent, self._display_percent if self._display_percent is not None else percent))
+        frontier = width * visible
+        completion_age = time.monotonic() - self._completion_sweep_started
+        completion_position = (
+            transition_progress(completion_age, COMPLETION_SWEEP_SECONDS) * (width - 1)
+            if self.succeeded and 0.0 <= completion_age < COMPLETION_SWEEP_SECONDS
+            else None
+        )
+        for index in range(width):
+            fill = max(0.0, min(1.0, frontier - index))
+            color = mix_color(PALETTE["line"], PALETTE["amber"], fill)
+            if completion_position is not None:
+                intensity = math.exp(-0.5 * ((index - completion_position) / 1.05) ** 2)
+                color = mix_color(color, PALETTE["signal_peak"], intensity)
+            result.append("─", style=color)
         result.append(f"   {percent * 100:5.1f}%", style=f"bold {PALETTE['paper']}")
         return result
 
@@ -1024,20 +1076,72 @@ class ModelTransferScreen(ModalScreen[dict[str, Any]]):
             )
         self.query_one("#transfer-status", Static).update(value)
 
+    def _advance_progress(self, now: float) -> None:
+        target = self._overall_percent()
+        elapsed = max(0.0, now - self._last_progress_tick)
+        self._last_progress_tick = now
+        if target is None:
+            self._display_percent = None
+            return
+        if self.complete and self.succeeded:
+            self._display_percent = 1.0
+            return
+        if self._display_percent is None:
+            start = self.active_index / max(1, len(self.models))
+            self._display_percent = min(target, start)
+        self._display_percent = eased_progress(self._display_percent, target, elapsed)
+
+    def _next_tick_delay(self, now: float) -> float | None:
+        if self.complete:
+            if self.succeeded and now - self._completion_sweep_started < COMPLETION_SWEEP_SECONDS:
+                return MOTION_FRAME_SECONDS
+            return None
+        target = self._overall_percent()
+        if target is not None and self._display_percent is not None and target - self._display_percent > 0.0005:
+            return MOTION_FRAME_SECONDS
+        return WAIT_FRAME_SECONDS
+
+    def _schedule_tick(self, now: float | None = None) -> None:
+        if not self.is_mounted:
+            return
+        timestamp = time.monotonic() if now is None else now
+        delay = self._next_tick_delay(timestamp)
+        if delay is None:
+            if self._feedback_timer is not None:
+                self._feedback_timer.stop()
+                self._feedback_timer = None
+                self._feedback_due = 0.0
+            return
+        due = timestamp + delay
+        if self._feedback_timer is not None and self._feedback_due <= due + 0.002:
+            return
+        if self._feedback_timer is not None:
+            self._feedback_timer.stop()
+        self._feedback_due = due
+        self._feedback_timer = self.set_timer(delay, self._tick, name="model-transfer-feedback")
+
     def _tick(self) -> None:
-        self.pulse = int(max(0.0, time.monotonic() - self.started) * SIGNAL_STEP_HZ)
+        self._feedback_timer = None
+        self._feedback_due = 0.0
+        now = time.monotonic()
+        self._advance_progress(now)
         self._render_progress()
+        self._schedule_tick(now)
 
     def _finish(self, succeeded: bool, error: str) -> None:
         self.complete = True
         self.succeeded = succeeded
         self.error = error
+        now = time.monotonic()
+        self._completion_sweep_started = now if succeeded else 0.0
+        self._advance_progress(now)
         button = self.query_one("#transfer-action", Button)
         button.label = "DONE" if succeeded else "CLOSE"
         button.variant = "primary" if succeeded else "default"
         self.query_one("#transfer-keys", Static).update("ENTER CLOSE   ESC CLOSE")
         button.focus()
         self._render_progress()
+        self._schedule_tick(now)
 
     @on(Button.Pressed, "#transfer-action")
     def transfer_action(self) -> None:
@@ -1622,10 +1726,15 @@ class DairackTextualBase(App[None]):
         self._last_stream_render = 0.0
         self._last_turn_stats: dict[str, Any] = {}
         self._last_turn_stats_until = 0.0
-        self._phase_glint_started = 0.0
-        self._completion_glint_started = 0.0
-        self._focus_glint_started = 0.0
+        self._phase_transition_started = 0.0
+        self._completion_sweep_started = 0.0
+        self._focus_transition_started = 0.0
+        self._focus_level = 0.0
+        self._focus_from = 0.0
+        self._focus_to = 0.0
         self._composer_was_focused = False
+        self._feedback_timer: Any | None = None
+        self._feedback_due = 0.0
         self._executor_stats: dict[str, Any] = {}
         self._active_tool_call: dict[str, str] | None = None
         self._active_route: dict[str, Any] | None = None
@@ -1684,7 +1793,6 @@ class DairackTextualBase(App[None]):
         self._ui_ready = True
         self._apply_responsive_classes()
         await self._rebuild_transcript_main()
-        self.set_interval(UI_TICK_SECONDS, self._feedback_tick, name="dairack-feedback")
         self.query_one("#composer", Composer).focus()
         self.screen.set_class(bool(self._pending_images), "has-attachments")
         self.refresh_chrome(force=True)
@@ -1701,6 +1809,10 @@ class DairackTextualBase(App[None]):
 
     def on_unmount(self) -> None:
         self._ui_ready = False
+        if self._feedback_timer is not None:
+            self._feedback_timer.stop()
+            self._feedback_timer = None
+            self._feedback_due = 0.0
         self.stop_workers(timeout=2.0)
         try:
             self.save_current_chat()
@@ -2044,8 +2156,11 @@ class DairackTextualBase(App[None]):
             coordination_phase = (self.busy_label or "").split(" / ", 1)[0]
             active_model = str(getattr(self.provider, "current_model", "") or "").upper()
             interrupting = self.interrupt_requested
+            streaming_output = phase == "responding" and self._stream_chars > 0 and not interrupting
             if interrupting:
                 label = f"INTERRUPTING / {active_model}" if active_model else "INTERRUPTING"
+            elif streaming_output:
+                label = f"OUTPUT / {active_model}" if active_model else "OUTPUT"
             elif coordination_phase in {"loading model", "processing context"}:
                 label = self.busy_label.upper()
             elif coordination_phase == "routing" and active_model and phase in {"thinking", "responding", "loading"}:
@@ -2065,11 +2180,21 @@ class DairackTextualBase(App[None]):
                 label = f"{phase_label} / {active_model}" if active_model else phase_label
             else:
                 label = (self.busy_label or "WORKING").upper()
-            pulse, pulse_color = signal_pulse(elapsed, self._reduced_motion)
-            phase_energy = (
-                0.0 if self._reduced_motion else signal_envelope(now - self._phase_glint_started, PHASE_GLINT_SECONDS)
+            phase_age = now - self._phase_transition_started
+            phase_transitioning = (
+                not self._reduced_motion and not streaming_output and 0.0 <= phase_age < PHASE_SETTLE_SECONDS
             )
-            label_color = mix_color(PALETTE["paper"], PALETTE["signal_peak"], phase_energy * 0.46)
+            pulse, pulse_color = signal_pulse(
+                elapsed,
+                self._reduced_motion,
+                active=not streaming_output and not interrupting and not phase_transitioning,
+            )
+            phase_progress = (
+                1.0
+                if self._reduced_motion or streaming_output
+                else transition_progress(phase_age, PHASE_SETTLE_SECONDS)
+            )
+            label_color = mix_color(PALETTE["muted"], PALETTE["paper"], phase_progress)
             if width < 44:
                 value = Text(" ")
                 value.append(pulse, style=f"bold {pulse_color}")
@@ -2080,7 +2205,11 @@ class DairackTextualBase(App[None]):
                 value.append(suffix, style=f"bold {PALETTE[suffix_color]}")
                 return value
             track_width = 12 if width >= 72 else 8
-            cursor = track_width // 2 if self._reduced_motion else int(elapsed * SIGNAL_STEP_HZ) % track_width
+            position = (
+                track_width / 2
+                if self._reduced_motion
+                else (elapsed % SIGNAL_CYCLE_SECONDS) / SIGNAL_CYCLE_SECONDS * track_width
+            )
             value = Text(" ")
             value.append(pulse, style=f"bold {pulse_color}")
             label_width = 12 if width < 60 else 22 if width < 90 else 34
@@ -2088,12 +2217,18 @@ class DairackTextualBase(App[None]):
             if (
                 width >= 104
                 and not interrupting
+                and not streaming_output
                 and coordination_phase in {"routing", "planning", "reviewing", "revising", "executing", "specialist"}
                 and phase in {"thinking", "responding", "loading"}
             ):
                 phase_label = {"thinking": "THINK", "responding": "OUTPUT", "loading": "LOAD"}[phase]
                 value.append(f"{phase_label:<6} ", style=PALETTE["brass"])
-            append_signal_track(value, track_width, cursor)
+            if streaming_output or interrupting:
+                value.append(" " * track_width)
+            elif phase_transitioning:
+                value.append("─" * track_width, style=PALETTE["line"])
+            else:
+                append_signal_track(value, track_width, position)
             value.append(f"  {elapsed_text(elapsed)}", style=PALETTE["brass"])
             current = getattr(self.provider, "current_stats", {}) or {}
             output_tokens = int(current.get("eval_count") or max(0, self._stream_chars // 4))
@@ -2131,13 +2266,13 @@ class DairackTextualBase(App[None]):
             return value
 
         value = Text(" READY", style=f"bold {PALETTE['olive']}")
-        completion_age = now - self._completion_glint_started
-        if not self._reduced_motion and 0.0 <= completion_age < COMPLETION_GLINT_SECONDS and width >= 44:
+        completion_age = now - self._completion_sweep_started
+        if not self._reduced_motion and 0.0 <= completion_age < COMPLETION_SWEEP_SECONDS and width >= 44:
             track_width = 7 if width < 72 else 9
-            progress = min(1.0, completion_age / COMPLETION_GLINT_SECONDS)
-            cursor = min(track_width - 1, round(progress * (track_width - 1)))
+            progress = transition_progress(completion_age, COMPLETION_SWEEP_SECONDS)
+            position = progress * (track_width - 1)
             value.append("  ")
-            append_signal_track(value, track_width, cursor, wrap=False)
+            append_signal_track(value, track_width, position, wrap=False)
         if self._last_turn_stats and now < self._last_turn_stats_until and width >= 72:
             count = int(self._last_turn_stats.get("eval_count") or 0)
             rate = float(self._last_turn_stats.get("tokens_per_second") or 0.0)
@@ -2160,7 +2295,7 @@ class DairackTextualBase(App[None]):
     def _activity_visible(self, now: float | None = None) -> bool:
         timestamp = time.monotonic() if now is None else now
         completion_active = (
-            not self._reduced_motion and 0.0 <= timestamp - self._completion_glint_started < COMPLETION_GLINT_SECONDS
+            not self._reduced_motion and 0.0 <= timestamp - self._completion_sweep_started < COMPLETION_SWEEP_SECONDS
         )
         return bool(
             self.busy
@@ -2305,12 +2440,26 @@ class DairackTextualBase(App[None]):
         compact = width_band(width) == "narrow" or self.size.height < 22
         settled = elapsed >= WELCOME_SETTLE_SECONDS
         glyph_count = len(WELCOME_WORDMARK)
-        revealed = glyph_count if settled else min(glyph_count, max(1, int(elapsed * WORDMARK_REVEAL_HZ) + 1))
-        accent = -1
-        accent_start = 0.58
-        accent_step = 0.1
-        if not settled and accent_start <= elapsed < accent_start + glyph_count * accent_step:
-            accent = min(glyph_count - 1, int((elapsed - accent_start) / accent_step))
+
+        mark_progress = transition_progress(elapsed, WELCOME_READY_START)
+        base_color = mix_color(PALETTE["line"], PALETTE["paper"], 0.28 + mark_progress * 0.72)
+        sweep_progress = max(0.0, min(1.0, (elapsed - WELCOME_SWEEP_START) / WELCOME_SWEEP_SECONDS))
+        sweep_position = -1.0 + sweep_progress * (glyph_count + 1.0)
+
+        def glyph_color(index: int) -> str:
+            if settled or elapsed < WELCOME_SWEEP_START or sweep_progress >= 1.0:
+                return PALETTE["paper"] if settled else base_color
+            intensity = math.exp(-0.5 * ((index - sweep_position) / 0.72) ** 2)
+            return mix_color(base_color, PALETTE["signal_peak"], intensity)
+
+        tagline_progress = transition_progress(elapsed - WELCOME_TAGLINE_START, 0.24)
+        tagline_color = mix_color(PALETTE["line"], PALETTE["muted"], tagline_progress)
+        ready_progress = transition_progress(
+            elapsed - WELCOME_READY_START, WELCOME_SETTLE_SECONDS - WELCOME_READY_START
+        )
+        ready_color = mix_color(PALETTE["ink"], PALETTE["olive"], ready_progress)
+        working_label_color = mix_color(PALETTE["ink"], PALETTE["quiet"], ready_progress)
+        working_path_color = mix_color(PALETTE["ink"], PALETTE["paper"], ready_progress)
         wordmark = Text(justify="center")
         if compact:
             letters = " ".join(WELCOME_WORDMARK)
@@ -2319,74 +2468,110 @@ class DairackTextualBase(App[None]):
                 if character == " ":
                     wordmark.append(character)
                     continue
-                if letter_index >= revealed:
-                    style = PALETTE["line"]
-                elif accent >= 0 and abs(letter_index - accent) == 0:
-                    style = PALETTE["signal_peak"]
-                elif accent >= 0 and abs(letter_index - accent) == 1:
-                    style = PALETTE["amber"]
-                else:
-                    style = PALETTE["paper"]
-                wordmark.append(character, style=f"bold {style}")
+                wordmark.append(character, style=f"bold {glyph_color(letter_index)}")
                 letter_index += 1
             tagline = "REMOTE COMPUTE" if self.config.get("compute_mode") == "remote" else "LOCAL INTELLIGENCE"
-            wordmark.append("\n" + tagline, style=f"bold {PALETTE['muted']}")
+            wordmark.append("\n" + tagline, style=f"bold {tagline_color}")
         else:
             for row in range(3):
                 for index, glyph in enumerate(WELCOME_GLYPHS):
                     if index:
                         wordmark.append("  ")
-                    if index >= revealed:
-                        style = PALETTE["line"]
-                    elif accent >= 0 and abs(index - accent) == 0:
-                        style = PALETTE["signal_peak"]
-                    elif accent >= 0 and abs(index - accent) == 1:
-                        style = PALETTE["amber"]
-                    else:
-                        style = PALETTE["paper"]
-                    wordmark.append(glyph[row], style=f"bold {style}")
+                    wordmark.append(glyph[row], style=f"bold {glyph_color(index)}")
                 wordmark.append("\n")
             tagline = (
                 "L O C A L   A G E N T   /   R E M O T E   C O M P U T E"
                 if self.config.get("compute_mode") == "remote"
                 else "L O C A L   I N T E L L I G E N C E"
             )
-            wordmark.append(tagline, style=f"bold {PALETTE['muted']}")
+            wordmark.append(tagline, style=f"bold {tagline_color}")
 
-        track_width = 13 if compact else 23
-        cursor = (
-            track_width // 2 if settled else min(track_width - 1, int((elapsed / WELCOME_SETTLE_SECONDS) * track_width))
-        )
-        wordmark.append("\n\n")
-        append_signal_track(wordmark, track_width, cursor, wrap=False)
-        wordmark.append("\n")
-        if elapsed < 0.58:
-            state = "RUNTIME / READY"
-        elif elapsed < 1.18:
-            state = "COORDINATOR / CALIBRATED"
-        else:
-            state = "NEW SESSION / READY"
-        wordmark.append(state, style=f"bold {PALETTE['olive']}")
-        if settled:
-            working_width = max(12, min(72, width - 8))
-            wordmark.append("\n\nWORKING IN  ", style=f"bold {PALETTE['quiet']}")
-            wordmark.append(clip_middle(str(self.cwd), working_width), style=PALETTE["paper"])
+        wordmark.append("\n\nNEW SESSION / READY", style=f"bold {ready_color}")
+        working_width = max(12, min(72, width - 8))
+        wordmark.append("\n\nWORKING IN  ", style=f"bold {working_label_color}")
+        wordmark.append(clip_middle(str(self.cwd), working_width), style=working_path_color)
         return wordmark
 
-    def _feedback_tick(self) -> None:
+    def _streaming_output_active(self) -> bool:
+        return bool(
+            self.busy
+            and self._stream_chars > 0
+            and str(getattr(self.provider, "stream_phase", "") or "") == "responding"
+        )
+
+    def _next_feedback_delay(self, now: float) -> float | None:
+        short_motion = False
+        if not self._reduced_motion:
+            short_motion = bool(
+                (self._empty_state is not None and now - self._welcome_started < WELCOME_SETTLE_SECONDS)
+                or (
+                    self._focus_transition_started > 0.0
+                    and now - self._focus_transition_started < FOCUS_SETTLE_SECONDS
+                    and self._focus_from != self._focus_to
+                )
+                or (
+                    self.busy
+                    and not self._streaming_output_active()
+                    and self._phase_transition_started > 0.0
+                    and now - self._phase_transition_started < PHASE_SETTLE_SECONDS
+                )
+                or (
+                    self._completion_sweep_started > 0.0
+                    and now - self._completion_sweep_started < COMPLETION_SWEEP_SECONDS
+                )
+            )
+        if short_motion:
+            return MOTION_FRAME_SECONDS
+        if self.busy:
+            return WAIT_FRAME_SECONDS
+        expirations = [
+            deadline - now
+            for deadline, active in (
+                (self._notice_until, bool(self._notice)),
+                (self._last_turn_stats_until, bool(self._last_turn_stats)),
+            )
+            if active and deadline > now
+        ]
+        return max(0.01, min(expirations)) if expirations else None
+
+    def _schedule_feedback(self, now: float | None = None) -> None:
         if not self._ui_ready or not self.is_running:
             return
+        timestamp = time.monotonic() if now is None else now
+        delay = self._next_feedback_delay(timestamp)
+        if delay is None:
+            if self._feedback_timer is not None:
+                self._feedback_timer.stop()
+                self._feedback_timer = None
+                self._feedback_due = 0.0
+            return
+        due = timestamp + delay
+        if self._feedback_timer is not None and self._feedback_due <= due + 0.002:
+            return
+        if self._feedback_timer is not None:
+            self._feedback_timer.stop()
+        self._feedback_due = due
+        self._feedback_timer = self.set_timer(delay, self._feedback_tick, name="dairack-feedback")
+
+    def _feedback_tick(self) -> None:
+        self._feedback_timer = None
+        self._feedback_due = 0.0
+        if not self._ui_ready or not self.is_running:
+            return
+        now = time.monotonic()
         width = max(20, self.size.width)
-        self.screen.set_class(self._activity_visible(), "activity-visible")
+        self.screen.set_class(self._activity_visible(now), "activity-visible")
         self._update_static("#activity", self._activity_content(width), False)
         self._update_welcome(width, False)
-        self._update_signal_surfaces(time.monotonic())
+        self._update_signal_surfaces(now)
+        self._schedule_feedback(now)
 
     def refresh_chrome(self, force: bool = False) -> None:
         if not self._ui_ready or not self.is_running:
             return
         width = max(20, self.size.width)
-        self.screen.set_class(self._activity_visible(), "activity-visible")
+        now = time.monotonic()
+        self.screen.set_class(self._activity_visible(now), "activity-visible")
         self._update_static("#topbar", self._topbar_content(width), force)
         self._update_static("#metabar", self._metabar_content(width), force)
         self._update_static("#activity", self._activity_content(width), force)
@@ -2394,31 +2579,44 @@ class DairackTextualBase(App[None]):
         self._update_static("#composer-meta", self._composer_meta_content(width), force)
         self._update_static("#keybar", self._keybar_content(width), force)
         self._update_welcome(width, force)
-        self._update_signal_surfaces(time.monotonic())
+        self._update_signal_surfaces(now)
+        self._schedule_feedback(now)
+
+    def _focus_amount(self, now: float) -> float:
+        if self._reduced_motion or self._focus_transition_started <= 0.0:
+            return self._focus_to
+        progress = transition_progress(now - self._focus_transition_started, FOCUS_SETTLE_SECONDS)
+        return self._focus_from + (self._focus_to - self._focus_from) * progress
+
+    def _set_focus_target(self, focused: bool, now: float) -> None:
+        current = self._focus_amount(now)
+        self._focus_level = current
+        self._focus_from = current
+        self._focus_to = 0.82 if focused else 0.0
+        self._focus_transition_started = now
+        self._composer_was_focused = focused
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        if event.widget.id != "composer":
+            return
+        self._set_focus_target(True, time.monotonic())
+        self.invalidate()
+
+    def on_descendant_blur(self, event: events.DescendantBlur) -> None:
+        if event.widget.id != "composer":
+            return
+        self._set_focus_target(False, time.monotonic())
+        self.invalidate()
 
     def _update_signal_surfaces(self, now: float) -> None:
         composer = self.query_one("#composer", Composer)
         focused = composer.has_focus
-        if focused and not self._composer_was_focused:
-            self._focus_glint_started = now
-        self._composer_was_focused = focused
-
-        if self._reduced_motion:
-            focus_energy = 0.0
-            completion_energy = 0.0
-        else:
-            focus_energy = signal_envelope(now - self._focus_glint_started, FOCUS_GLINT_SECONDS)
-            completion_energy = signal_envelope(
-                now - self._completion_glint_started,
-                COMPLETION_GLINT_SECONDS,
-            )
-        rail_energy = max(focus_energy * 0.58, completion_energy) if focused else 0.0
-        rail_base = PALETTE["amber"] if focused else "#151711"
-        rail_color = mix_color(rail_base, PALETTE["signal_peak"], rail_energy)
-        shell_energy = completion_energy * 0.62 if focused else 0.0
-        shell_line = mix_color(PALETTE["line"], PALETTE["line_hot"], shell_energy)
+        if focused != self._composer_was_focused:
+            self._set_focus_target(focused, now)
+        self._focus_level = self._focus_amount(now)
+        rail_color = mix_color("#151711", PALETTE["amber"], self._focus_level)
         composer.styles.border_left = ("solid", rail_color)
-        self.query_one("#composer-shell", Vertical).styles.border_top = ("solid", shell_line)
+        self.query_one("#composer-shell", Vertical).styles.border_top = ("solid", PALETTE["line"])
 
     def set_notice(self, value: str, seconds: float | None = None, severity: str = "success") -> None:
         severity = severity if severity in {"info", "success", "warning", "error"} else "info"
@@ -2661,11 +2859,11 @@ class DairackTextualBase(App[None]):
             self._stream_started = self.busy_started
             self._stream_chars = 0
             self._busy_interruptible = True if interruptible is None else interruptible
-            self._phase_glint_started = now
+            self._phase_transition_started = now
         elif value and interruptible is not None:
             self._busy_interruptible = interruptible
         if value and label and label != previous_label:
-            self._phase_glint_started = now
+            self._phase_transition_started = now
         elif not value:
             self.busy_started = 0.0
             self._busy_interruptible = True
@@ -2679,7 +2877,7 @@ class DairackTextualBase(App[None]):
                 self._last_turn_stats = {}
                 self._last_turn_stats_until = 0.0
             if was_busy:
-                self._completion_glint_started = now
+                self._completion_sweep_started = now
         self.invalidate()
 
     def begin_tool_action(self, call: dict[str, str], step_label: str = "") -> None:
@@ -4854,8 +5052,11 @@ class DairackTextualBase(App[None]):
                                 self.set_busy(True, f"{phase} / {executor}")
                                 first_chunk = False
                             assistant_text += chunk
+                            first_visible_chunk = self._stream_chars == 0 and bool(assistant_text)
                             self._stream_chars = len(assistant_text)
                             self.replace_last_assistant_text(self._visible_stream_text(assistant_text))
+                            if first_visible_chunk:
+                                self.invalidate()
                         break
                     except Exception as exc:
                         if stream_retry_used or self.cancel_event.is_set() or not self.core.transient_stream_error(exc):

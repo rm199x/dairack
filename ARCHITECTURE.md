@@ -132,6 +132,12 @@ separate until final request fitting; optional retrieval is shed first, macro me
 evidence, and a completed action result is narrowed again when necessary so its continuation request remains valid.
 Compaction may run between model/action steps but never in the middle of a provider call.
 
+Textual motion is event-driven and monotonic-time based. A one-shot scheduler runs at 20 fps only for short welcome,
+focus, phase, and completion transitions; visible waits update at 10 fps, while settled idle screens retain no motion
+timer. Signal tracks keep constant glyph geometry and interpolate true-color luminance across fractional cell
+positions. Streaming output suppresses decorative activity movement, and transfer progress visually eases toward the
+latest provider value without advancing beyond it. Reduced motion resolves every spatial transition immediately.
+
 Natural-language compute controls are a closed, schema-validated contract separate from task intent. They are
 confidence-gated, apply to one turn only, and cannot create action authority. A request for higher capacity must pass a
 provider-neutral material-capacity and task-fit check; quality and efficiency controls adjust bounded ranking policy.

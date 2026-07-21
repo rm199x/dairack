@@ -203,34 +203,45 @@ class SignalFeedbackTests(unittest.TestCase):
         self.assertEqual(len(ui.WELCOME_GLYPHS), len(ui.WELCOME_WORDMARK))
         self.assertTrue(all(ui.Text(row).cell_len == 3 for glyph in ui.WELCOME_GLYPHS for row in glyph))
 
-    def test_signal_clock_is_coherent_and_reduced_motion_is_static(self) -> None:
-        self.assertAlmostEqual(ui.SIGNAL_PULSE_HZ * 4.0, ui.SIGNAL_STEP_HZ)
-        self.assertAlmostEqual(ui.PHASE_GLINT_SECONDS, ui.SIGNAL_STEP_SECONDS * 2.0)
-        self.assertAlmostEqual(ui.FOCUS_GLINT_SECONDS, ui.SIGNAL_STEP_SECONDS * 2.0)
-        self.assertAlmostEqual(ui.COMPLETION_GLINT_SECONDS, ui.SIGNAL_STEP_SECONDS * 3.0)
+    def test_signal_clock_is_bounded_and_reduced_motion_is_static(self) -> None:
+        self.assertEqual(ui.MOTION_FRAME_SECONDS, 0.05)
+        self.assertEqual(ui.WAIT_FRAME_SECONDS, 0.1)
+        self.assertLess(ui.PHASE_SETTLE_SECONDS, 0.25)
+        self.assertLess(ui.FOCUS_SETTLE_SECONDS, 0.20)
+        self.assertLessEqual(ui.COMPLETION_SWEEP_SECONDS, 0.40)
+        self.assertLessEqual(ui.WELCOME_SETTLE_SECONDS, 0.90)
         self.assertEqual(ui.signal_pulse(0.0, True), ui.signal_pulse(999.0, True))
+        self.assertEqual(ui.signal_pulse(0.0, False)[0], ui.signal_pulse(0.8, False)[0])
+        self.assertNotEqual(ui.signal_pulse(0.0, False)[1], ui.signal_pulse(0.8, False)[1])
 
-    def test_signal_envelope_has_one_bounded_attack_and_decay(self) -> None:
-        duration = ui.COMPLETION_GLINT_SECONDS
-        values = [ui.signal_envelope(duration * index / 100, duration) for index in range(101)]
-
+    def test_transition_and_progress_easing_are_bounded(self) -> None:
+        values = [ui.transition_progress(index / 100, 1.0) for index in range(101)]
         self.assertEqual(values[0], 0.0)
-        self.assertEqual(values[-1], 0.0)
+        self.assertEqual(values[-1], 1.0)
         self.assertLessEqual(max(values), 1.0)
-        peak = values.index(max(values))
-        self.assertGreater(peak, 0)
-        self.assertLess(peak, len(values) - 1)
-        self.assertTrue(all(left <= right for left, right in zip(values[:peak], values[1 : peak + 1], strict=True)))
-        self.assertTrue(all(left >= right for left, right in zip(values[peak:-1], values[peak + 1 :], strict=True)))
+        self.assertTrue(all(left <= right for left, right in zip(values, values[1:], strict=False)))
+
+        progress = 0.0
+        for _ in range(20):
+            progress = ui.eased_progress(progress, 0.63, 0.05)
+            self.assertLessEqual(progress, 0.63)
+        self.assertGreater(progress, 0.62)
+        self.assertEqual(ui.eased_progress(progress, 0.40, 0.05), 0.40)
+
+    def test_color_mix_uses_linear_light(self) -> None:
+        self.assertEqual(ui.mix_color("#000000", "#ffffff", 0.5), "#bcbcbc")
 
     def test_signal_track_keeps_geometry_fixed(self) -> None:
-        track = ui.Text()
-        ui.append_signal_track(track, 9, 4, wrap=False)
+        first = ui.Text()
+        second = ui.Text()
+        ui.append_signal_track(first, 9, 4.1, wrap=False)
+        ui.append_signal_track(second, 9, 4.6, wrap=False)
 
-        self.assertEqual(track.plain, "----=----")
-        self.assertEqual(track.cell_len, 9)
-        self.assertIn(ui.PALETTE["signal_peak"], repr(track.spans))
-        self.assertIn(ui.PALETTE["signal_core"], repr(track.spans))
+        self.assertEqual(first.plain, "─" * 9)
+        self.assertEqual(second.plain, first.plain)
+        self.assertEqual(first.cell_len, 9)
+        self.assertNotEqual(first.spans, second.spans)
+        self.assertNotIn(" on ", repr(first.spans))
 
 
 def coordinator_config(policy: str = "adaptive", semantic: bool = True) -> dict[str, Any]:
@@ -3764,7 +3775,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(72, 24)) as pilot:
                 await pilot.pause(0.2)
                 welcome = app.query_one("#empty-state", ui.Static)
-                first_frame = str(welcome.render())
+                first_frame = repr(welcome.render())
                 self.assertIn("L O C A L   I N T E L L I G E N C E", first_frame)
                 compact_welcome = app._welcome_content(44).plain
                 self.assertIn("D A I R A C K", compact_welcome)
@@ -3774,14 +3785,15 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(app, "_context_values", wraps=app._context_values) as context_values:
                     await pilot.pause(0.25)
                 context_values.assert_not_called()
-                self.assertNotEqual(first_frame, str(welcome.render()))
-                await pilot.pause(0.9)
+                self.assertNotEqual(first_frame, repr(welcome.render()))
+                await pilot.pause(0.5)
                 self.assertIn("NEW SESSION", str(welcome.render()))
+                self.assertNotIn("COORDINATOR / CALIBRATED", str(welcome.render()))
                 app._welcome_started = time.monotonic() - ui.WELCOME_SETTLE_SECONDS - 0.1
                 app.refresh_chrome(force=True)
-                settled_frame = str(welcome.render())
+                settled_frame = repr(welcome.render())
                 await pilot.pause(0.2)
-                self.assertEqual(settled_frame, str(welcome.render()))
+                self.assertEqual(settled_frame, repr(welcome.render()))
                 self.assertNotIn("COORDINATOR / ADAPTIVE", settled_frame)
 
                 composer = app.query_one("#composer", ui.Composer)
@@ -3876,27 +3888,58 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("INTERRUPTING / QWEN3.5:9B", activity)
                 self.assertIn("WAIT", activity)
                 self.assertNotIn("ESC STOP", activity)
+                self.assertNotIn("─", activity)
                 app.set_busy(False)
                 app.cancel_event.clear()
+
+                provider.stream_phase = "responding"
+                provider.current_model = "qwen3.5:9b"
+                app.set_busy(True, "executing / qwen3.5:9b")
+                app._stream_chars = 80
+                streaming = app._activity_content(120).plain
+                self.assertIn("OUTPUT / QWEN3.5:9B", streaming)
+                self.assertNotIn("─", streaming)
+                app.set_busy(False)
+                provider.stream_phase = ""
 
                 provider.last_stats = {"eval_count": 22, "tokens_per_second": 62.9}
                 app.set_busy(True, "responding")
                 app.set_busy(False)
                 completion = app._activity_content(120).plain
                 self.assertIn("LAST 22 tok", completion)
-                self.assertIn("=", completion)
+                self.assertIn("─", completion)
                 app._last_turn_stats_until = time.monotonic() - 0.01
                 self.assertNotIn("LAST 22 tok", app._activity_content(120).plain)
 
                 composer = app.query_one("#composer", ui.Composer)
-                app._completion_glint_started = 0.0
-                app._focus_glint_started = time.monotonic() - ui.FOCUS_GLINT_SECONDS * 0.22
+                app._completion_sweep_started = 0.0
+                app._focus_from = 0.0
+                app._focus_to = 0.82
+                app._focus_transition_started = time.monotonic() - ui.FOCUS_SETTLE_SECONDS * 0.5
                 app._composer_was_focused = True
                 app._update_signal_surfaces(time.monotonic())
-                lit_rail = composer.styles.border_left
-                app._focus_glint_started = 0.0
+                transitioning_rail = composer.styles.border_left
+                app._focus_transition_started = time.monotonic() - ui.FOCUS_SETTLE_SECONDS
                 app._update_signal_surfaces(time.monotonic())
-                self.assertNotEqual(lit_rail, composer.styles.border_left)
+                self.assertNotEqual(transitioning_rail, composer.styles.border_left)
+
+                app._welcome_started = time.monotonic() - ui.WELCOME_SETTLE_SECONDS - 0.1
+                app._focus_transition_started = time.monotonic() - ui.FOCUS_SETTLE_SECONDS - 0.1
+                app._completion_sweep_started = time.monotonic() - ui.COMPLETION_SWEEP_SECONDS - 0.1
+                app._last_turn_stats = {}
+                app._notice = ""
+                app.refresh_chrome(force=True)
+                await pilot.pause(0.15)
+                self.assertIsNone(app._feedback_timer)
+
+                app._reduced_motion = True
+                now = time.monotonic()
+                app._focus_from = 0.0
+                app._focus_to = 0.82
+                app._focus_transition_started = now
+                app._phase_transition_started = now
+                app._completion_sweep_started = now
+                self.assertIsNone(app._next_feedback_delay(now))
 
                 app.append_assistant_start()
                 await pilot.pause(0.05)

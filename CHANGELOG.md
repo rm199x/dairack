@@ -83,8 +83,9 @@ semantic versioning after 1.0.
   available natively.
 - Welcome removal is atomic with first-message insertion, preventing animation refreshes from querying a detached
   widget.
-- Terminal chrome now uses measured content breakpoints, a shared 100 ms motion grid, readable quiet-text contrast,
-  and compact 32-column modal layouts.
+- Terminal chrome now uses measured content breakpoints, event-driven motion, readable quiet-text contrast, and
+  compact 32-column modal layouts. Short transitions render at 20 fps, active waits at 10 fps, and idle schedules no
+  animation work.
 - Coordinator semantic routing is independent of warm-model state and now resolves short contextual turns without
   contaminating fresh greetings.
 - `/run`, `/test`, `/search`, `/index`, `/web`, and `/url` now share one timed action lifecycle and retain bounded
@@ -144,6 +145,9 @@ semantic versioning after 1.0.
   commands, connection states say `READY` or `CONNECTED`, and code fences expose horizontal overflow.
 - Approval actions keep a fixed Deny / Allow Once / Auto-Allow Project Reads order. Risk controls initial focus and a
   critical rail without moving buttons, while persistent read policy now states its scope and lifetime explicitly.
+- Signal feedback keeps one glyph geometry and moves a fractional linear-light luminance envelope rather than a cell
+  cursor. Startup is one truthful 850 ms wordmark sweep, phase and completion transitions are shorter, activity motion
+  stops on the first output token, and model-transfer frontiers ease toward but never exceed reported progress.
 
 ### Removed
 

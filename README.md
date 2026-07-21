@@ -168,8 +168,8 @@ continuable line windows; each completed result is fitted again before the model
 the active task and a precise next range instead of stalling after compaction. `/context` shows the current macro
 memory, live working set, tool interface, reserves, and estimated next request.
 
-The interface adapts to compact terminals and settles into a static ready state after startup. Set
-`DAIRACK_REDUCED_MOTION=1` when all non-essential movement should remain disabled.
+The interface adapts to compact terminals and uses short event-driven transitions, with no animation timer retained
+while idle. Set `DAIRACK_REDUCED_MOTION=1` when all non-essential movement should remain disabled.
 
 ## Permissions
 
