@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from collections.abc import Callable
 from copy import deepcopy
 from html.parser import HTMLParser
@@ -907,13 +908,11 @@ def execute_coordinator_delegation(
     if any(isinstance(item, dict) and item.get("fingerprint") == fingerprint for item in prior):
         return 2, "Coordinator blocked a duplicate specialist request. Reuse the earlier evidence.", {}
 
-    decision_specialty = str((decision or {}).get("specialty") or "")
     decision_model = str((decision or {}).get("specialist") or "")
-    if (
-        decision is None
-        or decision_specialty != specialty
-        or (image_path is not None and not model_supports_vision(provider, decision_model))
-    ):
+    if decision is None or (image_path is not None and not model_supports_vision(provider, decision_model)):
+        # A provided decision is authoritative; re-ranking here would double the
+        # full model scan every consult. Only a missing decision or an image the
+        # chosen specialist cannot see forces one fresh selection.
         try:
             decision = select_coordinator_specialist(provider, config, call, parent_route)
         except Exception as exc:
@@ -1085,6 +1084,38 @@ COORDINATOR_SEMANTIC_SCHEMA: dict[str, Any] = {
 }
 
 
+_SEMANTIC_ASSESSMENT_CACHE_LIMIT = 96
+_semantic_assessment_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_semantic_assessment_cache_lock = threading.Lock()
+
+
+def reset_semantic_assessment_cache() -> None:
+    """Clear the per-process semantic assessment cache."""
+    with _semantic_assessment_cache_lock:
+        _semantic_assessment_cache.clear()
+
+
+def _semantic_assessment_cache_key(
+    model: str,
+    config: dict[str, Any],
+    task: str,
+    context: str,
+    observations: str,
+    tuning: Any,
+) -> str:
+    payload = "\x1f".join(
+        (
+            model,
+            str(config.get("num_ctx") or ""),
+            str(float(getattr(tuning, "intent_floor_strength", 0) or 0)),
+            task,
+            context,
+            observations,
+        )
+    )
+    return hashlib.sha1(payload.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def coordinator_semantic_assessment(
     provider: Any,
     config: dict[str, Any],
@@ -1097,6 +1128,12 @@ def coordinator_semantic_assessment(
 ) -> dict[str, Any]:
     if not model or not task.strip():
         return {}
+    cache_key = _semantic_assessment_cache_key(model, config, task, context, observations, tuning)
+    with _semantic_assessment_cache_lock:
+        cached = _semantic_assessment_cache.get(cache_key)
+        if cached is not None:
+            _semantic_assessment_cache.move_to_end(cache_key)
+            return deepcopy(cached)
     runtime = runtime_config_for_model(config, model)
     runtime["think"] = False
     options = runtime.get("model_options")
@@ -1211,6 +1248,10 @@ def coordinator_semantic_assessment(
         intent_floor = 0.50 + assessment["confidence"] * float(tuning.intent_floor_strength)
         assessment[intent_capability] = round(max(assessment[intent_capability], intent_floor), 3)
     assessment["reason"] = truncate(str(parsed.get("reason") or "semantic ambiguity"), 160)
+    with _semantic_assessment_cache_lock:
+        _semantic_assessment_cache[cache_key] = deepcopy(assessment)
+        while len(_semantic_assessment_cache) > _SEMANTIC_ASSESSMENT_CACHE_LIMIT:
+            _semantic_assessment_cache.popitem(last=False)
     return assessment
 
 

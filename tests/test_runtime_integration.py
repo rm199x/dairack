@@ -262,6 +262,7 @@ def route(
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     messages = list(history or []) + [{"role": "user", "content": prompt}]
+    CORE.reset_semantic_assessment_cache()
     return CORE.select_orchestrator_route(
         provider,
         config or coordinator_config(),
@@ -1256,6 +1257,27 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertEqual(len(saved["route_history"]), 2)
         self.assertEqual(saved["route_history"][0]["passes"], 1)
         self.assertIn("qwen3.5:9b", CORE.format_route_history(saved))
+
+    def test_semantic_assessment_caches_identical_turns_in_process(self) -> None:
+        CORE.reset_semantic_assessment_cache()
+        first_provider = FakeProvider()
+        config = coordinator_config()
+        messages = [{"role": "user", "content": AMBIGUOUS_TASK}]
+        first = CORE.select_orchestrator_route(first_provider, config, messages, Path("/tmp"))
+        self.assertEqual(len(first_provider.calls), 1)
+
+        # The identical turn re-routes without a second classifier inference.
+        second_provider = FakeProvider()
+        second = CORE.select_orchestrator_route(second_provider, config, messages, Path("/tmp"))
+        self.assertEqual(second_provider.calls, [])
+        self.assertEqual(second["executor"], first["executor"])
+        self.assertEqual(second["strategy"], first["strategy"])
+
+        # Caller-side mutation of a returned assessment cannot poison the cache.
+        second["semantic_assessment"]["code"] = 99.0
+        third = CORE.select_orchestrator_route(FakeProvider(), config, messages, Path("/tmp"))
+        self.assertLessEqual(float(third["semantic_assessment"]["code"]), 1.0)
+        CORE.reset_semantic_assessment_cache()
 
     def test_semantic_arbitration_and_stage_costs(self) -> None:
         provider = FakeProvider()
