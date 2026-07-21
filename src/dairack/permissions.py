@@ -321,6 +321,7 @@ def is_read_only_tool_call(call: dict[str, str]) -> bool:
         "read_file",
         "list_dir",
         "find_paths",
+        "grep",
         "hardware_status",
         "search_project",
         "consult_specialist",
@@ -344,7 +345,7 @@ def is_auto_approvable_tool_call(
         return True
     if name == "hardware_status":
         return True
-    if name not in {"read_file", "list_dir", "find_paths", "search_project", "consult_specialist"}:
+    if name not in {"read_file", "list_dir", "find_paths", "grep", "search_project", "consult_specialist"}:
         return False
     scope = project_root or cwd
     try:

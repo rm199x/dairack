@@ -271,6 +271,26 @@ TOOL_REGISTRY = ToolRegistry(
             interruptible=True,
         ),
         ToolSpec(
+            "grep",
+            "Search file contents with a regular expression; matches print as path:line:text.",
+            {
+                "query": {"type": "string", "description": "Regular expression to search for."},
+                "path": {
+                    "type": "string",
+                    "description": "Directory or file to search; defaults to the working directory.",
+                },
+            },
+            required=("query",),
+            aliases=("search_text", "content_search", "search_files", "rg"),
+            field_aliases={"pattern": "query", "regex": "query", "root": "path"},
+            body_field="query",
+            display_name="Content search",
+            activity="Searching file contents",
+            target_field="query",
+            target_label="QUERY",
+            interruptible=True,
+        ),
+        ToolSpec(
             "hardware_status",
             "Read Dairack's authoritative client and configured compute hardware identities.",
             {},

@@ -3106,9 +3106,7 @@ def ansi(text: str, code: str) -> str:
 
 
 try:
-    from prompt_toolkit import PromptSession
     from prompt_toolkit.application import Application
-    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     from prompt_toolkit.completion import WordCompleter
     from prompt_toolkit.data_structures import Point
     from prompt_toolkit.document import Document
@@ -3729,6 +3727,20 @@ def fit_request_context_messages(
     return fitted
 
 
+def strip_tool_catalog_for_native(content: str) -> str:
+    """Drop the prose tool catalog when native schemas accompany the request.
+
+    The catalog exists for the compatibility text protocol; with native tools the
+    schemas are authoritative and the duplicate listing wastes context budget.
+    Unmatched markers leave the content unchanged.
+    """
+    start = content.find("Available tools:")
+    end = content.find("Compatibility fallback only:")
+    if start == -1 or end == -1 or end <= start:
+        return content
+    return content[:start] + content[end:]
+
+
 def fit_agent_request_context_messages(
     messages: list[dict[str, Any]],
     config: dict[str, Any],
@@ -3738,6 +3750,11 @@ def fit_agent_request_context_messages(
     native_tools = list(tools or [])
     if native_tools:
         native_request = canonicalize_messages(messages, [NATIVE_TOOL_DIRECTIVE])
+        if native_request and native_request[0].get("role") == "system":
+            native_request[0] = {
+                **native_request[0],
+                "content": strip_tool_catalog_for_native(str(native_request[0].get("content") or "")),
+            }
         try:
             return fit_request_context_messages(native_request, config, native_tools), native_tools
         except RequestContextError:
@@ -3770,12 +3787,6 @@ def context_report(
         lines.append(f"auto compact: {'on' if config_bool(runtime, 'auto_compact', True) else 'off'} ({reason})")
         lines.append(f"summary covers messages before index: {chat_summary_upto(chat)}")
     return "\n".join(lines)
-
-
-def compact_source_text(messages: list[dict[str, str]], keep_recent: int) -> str:
-    start = 1
-    end = max(start, len(messages) - keep_recent) if keep_recent > 0 else len(messages)
-    return compact_range_text(messages, start, end)
 
 
 def compact_candidate_range(
@@ -4503,8 +4514,8 @@ def system_prompt(cwd: Path, agent: bool, config: dict[str, Any] | None = None) 
             direct fetch fails. Continue the workflow yourself after each result; never
             claim web access is unavailable when these tools are supplied or ask the
             user to invoke an internal web tool for you.
-            For code work, prefer search_project, read_file, list_dir, and git diff
-            before editing. For targeted changes, request edit_file with the exact
+            For code work, prefer grep for exact text or symbols, search_project
+            for concepts, plus read_file, list_dir, and git diff before editing. For targeted changes, request edit_file with the exact
             current text and its replacement; use patch with a unified diff only for
             multi-file or large rewrites. Do not write files through
             shell redirection, sed -i, Python scripts, or install commands unless the
@@ -4754,7 +4765,7 @@ def truncate_middle(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
 
 
 REPEATABLE_READ_TOOLS = frozenset(
-    {"read_file", "list_dir", "find_paths", "hardware_status", "search_project", "web_search", "web_open"}
+    {"read_file", "list_dir", "find_paths", "grep", "hardware_status", "search_project", "web_search", "web_open"}
 )
 STATE_PRESERVING_TOOLS = REPEATABLE_READ_TOOLS | {"consult_specialist", "analyze_image"}
 
@@ -4840,11 +4851,6 @@ def strip_tool_markup(text: str) -> str:
     return strip_tool_protocol(text)
 
 
-def visible_assistant_text(text: str) -> str:
-    cleaned = strip_tool_markup(text)
-    return cleaned if cleaned else "Requested an action."
-
-
 def response_incomplete_reason(text: str, stats: dict[str, Any] | None = None) -> str:
     """Return structural evidence that a model response ended before completion."""
     done_reason = str((stats or {}).get("done_reason") or "").strip().lower().replace("-", "_")
@@ -4892,11 +4898,6 @@ def parse_tool_request(text: str) -> tuple[dict[str, str] | None, str]:
     """Parse one validated action request and distinguish absence from malformed markup."""
     call, error, _recognized = decode_text_tool_call(text)
     return (normalize_coordinator_tool_call(call), "") if call else (None, error)
-
-
-def extract_tool_call(text: str) -> dict[str, str] | None:
-    call, _error = parse_tool_request(text)
-    return call
 
 
 def resolve_tool_request(
@@ -5202,12 +5203,32 @@ def search_files(
         return (0, "\n".join(matches)) if matches else (1, "no matches")
 
 
-def format_search_command(pattern: str) -> str:
-    parts = ["rg", "-n", "--hidden"]
-    for glob in SEARCH_GLOBS:
-        parts.extend(["--glob", glob])
-    parts.extend([pattern, "."])
-    return " ".join(shlex.quote(part) for part in parts)
+def grep_target(
+    target: Path,
+    pattern: str,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, str]:
+    """Content-search a directory tree or a single file for the agent grep tool."""
+    if target.is_file():
+        try:
+            expression = re.compile(pattern)
+        except re.error as exc:
+            return 2, f"invalid search expression: {exc}"
+        try:
+            data = target.read_bytes()
+        except OSError as exc:
+            return 1, f"could not read {target}: {exc}"
+        if b"\x00" in data[:4096]:
+            return 1, f"binary file not searched: {target}"
+        matches = [
+            f"{target.name}:{number}:{line}"
+            for number, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1)
+            if expression.search(line)
+        ]
+        return (0, "\n".join(matches)) if matches else (1, "no matches")
+    if not target.is_dir():
+        return 1, f"search root not found: {target}"
+    return search_files(target, pattern, cancel_event=cancel_event)
 
 
 def list_directory(cwd: Path, value: str = ".") -> tuple[int, str]:
@@ -6603,6 +6624,11 @@ def execute_tool_call(
         if enforce_project_scope and not path_within(target, scope):
             return 1, f"read-auto scope blocked: {target}"
         return discover_paths(target, call.get("query", ""), cancel_event=cancel_event)
+    if call.get("name") == "grep":
+        target = resolve_user_path(scope, call.get("path", "."))
+        if enforce_project_scope and not path_within(target, scope):
+            return 1, f"read-auto scope blocked: {target}"
+        return grep_target(target, call.get("query", ""), cancel_event=cancel_event)
     if call.get("name") == "hardware_status":
         return 0, format_hardware_status(load_config(), PATHS)
     if call.get("name") == "search_project":
@@ -6633,6 +6659,7 @@ def tool_result_message(call: dict[str, str], code: int, result: str) -> str:
         "read_file",
         "list_dir",
         "find_paths",
+        "grep",
         "hardware_status",
         "search_project",
         "index_project",
@@ -6664,34 +6691,6 @@ def denied_tool_history_message(call: dict[str, str], detail: str) -> dict[str, 
             "content": f"Action was not executed: {detail}",
         }
     return {"role": "user", "content": f"Tool request denied {detail}."}
-
-
-def coordinator_handoff_display(
-    call: dict[str, str],
-    code: int,
-    result: str,
-    record: dict[str, Any] | None,
-) -> str:
-    record = record or {}
-    specialty = str(record.get("specialty") or coordinator_specialty(call)).replace("_", " ").upper()
-    parent = str(record.get("parent") or "primary executor")
-    specialist = str(record.get("specialist") or "unavailable")
-    status = str(record.get("status") or ("complete" if code == 0 else "failed")).upper()
-    policy = str(record.get("policy") or "adaptive").upper()
-    seconds = float(record.get("seconds") or 0)
-    evidence = result.split("evidence:\n", 1)[1] if "evidence:\n" in result else result
-    lines = [
-        f"DELEGATION  {specialty}",
-        f"FLOW  {parent} > {specialist}",
-        f"STATE  {status}  /  {policy}  /  {seconds:.1f}s",
-        f"FIT  quality demand {float(record.get('quality_demand') or 0) * 100:.0f}%"
-        f"  /  route confidence {float(record.get('confidence') or 0) * 100:.0f}%",
-        f"TASK  {truncate(str(call.get('task') or ''), 300)}",
-    ]
-    if record.get("path"):
-        lines.append(f"INPUT  {record['path']}")
-    lines.extend(("EVIDENCE", truncate(evidence.strip(), 12000) or "(no evidence returned)"))
-    return "\n".join(lines)
 
 
 def diff_style_for_line(line: str) -> str:
@@ -6789,34 +6788,6 @@ def print_header(config: dict[str, Any], version: str, fancy: bool) -> None:
         f"{ansi('agent', '2')}: {ansi('on' if config.get('agent') else 'off', '32;1' if config.get('agent') else '2')}"
     )
     print(ansi("type below. /help commands, /model switch, /exit quit", "2"))
-
-
-def make_prompt_session() -> Any:
-    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
-    if not env_enabled("NO_COLOR"):
-        os.environ.pop("NO_COLOR", None)
-    style = Style.from_dict(
-        {
-            "prompt.user": "ansicyan bold",
-            "prompt.sep": "ansibrightblack",
-            "toolbar": "reverse",
-            "toolbar.model": "ansimagenta bold reverse",
-            "toolbar.dim": "ansibrightblack reverse",
-            "toolbar.hotkey": "ansicyan bold reverse",
-            "completion-menu.completion": "bg:#202020 #eeeeee",
-            "completion-menu.completion.current": "bg:#44475a #ffffff",
-        }
-    )
-    completer = WordCompleter(SLASH_COMMANDS, ignore_case=True, sentence=True)
-    return PromptSession(
-        history=FileHistory(str(HISTORY_PATH)),
-        completer=completer,
-        auto_suggest=AutoSuggestFromHistory(),
-        complete_while_typing=True,
-        enable_history_search=True,
-        style=style,
-    )
 
 
 def toolbar_html(config: dict[str, Any], cwd: Path) -> Any:

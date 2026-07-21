@@ -121,6 +121,58 @@ class PermissionBoundaryTests(unittest.TestCase):
                 [],
             )
 
+    def test_grep_tool_is_scoped_read_only_and_batchable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / ".git").mkdir()
+            (project / "a.py").write_text("def alpha():\n    return 1\n", encoding="ascii")
+            outside = Path(directory) / "secret.txt"
+            outside.write_text("token\n", encoding="ascii")
+
+            call = {"name": "grep", "query": "alpha"}
+            self.assertTrue(runtime.is_read_only_tool_call(call))
+            self.assertTrue(runtime.is_auto_approvable_tool_call(dict(call), project, project))
+            self.assertFalse(
+                runtime.is_auto_approvable_tool_call(
+                    {"name": "grep", "query": "token", "path": str(outside)}, project, project
+                )
+            )
+
+            # Even if reached directly, an out-of-scope grep is refused under read-auto.
+            code, output = runtime.execute_tool_call(
+                {"name": "grep", "query": "token", "path": str(outside)},
+                project,
+                project,
+                enforce_project_scope=True,
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("scope blocked", output)
+
+            code, output = runtime.execute_tool_call({"name": "grep", "query": "def alpha"}, project, project)
+            self.assertEqual(code, 0)
+            self.assertIn("a.py:1", output)
+
+            code, output = runtime.execute_tool_call(
+                {"name": "grep", "query": "return", "path": "a.py"}, project, project
+            )
+            self.assertEqual(code, 0)
+            self.assertIn("a.py:2", output)
+
+            code, output = runtime.execute_tool_call(
+                {"name": "grep", "query": "([unclosed", "path": "a.py"}, project, project
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("invalid search expression", output)
+
+            def native(name: str, **args: str) -> dict[str, object]:
+                return {"function": {"name": name, "arguments": {**args}}}
+
+            batch = runtime.read_only_batch(
+                [native("read_file", path="a.py"), native("grep", query="alpha")], project, project
+            )
+            self.assertEqual([entry["name"] for entry in batch], ["read_file", "grep"])
+
     def test_read_auto_rejects_traversal_and_symlink_scope_escapes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -406,6 +406,26 @@ class CoordinatorRoutingTests(unittest.TestCase):
             CORE.context_budget(config),
         )
 
+    def test_native_requests_drop_the_prose_tool_catalog_and_fit_default_context(self) -> None:
+        config = {**coordinator_config(semantic=False), "num_ctx": 4096, "context_budget_ratio": 0.82}
+        messages = [
+            {"role": "system", "content": CORE.system_prompt(Path("/tmp"), True, {"model_mode": "direct"})},
+            {"role": "user", "content": "What folders are in root?"},
+        ]
+
+        fitted, tools = CORE.fit_agent_request_context_messages(messages, config, CORE.agent_tool_schemas())
+
+        # Native tools stay active at the default context size; the schemas are
+        # authoritative there, so the duplicate prose catalog is dropped.
+        self.assertTrue(tools)
+        self.assertIn(CORE.NATIVE_TOOL_DIRECTIVE, fitted[0]["content"])
+        self.assertNotIn("Available tools:", fitted[0]["content"])
+        self.assertIn("Compatibility fallback only:", fitted[0]["content"])
+
+        compat, no_tools = CORE.fit_agent_request_context_messages(messages, config, None)
+        self.assertEqual(no_tools, [])
+        self.assertIn("Available tools:", compat[0]["content"])
+
     def test_final_request_fit_fails_locally_when_latest_turn_cannot_fit(self) -> None:
         config = {**coordinator_config(semantic=False), "num_ctx": 1024, "context_budget_ratio": 0.82}
         messages = [
