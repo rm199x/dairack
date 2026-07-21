@@ -426,6 +426,36 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertEqual(no_tools, [])
         self.assertIn("Available tools:", compat[0]["content"])
 
+    def test_final_fitter_can_shrink_macro_memory_without_dropping_active_directives(self) -> None:
+        config = {**coordinator_config(semantic=False), "num_ctx": 4096, "context_budget_ratio": 0.82}
+        messages = CORE.canonicalize_messages(
+            [
+                {"role": "system", "content": CORE.system_prompt(Path("/tmp"), True, config)},
+                {
+                    "role": "system",
+                    "content": "Persistent summary of earlier conversation:\n" + "grounded detail " * 1200,
+                },
+                {
+                    "role": "system",
+                    "content": "Retrieved local project memory.\n" + "stale retrieval " * 900,
+                },
+                {"role": "user", "content": "CURRENT_FILE_ANALYSIS_TASK"},
+            ],
+            ["ACTIVE_COORDINATOR_DIRECTIVE"],
+        )
+
+        fitted = CORE.fit_request_context_messages(messages, config)
+        rendered = "\n".join(str(message.get("content") or "") for message in fitted)
+
+        self.assertIn("CURRENT_FILE_ANALYSIS_TASK", rendered)
+        self.assertIn("ACTIVE_COORDINATOR_DIRECTIVE", rendered)
+        self.assertIn("Persistent summary of earlier conversation", rendered)
+        self.assertNotIn("stale retrieval", rendered)
+        self.assertLessEqual(
+            sum(CORE.estimate_message_tokens(message) for message in fitted) + max(256, int(config["num_ctx"] * 0.04)),
+            CORE.context_budget(config),
+        )
+
     def test_final_request_fit_fails_locally_when_latest_turn_cannot_fit(self) -> None:
         config = {**coordinator_config(semantic=False), "num_ctx": 1024, "context_budget_ratio": 0.82}
         messages = [
@@ -597,6 +627,67 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIn("lines 101-120 of 400", output)
         self.assertIn("continue with start_line=121, max_lines=20", output)
         self.assertNotIn("  121  line 121", output)
+
+    def test_large_read_after_compaction_is_rebounded_for_a_valid_continuation(self) -> None:
+        config = {
+            **coordinator_config(semantic=False),
+            "model_mode": "direct",
+            "model": "qwen3.5:9b",
+            "num_ctx": 4096,
+            "context_budget_ratio": 0.82,
+            "agent": True,
+        }
+        call = {
+            "name": "read_file",
+            "path": "large.cpp",
+            "start_line": "1",
+            "max_lines": "260",
+        }
+        native_call = {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": {"path": "large.cpp", "start_line": "1", "max_lines": "260"},
+            },
+        }
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": CORE.system_prompt(Path("/tmp"), True, config)},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "Read the file in parts and analyze it."},
+            {"role": "assistant", "content": "", "tool_calls": [native_call]},
+        ]
+        chat = {
+            "cwd": "/tmp",
+            "summary": "# Grounded conversation memory\n" + "Earlier grounded detail. " * 500,
+            "summary_upto": 3,
+            "summary_format": CORE.GROUNDED_MEMORY_FORMAT,
+        }
+        raw_result = (
+            "FILE large.cpp\nlines 1-260 of 1200\n"
+            + "\n".join(f"{line:5}  line evidence {line} " + "x" * 80 for line in range(1, 261))
+            + "\ncontinue with start_line=261, max_lines=260"
+        )
+
+        fitted_result = CORE.fit_tool_result_for_context(
+            messages,
+            chat,
+            config,
+            call,
+            0,
+            raw_result,
+            Path("/tmp"),
+        )
+        history = [*messages, CORE.tool_history_message(call, 0, fitted_result)]
+        active = CORE.request_context_messages(history, chat, config, Path("/tmp"), include_retrieval=False)
+        fitted, _tools = CORE.fit_agent_request_context_messages(active, config, CORE.agent_tool_schemas())
+        rendered = "\n".join(str(message.get("content") or "") for message in fitted)
+
+        self.assertLess(len(fitted_result), len(raw_result))
+        self.assertTrue(fitted_result.endswith("continue with start_line=261, max_lines=260"))
+        self.assertIn("Read the file in parts and analyze it.", rendered)
+        self.assertIn("Persistent summary of earlier conversation", rendered)
+        self.assertIn("continue with start_line=261, max_lines=260", rendered)
 
     def test_project_retrieval_keeps_the_real_user_prompt_after_tool_results(self) -> None:
         messages = [
@@ -3586,6 +3677,16 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsInstance(app.screen, ui.ApprovalScreen)
                     self.assertEqual(len(app.screen.query("#read-auto")), 1)
                     self.assertTrue(app.screen.query_one("#approve", ui.Button).has_focus)
+                    self.assertEqual(
+                        [button.id for button in app.screen.query(ui.Button)],
+                        ["deny", "approve", "read-auto"],
+                    )
+                    self.assertEqual(
+                        str(app.screen.query_one("#read-auto", ui.Button).label),
+                        "AUTO-ALLOW PROJECT READS",
+                    )
+                    policy_text = str(app.screen.query_one(".approval-policy", ui.Static).render())
+                    self.assertIn("persists for future chats", policy_text)
                     await pilot.press("escape")
                     await pilot.pause(0.05)
 
@@ -3751,10 +3852,25 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app._display_model(width=44), "ADAPT > QWEN3.5:9B")
                 composer_meta = app._composer_meta_content(120).plain
                 self.assertIn("ENTER SEND", composer_meta)
+                self.assertIn("CTRL+P COMMANDS", composer_meta)
                 self.assertNotIn("COORD", composer_meta)
+                self.assertFalse(app._activity_visible())
+                self.assertEqual(app.query_one("#activity").styles.display, "none")
+
+                composer = app.query_one("#composer", ui.Composer)
+                composer.load_text("/co")
+                command_hints = app._composer_meta_content(120).plain
+                self.assertIn("/coordinator", command_hints)
+                self.assertIn("/compact", command_hints)
+                self.assertIn("/compute", command_hints)
+                self.assertNotIn("/orchestrator", command_hints)
+                composer.load_text("")
 
                 provider.current_model = "qwen3.5:9b"
                 app.set_busy(True, "executing / qwen3.5:9b")
+                app.refresh_chrome(force=True)
+                self.assertTrue(app._activity_visible())
+                self.assertEqual(app.query_one("#activity").styles.display, "block")
                 app.request_interrupt()
                 activity = app._activity_content(120).plain
                 self.assertIn("INTERRUPTING / QWEN3.5:9B", activity)
@@ -4056,11 +4172,29 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     library = await wait_for(app, pilot, ui.SelectorScreen)
                     self.assertIn("MODEL LIBRARY", str(library.query_one(".dialog-title", ui.Static).render()))
                     library_options = library.query_one("#selector-options", ui.OptionList)
-                    self.assertEqual(library_options.option_count, 7)
+                    self.assertEqual(library_options.option_count, 9)
+                    self.assertTrue(library_options.get_option_at_index(0).disabled)
                     self.assertEqual(
-                        [library_options.get_option_at_index(index).id for index in range(3)],
+                        [library_options.get_option_at_index(index).id for index in range(1, 4)],
                         ["custom", "sets", "update-all"],
                     )
+                    library_filter = library.query_one("#selector-filter", ui.Input)
+                    library_filter.value = "qwen"
+                    await pilot.pause(0.05)
+                    self.assertEqual(library_options.option_count, 4)
+                    self.assertEqual(
+                        [library_options.get_option_at_index(index).id for index in range(4)],
+                        [
+                            "__heading__:installed",
+                            "model|qwen3.5:9b",
+                            "model|qwen3-coder:30b",
+                            "model|qwen3.6:27b",
+                        ],
+                    )
+                    library_filter.value = "qwen3.5"
+                    await pilot.pause(0.05)
+                    self.assertEqual(library_options.option_count, 2)
+                    self.assertEqual(library_options.get_option_at_index(1).id, "model|qwen3.5:9b")
                     await pilot.press("escape")
                     await pilot.pause(0.05)
                     self.assertNotIsInstance(app.screen, ui.SelectorScreen)
@@ -4138,7 +4272,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             app = ui.build_textual_app(CORE, CORE.DairackTui, initial_provider, "test", config, root)
 
             async with app.run_test(size=(110, 34)) as pilot:
-                self.assertIn("COMPUTE STUDIO SERVER / ONLINE", app._topbar_content(110).plain)
+                self.assertIn("COMPUTE STUDIO SERVER / CONNECTED", app._topbar_content(110).plain)
                 app.handle_command("/compute")
                 center = await wait_for_selector(app, pilot)
                 self.assertIn("COMPUTE / CONNECTION", str(center.query_one(".dialog-title", ui.Static).render()))

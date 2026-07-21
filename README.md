@@ -126,9 +126,9 @@ dairack models remove <model>
 dairack models
 ```
 
-<kbd>F6</kbd> or `/library` opens the same model lifecycle in the terminal interface, including transfer progress, cancellation,
-profile inspection, and confirmed removal. See [Models and Coordinator](docs/models.md) for profile tuning and advanced
-routing controls.
+<kbd>F6</kbd> or `/library` opens the same searchable model lifecycle in the terminal interface, including transfer
+progress, cancellation, profile inspection, and confirmed removal. See
+[Models and Coordinator](docs/models.md) for profile tuning and advanced routing controls.
 
 ## Coordinator
 
@@ -164,8 +164,9 @@ your saved configuration.
 Context handling follows the active model's generated or overridden runtime profile. Dairack reserves answer and
 protocol headroom, compacts covered history into grounded memory before the request becomes unsafe, and retains a
 small evidence ledger when an active tool workflow outgrows its raw transcript. Large files are read through bounded,
-continuable line windows. `/context` shows the current macro memory, live working set, tool interface, reserves, and
-estimated next request.
+continuable line windows; each completed result is fitted again before the model continues, so smaller contexts retain
+the active task and a precise next range instead of stalling after compaction. `/context` shows the current macro
+memory, live working set, tool interface, reserves, and estimated next request.
 
 The interface adapts to compact terminals and settles into a static ready state after startup. Set
 `DAIRACK_REDUCED_MOTION=1` when all non-essential movement should remain disabled.

@@ -46,7 +46,38 @@ from .config import (
 from .config import (
     save_config as save_app_config,
 )
-from .coordinator.calibration import MAX_TOTAL_ADJUSTMENT as MAX_LEARNED_ADJUSTMENT
+from .coordinator.analysis import (
+    analyze_task as analyze_orchestrator_task,
+)
+from .coordinator.analysis import (
+    execution_scope as coordinator_execution_scope,
+)
+from .coordinator.analysis import (
+    extract_public_web_targets,
+    is_direct_answer_route,
+    public_web_action_contract,
+)
+from .coordinator.analysis import (
+    merge_semantic_assessment as _merge_semantic_assessment,
+)
+from .coordinator.analysis import (
+    referenced_task_analysis as coordinator_referenced_task_analysis,
+)
+from .coordinator.analysis import (
+    semantic_context as coordinator_semantic_context,
+)
+from .coordinator.analysis import (
+    semantic_gate as coordinator_semantic_gate,
+)
+from .coordinator.analysis import (
+    signal_hits as _signal_hits,
+)
+from .coordinator.analysis import (
+    task_kind as _coordinator_task_kind,
+)
+from .coordinator.analysis import (
+    task_role as _coordinator_task_role,
+)
 from .coordinator.calibration import estimate as calibration_estimate
 from .coordinator.calibration import load_state as load_calibration_state
 from .coordinator.calibration import observe_estimate as observe_calibration
@@ -55,13 +86,39 @@ from .coordinator.calibration import reset as reset_calibration
 from .coordinator.control import RoutingControl, materially_larger
 from .coordinator.policy import POLICIES as COORDINATOR_POLICY_DEFINITIONS
 from .coordinator.policy import policy_for
+from .coordinator.ranking import (
+    candidate_score as coordinator_candidate_score,
+)
+from .coordinator.ranking import (
+    effective_learning_adjustment as coordinator_learning_adjustment,
+)
+from .coordinator.ranking import (
+    role_preference as coordinator_role_preference,
+)
+from .coordinator.ranking import (
+    semantic_router_model as select_semantic_router_model,
+)
+from .coordinator.ranking import (
+    stage_model as select_coordinator_stage_model,
+)
 from .coordinator.tuning import DEFAULT_TUNING
 from .coordinator.tuning import for_config as coordinator_tuning_for_config
 from .file_discovery import find_paths as discover_paths
 from .identity import APP_NAME, env_enabled
 from .machine import hardware_status as format_hardware_status
 from .machine import machine_prompt
-from .messages import canonicalize_messages
+from .messages import (
+    MAX_ATTACHED_IMAGES,
+    SYSTEM_PARTS_KEY,
+    TOOL_RESULT_PREFIXES,
+    canonicalize_messages,
+    depends_on_conversation_context,  # noqa: F401  (compatibility export)
+    expand_system_messages,
+    latest_user_images,
+    latest_user_message,  # noqa: F401  (compatibility export)
+    latest_user_task,
+    message_image_paths,  # noqa: F401  (compatibility export)
+)
 from .models import (
     ModelDescriptor,
     capabilities_for,
@@ -91,6 +148,7 @@ from .permissions import (
 )
 from .providers.ollama import OllamaError, OllamaProvider
 from .search import RG_EXCLUSION_GLOBS
+from .text import MAX_TEXT_OUTPUT, truncate, truncate_middle
 from .tool_protocol import TOOL_REGISTRY, decode_text_tool_call, strip_tool_protocol
 from .turn import (
     CompletionOutcome,
@@ -125,7 +183,7 @@ NATIVE_TOOL_DIRECTIVE = (
     "tool_calls field; return no ordinary response text alongside a tool call, and do not print function names, "
     "arguments, or fallback markup as response content."
 )
-MAX_TOOL_OUTPUT = 24000
+MAX_TOOL_OUTPUT = MAX_TEXT_OUTPUT
 DEFAULT_AGENT_ACTION_LIMIT = 12
 MAX_AGENT_ACTION_LIMIT = 64
 MAX_INDEX_FILE_BYTES = 512 * 1024
@@ -147,7 +205,6 @@ COORDINATOR_TOKEN_BUDGETS = {
     name: policy.specialist_token_budget for name, policy in COORDINATOR_POLICY_DEFINITIONS.items()
 }
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
-MAX_ATTACHED_IMAGES = 4
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 SEARCH_GLOBS = RG_EXCLUSION_GLOBS
 SLASH_COMMANDS = [
@@ -432,7 +489,13 @@ def runtime_config_for_model(config: dict[str, Any], model: str) -> dict[str, An
     return runtime
 
 
+def ollama_options(config: dict[str, Any]) -> dict[str, Any]:
+    options = config.get("model_options")
+    return dict(options) if isinstance(options, dict) else {}
+
+
 def model_capabilities(model: Any) -> dict[str, float]:
+    """Resolve capabilities against this runtime's active state tree."""
     return capabilities_for(model, PATHS)
 
 
@@ -440,15 +503,19 @@ def model_capability_metadata(model: Any) -> dict[str, Any]:
     return capability_metadata_for(model, PATHS)
 
 
-TOOL_RESULT_PREFIXES = (
-    "Shell tool result:",
-    "Patch tool result:",
-    "Structured tool result:",
-    "Coordinator specialist result:",
-    "Tool result:",
-    "Tool request denied",
-    "Runtime event:",
-)
+def model_supports_vision(provider: Any, model: str) -> bool:
+    supports = getattr(provider, "supports", None)
+    if callable(supports):
+        try:
+            return bool(supports(model, "vision"))
+        except Exception:
+            pass
+    return model_capabilities(model).get("vision", 0.0) >= 0.50
+
+
+def require_vision_support(provider: Any, model: str, messages: list[dict[str, Any]]) -> None:
+    if latest_user_images(messages) and not model_supports_vision(provider, model):
+        raise RuntimeError(f"{model} cannot accept images. Select COORDINATOR or a model marked VISION with F2.")
 
 
 def runtime_failure_message(error: Exception | str, phase: str = "model response") -> dict[str, str]:
@@ -475,511 +542,6 @@ def runtime_failure_message(error: Exception | str, phase: str = "model response
     }
 
 
-def latest_user_message(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-        content = str(message.get("content") or "").strip()
-        if content and not content.startswith(TOOL_RESULT_PREFIXES):
-            return message
-    return {}
-
-
-def latest_user_task(messages: list[dict[str, Any]]) -> str:
-    return str(latest_user_message(messages).get("content") or "")
-
-
-def message_image_paths(message: dict[str, Any]) -> list[str]:
-    values = message.get("image_paths")
-    if not isinstance(values, list):
-        return []
-    return [str(value) for value in values if str(value).strip()][:MAX_ATTACHED_IMAGES]
-
-
-def latest_user_images(messages: list[dict[str, Any]]) -> list[str]:
-    return message_image_paths(latest_user_message(messages))
-
-
-def _signal_hits(text: str, terms: tuple[str, ...]) -> list[str]:
-    hits: list[str] = []
-    for raw_term in terms:
-        term = raw_term.strip()
-        if not term:
-            continue
-        if re.fullmatch(r"[a-z0-9]+(?:[ -][a-z0-9]+)*", term):
-            pattern = re.escape(term).replace(r"\ ", r"\s+")
-            matched = re.search(rf"(?<![a-z0-9_]){pattern}(?![a-z0-9_])", text)
-        else:
-            matched = term in text
-        if matched:
-            hits.append(term)
-    return hits
-
-
-def _dominant_coordinator_role(signals: dict[str, float]) -> str:
-    thresholds = {
-        "coding": (float(signals.get("code") or 0), 0.35, 4),
-        "reasoning": (float(signals.get("reasoning") or 0), 0.42, 3),
-        "research": (float(signals.get("research") or 0), 0.42, 2),
-        "agent": (float(signals.get("agent") or 0), 0.42, 1),
-    }
-    eligible = [
-        (role, value, tie_priority)
-        for role, (value, threshold, tie_priority) in thresholds.items()
-        if value >= threshold
-    ]
-    if not eligible:
-        return "general"
-    return max(eligible, key=lambda item: (item[1], item[2]))[0]
-
-
-def _coordinator_task_kind(signals: dict[str, float]) -> str:
-    vision = float(signals.get("vision") or 0)
-    code = float(signals.get("code") or 0)
-    agent = float(signals.get("agent") or 0)
-    reasoning = float(signals.get("reasoning") or 0)
-    simple = float(signals.get("simple") or 0)
-    role = _dominant_coordinator_role(signals)
-    if vision and code >= 0.34:
-        return "visual coding"
-    if vision:
-        return "visual analysis"
-    if agent >= 0.50 and code >= 0.38:
-        return "coding agent"
-    if role == "agent" and agent >= 0.58:
-        return "system agent"
-    if role == "coding":
-        return "coding"
-    if role == "reasoning" and reasoning >= 0.48:
-        return "deep reasoning"
-    if role == "research":
-        return "research"
-    if role == "agent":
-        return "system action"
-    if role == "reasoning":
-        return "reasoning"
-    if simple >= 0.55:
-        return "quick answer"
-    return "general"
-
-
-CONTEXT_REFERENCE_PATTERN = re.compile(
-    r"\b(?:it|its|that|this|these|those|one|ones|former|latter|above|earlier|previous|same|other)\b"
-)
-CONTEXT_CONTINUATION_PATTERN = re.compile(
-    r"^(?:and|but|so|then)\b|\b(?:continue|proceed|resume|retry|again|instead|go ahead|carry on|do so)\b"
-)
-CONTEXT_REPLY_PATTERN = re.compile(
-    r"^(?:yes|no|yep|nope|sure|maybe|why|why not|how so|which one|the first|the second|the last)\??$"
-)
-WEB_REFERENCE_PATTERN = re.compile(r"\b(?:this|that|the|same)\s+(?:web\s*page|website|site|url|link|domain)\b")
-WEB_RESOURCE_PATTERN = re.compile(r"\b(?:web\s*page|website|site|url|link|domain)\b")
-WEB_ACCESS_PATTERN = re.compile(
-    r"\b(?:open|visit|browse|fetch|read|inspect|check|review|access|view|"
-    r"look\s+at|take\s+a\s+look\s+at|go\s+to)\b"
-)
-WEB_EVALUATION_PATTERN = re.compile(
-    r"\b(?:think|thoughts?|opinion|assess|evaluate|legit|safe|trustworthy|credib(?:le|ility)|"
-    r"what(?:'s|\s+is)|tell\s+me\s+about)\b"
-)
-WEB_SEARCH_REQUEST_PATTERN = re.compile(
-    r"\b(?:web\s*search|search\s+(?:the\s+)?(?:web|internet|online)|"
-    r"look\s+(?:it\s+)?up\s+online|find\s+(?:it\s+)?online)\b"
-)
-WEB_SCHEME_TARGET_PATTERN = re.compile(r"https?://[^\s<>'\"`]+", re.IGNORECASE)
-WEB_BARE_TARGET_PATTERN = re.compile(
-    r"(?<![@\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
-    r"[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>'\"`]*)?",
-    re.IGNORECASE,
-)
-WEB_NON_DOMAIN_SUFFIXES = {
-    "c",
-    "cc",
-    "cpp",
-    "css",
-    "csv",
-    "go",
-    "h",
-    "hpp",
-    "html",
-    "ini",
-    "java",
-    "js",
-    "json",
-    "jsx",
-    "lock",
-    "md",
-    "py",
-    "rb",
-    "rs",
-    "sh",
-    "sql",
-    "toml",
-    "ts",
-    "tsx",
-    "txt",
-    "xml",
-    "yaml",
-    "yml",
-}
-COORDINATOR_FAST_CONVERSATION_PATTERN = re.compile(
-    r"^(?:hi|hello|hey|greetings|good\s+(?:morning|afternoon|evening)|"
-    r"thanks?(?:\s+you)?(?:\s+for\b.*)?|appreciate\s+it|cheers|bye|goodbye|whats\s+up|how\s+are\s+you|"
-    r"okay|ok|cool|great|good|understood|nice\s+work|well\s+done|sounds\s+good|got\s+it|no\s+thanks)[.!?]*$"
-)
-COORDINATOR_FAST_FACT_PATTERN = re.compile(
-    r"^(?:who|when|where)\b|^what\b(?:\s+\w+){0,4}\s+(?:is|are|was|were|does|did)\b|"
-    r"^how\s+(?:many|much|old|far|long)\b"
-)
-COORDINATOR_JUDGMENT_PATTERN = re.compile(
-    r"\b(?:best|better|should|recommend|compare|versus|vs\.?|trade-?offs?|evaluate|analy[sz]e|design|diagnose)\b"
-)
-
-
-def depends_on_conversation_context(prompt: str) -> bool:
-    """Detect discourse references without inheriting complexity from history by default."""
-    normalized = prompt.lower().replace("'", "")
-    normalized = re.sub(r"[^a-z0-9\s?]", " ", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not normalized:
-        return False
-    return bool(
-        CONTEXT_REFERENCE_PATTERN.search(normalized)
-        or CONTEXT_CONTINUATION_PATTERN.search(normalized)
-        or CONTEXT_REPLY_PATTERN.fullmatch(normalized)
-        or WEB_REFERENCE_PATTERN.search(normalized)
-    )
-
-
-def extract_public_web_targets(text: str) -> list[str]:
-    """Extract canonical public-web candidates without resolving or fetching them."""
-    candidates = WEB_SCHEME_TARGET_PATTERN.findall(text)
-    masked = WEB_SCHEME_TARGET_PATTERN.sub(" ", text)
-    candidates.extend(WEB_BARE_TARGET_PATTERN.findall(masked))
-    targets: list[str] = []
-    seen: set[str] = set()
-    for raw in candidates:
-        candidate = raw.rstrip(".,;:!?)]}")
-        if not candidate:
-            continue
-        value = candidate if re.match(r"https?://", candidate, re.IGNORECASE) else f"https://{candidate}"
-        try:
-            parsed = urllib.parse.urlsplit(value)
-            host = str(parsed.hostname or "").lower()
-            if not host or host.rsplit(".", 1)[-1] in WEB_NON_DOMAIN_SUFFIXES:
-                continue
-            normalized = normalize_web_url(value)
-        except ValueError:
-            continue
-        if normalized not in seen:
-            seen.add(normalized)
-            targets.append(normalized)
-    return targets
-
-
-def public_web_action_contract(messages: list[dict[str, Any]]) -> dict[str, str]:
-    """Derive an explicit network capability requirement from natural language."""
-    latest = latest_user_message(messages)
-    prompt = str(latest.get("content") or "").strip()
-    if not prompt:
-        return {}
-    normalized = re.sub(r"\s+", " ", prompt.lower().replace("’", "'")).strip()
-    current_targets = extract_public_web_targets(prompt)
-    explicit_search = bool(WEB_SEARCH_REQUEST_PATTERN.search(normalized)) or bool(
-        current_targets and re.search(r"\bsearch(?:ed|ing)?\b", normalized)
-    )
-    asks_for_access = bool(WEB_ACCESS_PATTERN.search(normalized))
-    asks_for_evaluation = bool(WEB_EVALUATION_PATTERN.search(normalized))
-    references_resource = bool(WEB_RESOURCE_PATTERN.search(normalized))
-
-    if explicit_search:
-        return {
-            "capability": "public_web",
-            "preferred_tool": "web_search",
-            "target": current_targets[0] if current_targets else "",
-            "reason": "explicit public web search",
-        }
-
-    target = current_targets[0] if current_targets else ""
-    if not target and references_resource and (asks_for_access or asks_for_evaluation):
-        found_latest = False
-        for message in reversed(messages):
-            if message is latest:
-                found_latest = True
-                continue
-            if not found_latest or str(message.get("role") or "") not in {"user", "assistant"}:
-                continue
-            prior = str(message.get("content") or "")
-            if prior.startswith(TOOL_RESULT_PREFIXES):
-                continue
-            prior_targets = extract_public_web_targets(strip_tool_markup(prior))
-            if prior_targets:
-                target = prior_targets[0]
-                break
-
-    if target and (asks_for_access or asks_for_evaluation):
-        return {
-            "capability": "public_web",
-            "preferred_tool": "web_open",
-            "target": target,
-            "reason": "public website inspection",
-        }
-    return {}
-
-
-def coordinator_execution_scope(
-    task_kind: str,
-    signals: dict[str, Any],
-    action_contract: dict[str, Any] | None = None,
-    routing_control: dict[str, Any] | None = None,
-) -> str:
-    """Convert semantic demand into a capability contract for the executor."""
-    if isinstance(action_contract, dict) and action_contract.get("capability"):
-        return "agentic"
-    if isinstance(routing_control, dict) and routing_control.get("active"):
-        action_demand = max(
-            (float(signals.get(name) or 0) for name in ("code", "agent", "research")),
-            default=0.0,
-        )
-        if action_demand < 0.34:
-            return "direct-answer"
-    if task_kind == "quick answer" and float(signals.get("simple") or 0) >= 0.55:
-        return "direct-answer"
-    return "agentic"
-
-
-def is_direct_answer_route(route: dict[str, Any] | None) -> bool:
-    """Return whether the route contract excludes tools and delegation."""
-    if str((route or {}).get("mode") or "") != "orchestrator":
-        return False
-    explicit = str((route or {}).get("execution_scope") or "")
-    if explicit:
-        return explicit == "direct-answer"
-    signals = (route or {}).get("signals")
-    return (
-        coordinator_execution_scope(
-            str((route or {}).get("task_kind") or "general"),
-            signals if isinstance(signals, dict) else {},
-            (route or {}).get("action_contract") if isinstance((route or {}).get("action_contract"), dict) else None,
-            (route or {}).get("routing_control") if isinstance((route or {}).get("routing_control"), dict) else None,
-        )
-        == "direct-answer"
-    )
-
-
-def analyze_orchestrator_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dict[str, Any]:
-    prompt = latest_user_task(messages)
-    image_paths = latest_user_images(messages)
-    action_contract = public_web_action_contract(messages)
-    text = prompt.lower()
-    code_hits = _signal_hits(
-        text,
-        (
-            "code",
-            "function",
-            "class ",
-            "script",
-            "bug",
-            "stack trace",
-            "traceback",
-            "compile",
-            "typescript",
-            "javascript",
-            "python",
-            "rust",
-            "golang",
-            "sql",
-            "api",
-            "test",
-            "refactor",
-            "repository",
-            "repo",
-            "git ",
-            "diff",
-            "src/",
-            ".py",
-            ".js",
-            ".ts",
-            "```",
-        ),
-    )
-    agent_hits = _signal_hits(
-        text,
-        (
-            "install",
-            "implement",
-            "edit",
-            "change",
-            "fix",
-            "build",
-            "run ",
-            "execute",
-            "inspect",
-            "search files",
-            "open file",
-            "read file",
-            "list files",
-            "what files",
-            "which files",
-            "folder",
-            "directory",
-            "deploy",
-            "configure",
-            "set up",
-            "setup",
-            "terminal",
-            "server",
-            "hardware",
-            "commit",
-            "apply",
-            "create file",
-            "delete",
-            "rename",
-        ),
-    )
-    reasoning_hits = _signal_hits(
-        text,
-        (
-            "reason",
-            "analyze",
-            "architecture",
-            "design",
-            "tradeoff",
-            "tradeoffs",
-            "trade-off",
-            "trade-offs",
-            "pros and cons",
-            "why",
-            "prove",
-            "derive",
-            "optimize",
-            "optimization",
-            "diagnose",
-            "root cause",
-            "deep",
-            "complex",
-            "strategy",
-            "compare",
-            "evaluate",
-            "algorithm",
-            "math",
-            "signal processing",
-            "dsp",
-            "coherence",
-        ),
-    )
-    research_hits = _signal_hits(
-        text,
-        (
-            "latest",
-            "current",
-            "today",
-            "news",
-            "internet",
-            "web",
-            "search online",
-            "look up",
-            "verify",
-            "source",
-            "citation",
-            "price",
-            "release",
-            "documentation",
-            "as of ",
-        ),
-    )
-    risk_hits = _signal_hits(
-        text,
-        (
-            "production",
-            "security",
-            "permission",
-            "sudo",
-            "database",
-            "migration",
-            "delete",
-            "payment",
-            "medical",
-            "legal",
-            "backup",
-            "restore",
-            "network",
-            "firewall",
-            "credential",
-            "password",
-        ),
-    )
-    word_count = len(re.findall(r"\b\w+\b", text))
-    code = min(1.0, 0.25 + 0.13 * (len(code_hits) - 1)) if code_hits else 0.0
-    agent = min(1.0, 0.20 + 0.14 * (len(agent_hits) - 1)) if agent_hits else 0.0
-    reasoning = min(1.0, 0.27 + 0.14 * (len(reasoning_hits) - 1)) if reasoning_hits else 0.0
-    research = min(1.0, 0.22 + 0.18 * (len(research_hits) - 1)) if research_hits else 0.0
-    risk = min(1.0, 0.20 + 0.16 * (len(risk_hits) - 1)) if risk_hits else 0.0
-    if action_contract:
-        research = max(research, 0.72)
-        agent = max(agent, 0.48)
-    vision = 1.0 if image_paths else 0.0
-    simple = 0.92 if word_count <= 24 else 0.72 if word_count <= 55 else 0.38 if word_count <= 120 else 0.12
-    task_difficulty = max(code, agent, reasoning, research, risk, vision * 0.35)
-    simple *= max(0.20, 1.0 - 0.52 * task_difficulty)
-    general = max(0.25, min(1.0, 0.72 + simple * 0.20 - max(code, agent) * 0.18))
-    conjunctions = len(re.findall(r"\b(and then|then|also|after that|before|while|across|end to end)\b", text))
-    complexity = 0.12
-    complexity += min(0.24, word_count / 520.0)
-    complexity += reasoning * 0.33 + agent * 0.28 + code * 0.15 + research * 0.18 + risk * 0.18
-    complexity += min(0.15, conjunctions * 0.05)
-    complexity += min(0.18, vision * (0.10 + 0.03 * len(image_paths)))
-    if agent >= 0.55 and code >= 0.45:
-        complexity += 0.07
-    if reasoning >= 0.60 and risk >= 0.35:
-        complexity += 0.07
-    if "?" in prompt and prompt.count("?") > 2:
-        complexity += 0.06
-    complexity = min(1.0, complexity)
-
-    evidence: list[str] = []
-    for label, hits in (
-        ("code", code_hits),
-        ("actions", agent_hits),
-        ("reasoning", reasoning_hits),
-        ("research", research_hits),
-        ("risk", risk_hits),
-    ):
-        if hits:
-            evidence.append(f"{label}: {', '.join(hits[:3])}")
-    if not evidence:
-        evidence.append("short conversational request" if simple >= 0.55 else "general language request")
-    if action_contract:
-        preferred_tool = str(action_contract.get("preferred_tool") or "web_open")
-        target = str(action_contract.get("target") or "")
-        evidence.append(f"public web action: {preferred_tool}" + (f" {target}" if target else ""))
-    if image_paths:
-        evidence.insert(0, f"vision input: {len(image_paths)} image{'s' if len(image_paths) != 1 else ''}")
-    if cwd is not None and (cwd / ".git").exists() and (code >= 0.35 or agent >= 0.35):
-        code = min(1.0, code + 0.08)
-        evidence.append("active Git repository")
-
-    signals = {
-        "code": round(code, 3),
-        "agent": round(agent, 3),
-        "reasoning": round(reasoning, 3),
-        "general": round(general, 3),
-        "research": round(research, 3),
-        "vision": round(vision, 3),
-        "risk": round(risk, 3),
-        "simple": round(simple, 3),
-    }
-
-    return {
-        "prompt": prompt,
-        "task_kind": _coordinator_task_kind(signals),
-        "complexity": round(complexity, 3),
-        "signals": signals,
-        "evidence": evidence[:6],
-        "action_contract": action_contract,
-    }
-
-
 def _orchestrator_candidate_score(
     model: Any,
     signals: dict[str, float],
@@ -993,64 +555,20 @@ def _orchestrator_candidate_score(
     routing_preference: str = "auto",
     preference_strength: float = 0.0,
 ) -> float:
-    capabilities = model_capabilities(model)
-    policy_definition = policy_for(policy)
-    capability_fields = ("code", "agent", "reasoning", "general", "research", "vision")
-    demands = {key: max(0.0, float(signals.get(key) or 0)) for key in capability_fields}
-    simplicity = max(0.0, min(1.0, float(signals.get("simple") or 0)))
-    ease = max(simplicity, 1.0 - max(0.0, min(1.0, task_complexity)))
-    grounding_balance = demands["research"] - demands["reasoning"]
-    grounding_multiplier = max(
-        0.72,
-        min(1.38, 1.0 + grounding_balance * float(tuning.grounding_balance_weight)),
+    return coordinator_candidate_score(
+        str(getattr(model, "name", model) or ""),
+        model_capabilities(model),
+        signals,
+        policy,
+        resident,
+        preferred_model,
+        profile_confidence,
+        learned_adjustment,
+        task_complexity,
+        tuning,
+        routing_preference,
+        preference_strength,
     )
-    preference_strength = max(0.0, min(1.0, preference_strength))
-    quality_shift = preference_strength if routing_preference in {"quality", "higher_capacity"} else 0.0
-    efficiency_shift = preference_strength if routing_preference == "efficiency" else 0.0
-    demands["efficiency"] = ease * policy_definition.efficiency_weight * grounding_multiplier
-    demands["efficiency"] *= max(0.04, 1.0 - quality_shift * 0.96)
-    demands["efficiency"] *= 1.0 + efficiency_shift * 1.75
-    if not sum(demands.values()):
-        demands["general"] = 1.0
-    capability_ceiling = (
-        1.0
-        if policy == "quality"
-        else 0.68 + 0.20 * task_complexity
-        if policy == "efficient"
-        else 0.74 + 0.24 * task_complexity
-    )
-    capability_ceiling += (1.0 - capability_ceiling) * quality_shift
-    weighted = sum(
-        (capabilities[key] if key == "efficiency" else min(capabilities[key], capability_ceiling)) * weight
-        for key, weight in demands.items()
-    )
-    score = weighted / max(0.001, sum(demands.values()))
-    name = str(getattr(model, "name", model) or "")
-    lowered_resident = {value.lower() for value in resident}
-    if name.lower() in lowered_resident:
-        complexity_discount = 1.0 - max(0.0, min(1.0, task_complexity))
-        preference_residency = max(0.04, 1.0 - quality_shift * 0.96) * (1.0 + efficiency_shift * 1.5)
-        score += (
-            policy_definition.residency_bonus
-            * simplicity**2
-            * complexity_discount
-            * float(tuning.residency_scale)
-            * preference_residency
-        )
-    if preferred_model and name.lower() == preferred_model.lower():
-        score += {"efficient": 0.045, "adaptive": 0.060, "quality": 0.045}[policy]
-    score += max(-MAX_LEARNED_ADJUSTMENT, min(MAX_LEARNED_ADJUSTMENT, learned_adjustment))
-    score *= 0.96 + max(0.0, min(1.0, profile_confidence)) * 0.04
-    if signals["vision"] and capabilities["vision"] < 0.50:
-        score *= 0.12
-    return max(0.0, min(0.999, score))
-
-
-def _coordinator_task_role(signals: dict[str, float]) -> str:
-    vision = signals.get("vision", 0.0)
-    if vision >= 0.25:
-        return "vision"
-    return _dominant_coordinator_role(signals)
 
 
 def _effective_learning_adjustment(
@@ -1058,27 +576,11 @@ def _effective_learning_adjustment(
     task_complexity: float,
     learned_adjustment: float,
 ) -> float:
-    specialized = max(
-        float(signals.get(key) or 0) for key in ("code", "agent", "reasoning", "research", "vision", "risk")
-    )
-    simplicity = float(signals.get("simple") or 0)
-    if simplicity >= 0.72 and specialized < 0.25 and task_complexity < 0.36:
-        return 0.0
-    confidence = max(0.15, min(1.0, max(specialized, task_complexity)))
-    return learned_adjustment * confidence
+    return coordinator_learning_adjustment(signals, task_complexity, learned_adjustment)
 
 
 def _coordinator_role_preference(config: dict[str, Any], role: str, models: list[Any]) -> str:
-    raw = config.get("coordinator_role_preferences")
-    if not isinstance(raw, dict):
-        return ""
-    preferred = str(raw.get(role) or "").strip()
-    if not preferred:
-        return ""
-    return next(
-        (str(model.name) for model in models if str(model.name).lower() == preferred.lower()),
-        "",
-    )
+    return coordinator_role_preference(config, role, models)
 
 
 def _specialist_model(
@@ -1090,58 +592,20 @@ def _specialist_model(
     signals: dict[str, float],
     preferred_model: str = "",
 ) -> str:
-    has_resident = any(bool(candidate.get("resident")) for candidate in candidates)
-    best_name = executor
-    best_score = -1.0
-    for candidate in candidates:
-        if signals["vision"] and not model_supports_vision(provider, str(candidate["model"])):
-            continue
-        capabilities = candidate["capabilities"]
-        if purpose == "planner":
-            weights = {
-                "reasoning": 0.34 + signals["reasoning"] * 0.14,
-                "general": 0.18,
-                "agent": 0.10 + signals["agent"] * 0.16,
-                "code": 0.06 + signals["code"] * 0.12,
-                "research": 0.06 + signals["research"] * 0.10,
-                "vision": 0.02 + signals["vision"] * 0.20,
-            }
-            capability_score = sum(capabilities[key] * weight for key, weight in weights.items()) / sum(
-                weights.values()
-            )
-        else:
-            weights = {
-                "route": 0.40,
-                "reasoning": 0.25,
-                "general": 0.08,
-                "code": 0.05 + signals["code"] * 0.07,
-                "agent": 0.05,
-                "vision": 0.02 + signals["vision"] * 0.08,
-            }
-            capability_score = (
-                float(candidate["score"]) * weights["route"]
-                + sum(capabilities[key] * weight for key, weight in weights.items() if key != "route")
-            ) / sum(weights.values())
-        efficiency_mix = {"efficient": 0.32, "adaptive": 0.16, "quality": 0.03}[policy]
-        score = capability_score * (1.0 - efficiency_mix) + capabilities["efficiency"] * efficiency_mix
-        same_executor = candidate["model"].lower() == executor.lower()
-        if candidate.get("resident"):
-            score += {"efficient": 0.11, "adaptive": 0.07, "quality": 0.015}[policy]
-        if same_executor:
-            if purpose == "planner":
-                score += 0.08 if policy == "adaptive" and not has_resident else 0.015
-            elif purpose == "reviewer":
-                score += {"efficient": 0.07, "adaptive": 0.04, "quality": 0.005}[policy]
-        elif purpose == "reviewer":
-            score += {"efficient": 0.0, "adaptive": 0.025, "quality": 0.055}[policy]
-        elif purpose == "planner":
-            score += 0.005
-        if preferred_model and candidate["model"].lower() == preferred_model.lower():
-            score += 0.045
-        if score > best_score:
-            best_name = candidate["model"]
-            best_score = score
-    return best_name
+    return select_coordinator_stage_model(
+        provider,
+        candidates,
+        purpose,
+        executor,
+        policy,
+        signals,
+        model_supports_vision,
+        preferred_model,
+    )
+
+
+def _semantic_router_model(models: list[Any], resident: set[str]) -> str:
+    return select_semantic_router_model(models, resident, model_capabilities)
 
 
 def direct_route(config: dict[str, Any], model: str | None = None) -> dict[str, Any]:
@@ -1162,21 +626,6 @@ def direct_route(config: dict[str, Any], model: str | None = None) -> dict[str, 
         "delegations": [],
         "created_at": now_iso(),
     }
-
-
-def model_supports_vision(provider: Any, model: str) -> bool:
-    supports = getattr(provider, "supports", None)
-    if callable(supports):
-        try:
-            return bool(supports(model, "vision"))
-        except Exception:
-            pass
-    return model_capabilities(model).get("vision", 0.0) >= 0.50
-
-
-def require_vision_support(provider: Any, model: str, messages: list[dict[str, Any]]) -> None:
-    if latest_user_images(messages) and not model_supports_vision(provider, model):
-        raise RuntimeError(f"{model} cannot accept images. Select COORDINATOR or a model marked VISION with F2.")
 
 
 def coordinator_specialty(call: dict[str, str]) -> str:
@@ -1577,115 +1026,6 @@ def execute_coordinator_delegation(
     return code, result, record
 
 
-def _semantic_router_model(models: list[Any], resident: set[str]) -> str:
-    lowered_resident = {name.lower() for name in resident}
-    if not models:
-        return ""
-    eligible = list(models)
-    eligible.sort(
-        key=lambda model: (
-            -(
-                model_capabilities(model)["efficiency"] * 0.54
-                + model_capabilities(model)["general"] * 0.24
-                + model_capabilities(model)["reasoning"] * 0.22
-                + (0.08 if model.name.lower() in lowered_resident else 0.0)
-            )
-        )
-    )
-    return str(eligible[0].name)
-
-
-def coordinator_semantic_context(messages: list[dict[str, Any]]) -> str:
-    latest = latest_user_message(messages)
-    if not latest:
-        return ""
-    latest_index = next(
-        (index for index in range(len(messages) - 1, -1, -1) if messages[index] is latest),
-        -1,
-    )
-    if latest_index <= 0:
-        return ""
-    context: list[str] = []
-    for message in messages[max(0, latest_index - 8) : latest_index]:
-        role = str(message.get("role") or "").lower()
-        content = str(message.get("content") or "").strip()
-        if role not in {"user", "assistant"} or not content or content.startswith(TOOL_RESULT_PREFIXES):
-            continue
-        context.append(f"{role.upper()}: {truncate(strip_tool_markup(content), 1600)}")
-    return truncate("\n\n".join(context), 6000)
-
-
-def coordinator_referenced_task_analysis(
-    messages: list[dict[str, Any]],
-    cwd: Path,
-) -> dict[str, Any]:
-    latest = latest_user_message(messages)
-    if not latest:
-        return {}
-    found_latest = False
-    for message in reversed(messages):
-        if message is latest:
-            found_latest = True
-            continue
-        if not found_latest or message.get("role") != "user":
-            continue
-        content = str(message.get("content") or "").strip()
-        if not content or content.startswith(TOOL_RESULT_PREFIXES):
-            continue
-        prior: dict[str, Any] = {"role": "user", "content": content}
-        images = message_image_paths(message)
-        if images:
-            prior["image_paths"] = images
-        return analyze_orchestrator_task([prior], cwd)
-    return {}
-
-
-def coordinator_semantic_gate(
-    policy: str,
-    analysis: dict[str, Any],
-    score_gap: float,
-    has_context: bool,
-) -> str:
-    prompt = str(analysis.get("prompt") or "")
-    signals = analysis.get("signals") or {}
-    word_count = len(re.findall(r"\b\w+\b", prompt))
-    normalized = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s?.]", " ", prompt.lower().replace("'", ""))).strip()
-    domain_strength = max(
-        (float(signals.get(key) or 0) for key in ("code", "agent", "reasoning", "research", "vision", "risk")),
-        default=0.0,
-    )
-    structural_steps = len(re.findall(r"(?:^|\n)\s*(?:[-*]|\d+[.)])\s+|[;\n]", prompt))
-    semantic_mode = policy_for(policy).semantic_mode
-    if semantic_mode == "off":
-        return ""
-    if COORDINATOR_FAST_CONVERSATION_PATTERN.fullmatch(normalized):
-        return ""
-    if has_context and depends_on_conversation_context(prompt):
-        return "conversation-dependent follow-up"
-    if has_context and word_count <= 4:
-        return "short contextual turn"
-    if float(signals.get("vision") or 0):
-        return "visual capability assessment"
-    if semantic_mode == "substantive" and (word_count >= 3 or domain_strength >= 0.34):
-        return "quality policy semantic pass"
-    if semantic_mode != "ambiguous":
-        return ""
-    if structural_steps >= 2 and word_count >= 12:
-        return "multi-part request"
-    if (
-        word_count <= 9
-        and domain_strength < 0.34
-        and COORDINATOR_FAST_FACT_PATTERN.search(normalized)
-        and not COORDINATOR_JUDGMENT_PATTERN.search(normalized)
-    ):
-        return ""
-    if word_count <= 2 and domain_strength < 0.34:
-        return ""
-    if word_count >= 3 or domain_strength >= 0.34 or score_gap <= 0.045:
-        return "adaptive semantic pass"
-    return ""
-
-
 COORDINATOR_SEMANTIC_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -1872,160 +1212,6 @@ def coordinator_semantic_assessment(
         assessment[intent_capability] = round(max(assessment[intent_capability], intent_floor), 3)
     assessment["reason"] = truncate(str(parsed.get("reason") or "semantic ambiguity"), 160)
     return assessment
-
-
-def _merge_semantic_assessment(
-    analysis: dict[str, Any],
-    assessment: dict[str, Any],
-    tuning: Any = DEFAULT_TUNING,
-    referenced_analysis: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    if not assessment:
-        return analysis
-    original_analysis = analysis
-    control = assessment.get("routing_control")
-    control = dict(control) if isinstance(control, dict) else {}
-    control_authority_signals: dict[str, Any] = {}
-    if control.get("active") and control.get("applies_to_previous") and control.get("resolved_task"):
-        resolved = analyze_orchestrator_task([{"role": "user", "content": str(control["resolved_task"])}])
-        resolved["prompt"] = str(analysis.get("prompt") or "")
-        resolved["resolved_task"] = str(control["resolved_task"])
-        current_contract = analysis.get("action_contract")
-        referenced_contract = (referenced_analysis or {}).get("action_contract")
-        resolved["action_contract"] = (
-            current_contract
-            if isinstance(current_contract, dict) and current_contract.get("capability")
-            else referenced_contract
-            if isinstance(referenced_contract, dict) and referenced_contract.get("capability")
-            else {}
-        )
-        resolved_signals = dict(resolved.get("signals") or {})
-        observed_vision = max(
-            float((analysis.get("signals") or {}).get("vision") or 0),
-            float(((referenced_analysis or {}).get("signals") or {}).get("vision") or 0),
-        )
-        resolved_signals["vision"] = round(observed_vision, 3)
-        resolved["signals"] = resolved_signals
-        resolved["task_kind"] = _coordinator_task_kind(resolved_signals)
-        resolved["evidence"] = ["resolved per-turn routing instruction", *list(resolved.get("evidence") or [])][:6]
-        authority = referenced_analysis if referenced_analysis else resolved
-        control_authority_signals = dict(authority.get("signals") or {})
-        analysis = resolved
-    merged = dict(analysis)
-    signals = dict(analysis.get("signals") or {})
-    prompt = str(original_analysis.get("prompt") or "")
-    word_count = len(re.findall(r"\b\w+\b", prompt))
-    deterministic_strength = max(
-        (float(signals.get(key) or 0) for key in ("code", "agent", "reasoning", "research", "risk")),
-        default=0.0,
-    )
-    confidence = max(0.0, min(1.0, float(assessment.get("confidence", 0.65))))
-    base_weight = 0.55 if word_count >= 8 or deterministic_strength >= 0.34 else 0.42
-    semantic_weight = min(0.76, base_weight * (0.65 + confidence * 0.35) * float(tuning.semantic_evidence_scale))
-    if assessment.get("intent") == "conversation":
-        semantic_weight = min(semantic_weight, 0.32)
-    if assessment.get("trigger") == "conversation-dependent follow-up":
-        semantic_weight = max(semantic_weight, 0.64 * (0.85 + confidence * 0.15))
-    deterministic_risk = float(signals.get("risk") or 0)
-    referenced_signals = (referenced_analysis or {}).get("signals")
-    for key in ("code", "agent", "reasoning", "general", "research", "risk"):
-        semantic_value = float(assessment.get(key) or 0)
-        existing = float(signals.get(key) or 0)
-        referenced_value = float(referenced_signals.get(key) or 0) if isinstance(referenced_signals, dict) else 0.0
-        if key in {"code", "agent", "research"}:
-            grounded = max(existing, referenced_value)
-            promotion_margin = 0.24 if grounded >= 0.34 else 0.20
-            # A confident semantic read may promote further than the keyword layer alone allows,
-            # so paraphrased or non-English requests are not capped by English keyword hits.
-            promotion_margin += max(0.0, confidence - 0.60) * 0.55
-            semantic_value = min(semantic_value, max(0.18, grounded + promotion_margin))
-        if control.get("active") and key in {"agent", "research"}:
-            authority_value = float(control_authority_signals.get(key) or 0)
-            semantic_value = min(semantic_value, max(0.18, existing + 0.12, authority_value + 0.12))
-        if assessment.get("intent") in {"conversation", "general"} and key != "general":
-            corroborated_margin = 0.12 if existing >= 0.34 else 0.0
-            semantic_value = min(
-                semantic_value,
-                max(0.18, existing + corroborated_margin, referenced_value + 0.12),
-            )
-        blended = existing * (1.0 - semantic_weight) + semantic_value * semantic_weight
-        evidence_floor = existing * (0.72 - confidence * 0.30)
-        signals[key] = round(max(evidence_floor, blended), 3)
-    # Semantic output may raise observed risk, but it cannot erase deterministic evidence.
-    signals["risk"] = round(max(deterministic_risk, float(signals.get("risk") or 0)), 3)
-    action_contract = analysis.get("action_contract")
-    if (
-        not (isinstance(action_contract, dict) and action_contract.get("capability"))
-        and bool(assessment.get("requires_action"))
-        and confidence >= 0.60
-    ):
-        action_contract = {
-            "capability": "runtime_action",
-            "preferred_tool": "auto",
-            "target": "",
-            "reason": "semantic runtime action requirement",
-        }
-        merged["action_contract"] = action_contract
-        signals["agent"] = round(max(0.48, float(signals.get("agent") or 0)), 3)
-    if isinstance(action_contract, dict) and action_contract.get("capability") == "public_web":
-        signals["research"] = round(max(0.72, float(signals.get("research") or 0)), 3)
-        signals["agent"] = round(max(0.48, float(signals.get("agent") or 0)), 3)
-    referenced_signals = (referenced_analysis or {}).get("signals")
-    if isinstance(referenced_signals, dict):
-        for key in ("code", "agent", "reasoning", "research", "risk"):
-            inherited = float(referenced_signals.get(key) or 0) * 0.88
-            signals[key] = round(max(float(signals.get(key) or 0), inherited), 3)
-    # Image presence is an observable transport fact, not a semantic judgment.
-    signals["vision"] = round(float(signals.get("vision") or 0), 3)
-    specialized = max(
-        signals.get("code", 0.0),
-        signals.get("agent", 0.0),
-        signals.get("reasoning", 0.0),
-        signals.get("research", 0.0),
-        signals.get("risk", 0.0),
-        signals.get("vision", 0.0) * 0.35,
-    )
-    signals["simple"] = round(min(float(signals.get("simple") or 0), max(0.05, 1.0 - specialized * 0.82)), 3)
-    merged["signals"] = signals
-    existing_complexity = float(analysis.get("complexity") or 0)
-    semantic_complexity = float(assessment.get("complexity") or 0)
-    complexity_weight = 0.55 if word_count >= 8 or deterministic_strength >= 0.34 else 0.35
-    if referenced_analysis and assessment.get("trigger") == "conversation-dependent follow-up":
-        complexity_weight = max(complexity_weight, semantic_weight)
-    merged["complexity"] = round(
-        max(
-            existing_complexity,
-            existing_complexity * (1.0 - complexity_weight) + semantic_complexity * complexity_weight,
-        ),
-        3,
-    )
-    if referenced_analysis:
-        merged["complexity"] = round(
-            max(float(merged["complexity"]), float(referenced_analysis.get("complexity") or 0) * 0.90),
-            3,
-        )
-    if (
-        assessment.get("intent") == "system_action"
-        and signals.get("agent", 0.0) >= 0.42
-        and signals.get("risk", 0.0) >= 0.30
-    ):
-        operational_floor = min(
-            1.0,
-            semantic_complexity * 0.80 + signals["risk"] * float(tuning.operational_risk_weight),
-        )
-        merged["complexity"] = round(max(float(merged["complexity"]), operational_floor), 3)
-    merged["task_kind"] = _coordinator_task_kind(signals)
-    evidence = list(analysis.get("evidence") or [])
-    evidence.insert(0, f"semantic assessor {assessment.get('model')}: {assessment.get('reason')}")
-    if referenced_analysis:
-        evidence.insert(1, f"resolved prior task: {referenced_analysis.get('task_kind') or 'general'}")
-    merged["evidence"] = evidence[:6]
-    merged_assessment = dict(assessment)
-    merged_assessment["weight"] = semantic_weight
-    merged["semantic_assessment"] = merged_assessment
-    if control:
-        merged["routing_control"] = control
-    return merged
 
 
 def select_orchestrator_route(
@@ -3083,11 +2269,6 @@ def orchestrator_review(
     return {"verdict": verdict, "feedback": feedback}
 
 
-def ollama_options(config: dict[str, Any]) -> dict[str, Any]:
-    options = config.get("model_options")
-    return dict(options) if isinstance(options, dict) else {}
-
-
 def format_model_profiles() -> str:
     registry = load_registry(PATHS)
     if not registry:
@@ -3822,16 +3003,21 @@ def active_context_messages(
         ):
             task_group = index
     required = {index for index in (len(groups) - 1, task_group) if index >= 0}
-    durable_prefixes = (
-        "Persistent summary of earlier conversation:",
+    optional_system_prefixes = (
         "Compressed evidence from omitted active tool exchanges:",
+        "Retrieved local project memory.",
+        "Project retrieval is inactive because",
     )
     required.update(
         index
         for index, group in enumerate(groups)
         if group
         and group[0].get("role") == "system"
-        and str(group[0].get("content") or "").startswith(durable_prefixes)
+        and not str(group[0].get("content") or "").startswith(optional_system_prefixes)
+        and not re.match(
+            r"^\d+ earlier saved messages? (?:are|is) omitted from this active context window\.",
+            str(group[0].get("content") or ""),
+        )
     )
     priority = [
         *sorted(required, reverse=True),
@@ -3847,14 +3033,16 @@ def active_context_messages(
 
     omitted = max(0, len(messages) - 1 - sum(len(groups[index]) for index in kept_indices))
 
+    include_context_notices = True
+
     def build_selected() -> list[dict[str, Any]]:
         selected = [system]
         if summary_message:
             selected.append(summary_message)
-        ledger = _omitted_tool_ledger(groups, kept_indices, budget)
+        ledger = _omitted_tool_ledger(groups, kept_indices, budget) if include_context_notices else ""
         if ledger:
             selected.append({"role": "system", "content": ledger})
-        if omitted:
+        if omitted and include_context_notices:
             selected.append(
                 {
                     "role": "system",
@@ -3875,6 +3063,56 @@ def active_context_messages(
         kept_indices.remove(index)
         omitted += len(groups[index])
         selected = build_selected()
+
+    if sum(estimate_message_tokens(message) for message in selected) > budget:
+        include_context_notices = False
+        selected = build_selected()
+
+    # Current task evidence has priority over macro memory. A large summary is
+    # retained in saved state and can return on the next turn; it must not make
+    # an otherwise valid current tool exchange impossible to continue.
+    if sum(estimate_message_tokens(message) for message in selected) > budget and summary_message:
+        selected_without_summary = [message for message in selected if message is not summary_message]
+        fixed_tokens = sum(estimate_message_tokens(message) for message in selected_without_summary)
+        available_tokens = max(0, budget - fixed_tokens - 12)
+        if available_tokens >= 48:
+            prefix = "Persistent summary of earlier conversation:\n"
+            char_limit = max(120, (available_tokens - estimate_tokens(prefix) - 8) * 4)
+            summary_message["content"] = prefix + truncate(summary.strip(), char_limit)
+        elif summary_required:
+            summary_message["content"] = (
+                "Persistent summary of earlier conversation temporarily omitted while current action evidence "
+                "uses the request window. The grounded memory remains saved."
+            )
+        else:
+            summary_message = None
+        selected = build_selected()
+
+    # A caller may pass an already-materialized macro-memory message back
+    # through the final provider fitter. Shrink that copy too; otherwise its
+    # durable marker makes it indivisible on the second fitting pass.
+    if sum(estimate_message_tokens(message) for message in selected) > budget:
+        for index, message in enumerate(selected):
+            content = str(message.get("content") or "")
+            prefix = "Persistent summary of earlier conversation:\n"
+            if not content.startswith(prefix):
+                continue
+            fixed_tokens = sum(
+                estimate_message_tokens(candidate)
+                for candidate_index, candidate in enumerate(selected)
+                if candidate_index != index
+            )
+            available_tokens = max(0, budget - fixed_tokens - 12)
+            if available_tokens >= 48:
+                char_limit = max(120, (available_tokens - estimate_tokens(prefix) - 8) * 4)
+                replacement = prefix + truncate(content[len(prefix) :], char_limit)
+            else:
+                replacement = (
+                    "Persistent summary of earlier conversation temporarily omitted while current action evidence "
+                    "uses the request window. The grounded memory remains saved."
+                )
+            selected[index] = {**message, "content": replacement}
+            break
     return selected
 
 
@@ -3903,15 +3141,17 @@ def fit_request_context_messages(
 ) -> list[dict[str, Any]]:
     """Fit the final provider payload, including tool schemas and tokenizer uncertainty."""
     canonical = canonicalize_messages(messages)
+    sections = expand_system_messages(canonical)
     tool_tokens = estimate_tokens(json.dumps(tools, sort_keys=True)) if tools else 0
     tokenizer_headroom, _routing_headroom = context_request_headroom(config)
     reserve_tokens = tool_tokens + tokenizer_headroom
     fitted = active_context_messages(
-        canonical,
+        sections,
         "",
         config,
         reserve_tokens=reserve_tokens,
     )
+    fitted = canonicalize_messages(fitted)
     estimated_payload = sum(estimate_message_tokens(message) for message in fitted) + reserve_tokens
     if estimated_payload > context_budget(config):
         raise RequestContextError(
@@ -3933,6 +3173,22 @@ def strip_tool_catalog_for_native(content: str) -> str:
     if start == -1 or end == -1 or end <= start:
         return content
     return content[:start] + content[end:]
+
+
+def strip_native_system_catalog(message: dict[str, Any]) -> dict[str, Any]:
+    """Strip compatibility prose without losing budget-aware system sections."""
+    parts = message.get(SYSTEM_PARTS_KEY)
+    if isinstance(parts, list):
+        stripped_parts = [strip_tool_catalog_for_native(str(part)) for part in parts]
+        return {
+            **message,
+            "content": "\n\n".join(part for part in stripped_parts if part.strip()),
+            SYSTEM_PARTS_KEY: stripped_parts,
+        }
+    return {
+        **message,
+        "content": strip_tool_catalog_for_native(str(message.get("content") or "")),
+    }
 
 
 def compatibility_tool_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3973,10 +3229,7 @@ def fit_agent_request_context_messages(
     if native_tools:
         native_request = canonicalize_messages(messages, [NATIVE_TOOL_DIRECTIVE])
         if native_request and native_request[0].get("role") == "system":
-            native_request[0] = {
-                **native_request[0],
-                "content": strip_tool_catalog_for_native(str(native_request[0].get("content") or "")),
-            }
+            native_request[0] = strip_native_system_catalog(native_request[0])
         try:
             return fit_request_context_messages(native_request, config, native_tools), native_tools
         except RequestContextError:
@@ -4073,10 +3326,7 @@ def _request_payload_estimates(
 
     native = canonicalize_messages(source, [NATIVE_TOOL_DIRECTIVE])
     if native and native[0].get("role") == "system":
-        native[0] = {
-            **native[0],
-            "content": strip_tool_catalog_for_native(str(native[0].get("content") or "")),
-        }
+        native[0] = strip_native_system_catalog(native[0])
     if summary_message:
         native.insert(min(1, len(native)), summary_message)
 
@@ -4105,9 +3355,13 @@ def context_state(
     config: dict[str, Any],
     chat: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    *,
+    resolve_runtime: bool = True,
 ) -> dict[str, Any]:
     """Describe the next safe provider payload using the selected model's runtime profile."""
-    runtime, executor = context_runtime_config(config, chat)
+    runtime, executor = (
+        context_runtime_config(config, chat) if resolve_runtime else (config, chat_executor(config, chat))
+    )
     source = summarized_context_source(messages, chat or {})
     active = active_context_messages(source, summary, runtime, summary_required=bool(summary.strip()))
     requested_tools = (
@@ -5140,31 +4394,19 @@ def run_argv(
     return _run_process(cmd, cwd, timeout, cancel_event, shell=False)
 
 
-def truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
-
-
-def truncate_middle(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
-    """Bound long output while keeping its beginning and end, where verdict lines usually live."""
-    if len(text) <= limit:
-        return text
-    head = max(1, int(limit * 0.6))
-    tail = max(1, limit - head)
-    omitted = len(text) - head - tail
-    return (
-        text[:head] + f"\n...[{omitted} chars omitted from the middle; beginning and end retained]...\n" + text[-tail:]
-    )
-
-
 def tool_result_char_budget(
     messages: list[dict[str, Any]],
     chat: dict[str, Any],
     config: dict[str, Any],
 ) -> int:
     """Scale one tool result to the active model while preserving room for continuation."""
-    state = context_state(messages, str(chat.get("summary") or ""), config, chat)
+    state = context_state(
+        messages,
+        str(chat.get("summary") or ""),
+        config,
+        chat,
+        resolve_runtime=False,
+    )
     budget = int(state["budget"])
     free_tokens = max(0, budget - int(state["request_tokens"]))
     target_tokens = max(384, min(MAX_TOOL_OUTPUT // 4, int(budget * 0.18)))
@@ -5177,6 +4419,51 @@ def bounded_tool_output(output: str, limit: int) -> str:
     if not output:
         return "(no output)"
     return truncate_middle(output, max(512, min(MAX_TOOL_OUTPUT, limit)))
+
+
+def fit_tool_result_for_context(
+    messages: list[dict[str, Any]],
+    chat: dict[str, Any],
+    config: dict[str, Any],
+    call: dict[str, str],
+    code: int,
+    result: str,
+    cwd: Path | None = None,
+) -> str:
+    """Bound one completed action so the next model continuation still fits."""
+
+    def fits(candidate: str) -> bool:
+        history = [*messages, tool_history_message(call, code, candidate)]
+        if cwd is not None:
+            active = request_context_messages(history, chat, config, cwd, include_retrieval=False)
+        else:
+            source = summarized_context_source(history, chat)
+            summary = str(chat.get("summary") or "")
+            active = active_context_messages(source, summary, config, summary_required=bool(summary.strip()))
+        tools = agent_tool_schemas() if config_bool(config, "agent", True) else []
+        try:
+            fit_agent_request_context_messages(active, config, tools)
+        except RequestContextError:
+            return False
+        return True
+
+    if fits(result):
+        return result
+    low = 128
+    high = max(low, len(result) - 1)
+    best = ""
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = truncate_middle(result, midpoint)
+        if fits(candidate):
+            best = candidate
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    if best:
+        return best
+    fallback = "Action completed; detailed output was omitted to preserve the active context. Request a narrower range."
+    return fallback if fits(fallback) else truncate(fallback, 96)
 
 
 REPEATABLE_READ_TOOLS = frozenset(
@@ -8917,11 +8204,8 @@ class DairackTui:
         else:
             self.set_busy(True, tool_activity_label(call, step_label))
         started = time.monotonic()
-        result_limit = tool_result_char_budget(
-            self.messages,
-            self.chat,
-            self._route_config or context_runtime_config(self.config, self.chat)[0],
-        )
+        runtime = self._route_config or context_runtime_config(self.config, self.chat)[0]
+        result_limit = tool_result_char_budget(self.messages, self.chat, runtime)
         try:
             try:
                 project_root = project_scope_for_chat(self.chat, self.cwd)
@@ -8964,6 +8248,7 @@ class DairackTui:
                 code, output = 1, f"action failed: {exc}"
             result = bounded_tool_output(output, result_limit)
             result += self._loop_guard.record(call, result)
+            result = fit_tool_result_for_context(self.messages, self.chat, runtime, call, code, result, self.cwd)
             elapsed = time.monotonic() - started
             if call.get("name") == "consult_specialist":
                 # Delegation is internal evidence. Live model/phase feedback belongs in
@@ -9586,6 +8871,7 @@ class DairackTui:
                     output,
                     tool_result_char_budget(self.messages, self.chat, runtime),
                 )
+                result = fit_tool_result_for_context(self.messages, self.chat, runtime, call, code, result, self.cwd)
                 try:
                     if record_history:
                         self.messages.append(tool_history_message(call, code, result))
@@ -10617,6 +9903,7 @@ def chat_turn(
             result_limit = tool_result_char_budget(messages, chat, runtime)
         result = bounded_tool_output(output, result_limit)
         result += loop_guard.record(call, result)
+        result = fit_tool_result_for_context(messages, chat, runtime, call, code, result, cwd)
         print(f"\n{tool_summary(call)}")
         print(result)
         print(f"[exit {code}]")

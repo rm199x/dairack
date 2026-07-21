@@ -57,6 +57,10 @@ change.
 | `providers/` | Inference transport contracts and Ollama HTTP adapter |
 | `compute.py` | Compute endpoint policy, private credentials, identity probing, and connection state |
 | `bridge.py` | Authenticated inference-only Ollama proxy and verified server hardware metadata |
+| `messages.py` | Canonical provider messages, discourse references, attachments, and separable system sections |
+| `text.py` | Shared bounded plain-text output helpers |
+| `coordinator/analysis.py` | Deterministic task signals, action contracts, semantic gates, and assessment merging |
+| `coordinator/ranking.py` | Provider-neutral executor ranking, learned influence, and bounded stage selection |
 | `coordinator/policy.py` | Named quality/cost policy controls |
 | `coordinator/tuning.py` | Small validated baseline tuning vector |
 | `coordinator/calibration.py` | Bounded model/role outcome residuals, refined per task kind with evidence backoff |
@@ -123,7 +127,10 @@ task, tool schemas, and tokenizer/routing uncertainty. Covered history is replac
 not retained beside it. Within a long active task, raw tool exchanges may be shed only after their bounded evidence is
 placed in a task-local ledger, and native call/result pairs remain indivisible. Tool-result and `read_file` line-window
 budgets scale with the same profile, so small contexts advance through explicit chunks while larger verified contexts
-retain more source evidence. Compaction may run between model/action steps but never in the middle of a provider call.
+retain more source evidence. System foundations, macro memory, retrieval, and transient coordinator directives remain
+separate until final request fitting; optional retrieval is shed first, macro memory can contract around current-turn
+evidence, and a completed action result is narrowed again when necessary so its continuation request remains valid.
+Compaction may run between model/action steps but never in the middle of a provider call.
 
 Natural-language compute controls are a closed, schema-validated contract separate from task intent. They are
 confidence-gated, apply to one turn only, and cannot create action authority. A request for higher capacity must pass a

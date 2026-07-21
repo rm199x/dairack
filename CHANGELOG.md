@@ -58,6 +58,7 @@ semantic versioning after 1.0.
   interrupts the active turn in both terminal interfaces instead of being unbound or exiting mid-stream.
 - Context-aware file windows with explicit line continuations, plus a compact task-evidence ledger that preserves the
   useful head and tail of older tool results when their raw exchanges no longer fit the active request.
+- Searchable model-library sections with concise installed-model rows and progressively disclosed profile details.
 
 ### Changed
 
@@ -135,6 +136,14 @@ semantic versioning after 1.0.
   model mode never switches models implicitly.
 - Automatic accelerator profiles can use 32K or 64K declared context windows on verified high-headroom hardware;
   hybrid, constrained, unverified-remote, and model-limited profiles retain conservative bounds.
+- Final request fitting keeps system foundations, grounded memory, retrieval, and transient directives separable until
+  budgeting is complete. Optional context is shed before current evidence, and completed tool results are dynamically
+  narrowed when needed so a low-context file-analysis turn can still reach its next bounded continuation.
+- The terminal shell now combines global state into one header, hides the activity row while idle, removes the prompt
+  label and permanent function-key strip, and uses one contextual composer footer. Slash prefixes show several matching
+  commands, connection states say `READY` or `CONNECTED`, and code fences expose horizontal overflow.
+- Approval actions keep a fixed Deny / Allow Once / Auto-Allow Project Reads order. Risk controls initial focus and a
+  critical rail without moving buttons, while persistent read policy now states its scope and lifetime explicitly.
 
 ### Removed
 

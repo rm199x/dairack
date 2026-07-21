@@ -166,7 +166,7 @@ LOCKED_THEME = Theme(
 
 COMMAND_DESCRIPTIONS = {
     "/help": "Command reference",
-    "/model": "Switch the active model",
+    "/model": "Choose Coordinator or a direct model",
     "/coordinator": "Configure adaptive multi-model coordination",
     "/orchestrator": "Alias for /coordinator",
     "/route": "Inspect the coordinator's last decision",
@@ -553,6 +553,8 @@ class SelectorScreen(ModalScreen[str | None]):
         options: list[tuple[str, Text]],
         highlighted: int = 0,
         family: str = "standard",
+        searchable: bool = False,
+        filter_placeholder: str = "Filter...",
     ) -> None:
         super().__init__()
         self.dialog_title = title
@@ -560,16 +562,52 @@ class SelectorScreen(ModalScreen[str | None]):
         self.options = options
         self.highlighted = max(0, min(highlighted, max(0, len(options) - 1)))
         self.family = family if family in {"standard", "library", "archive"} else "standard"
+        self.searchable = searchable
+        self.filter_placeholder = filter_placeholder
+
+    @staticmethod
+    def _option_widgets(options: list[tuple[str, Text]]) -> list[Option]:
+        return [
+            Option(prompt, id=option_id, disabled=option_id.startswith("__heading__:")) for option_id, prompt in options
+        ]
+
+    def _filtered_options(self, query: str) -> list[tuple[str, Text]]:
+        normalized = query.casefold().strip()
+        if not normalized:
+            return list(self.options)
+        filtered: list[tuple[str, Text]] = []
+        included_headings: set[str] = set()
+        pending_heading: tuple[str, Text] | None = None
+        for option_id, prompt in self.options:
+            if option_id.startswith("__heading__:"):
+                pending_heading = (option_id, prompt)
+                continue
+            haystack = f"{option_id}\n{prompt.plain}".casefold()
+            if normalized not in haystack:
+                continue
+            if pending_heading and pending_heading[0] not in included_headings:
+                filtered.append(pending_heading)
+                included_headings.add(pending_heading[0])
+            filtered.append((option_id, prompt))
+        if filtered:
+            return filtered
+        return [("__heading__:no-results", Text("NO MATCHES", style=f"bold {PALETTE['quiet']}"))]
+
+    @staticmethod
+    def _selectable_index(options: list[tuple[str, Text]], preferred: int = 0) -> int | None:
+        if not options:
+            return None
+        bounded = max(0, min(preferred, len(options) - 1))
+        order = [*range(bounded, len(options)), *range(0, bounded)]
+        return next((index for index in order if not options[index][0].startswith("__heading__:")), None)
 
     def compose(self) -> ComposeResult:
-        option_widgets = [
-            Option(prompt, id=option_id, disabled=option_id.startswith("__heading__:"))
-            for option_id, prompt in self.options
-        ]
         with Vertical(id="selector-dialog", classes="dialog"):
             yield Static(self.dialog_title, classes="dialog-title")
             yield Static(self.dialog_detail, classes="dialog-detail")
-            yield OptionList(*option_widgets, id="selector-options")
+            if self.searchable:
+                yield Input(placeholder=self.filter_placeholder, id="selector-filter")
+            yield OptionList(*self._option_widgets(self.options), id="selector-options")
             yield Static("UP/DOWN MOVE   ENTER SELECT   ESC CANCEL", classes="dialog-keys")
 
     def _fit_dialog(self) -> None:
@@ -599,8 +637,11 @@ class SelectorScreen(ModalScreen[str | None]):
         self._fit_dialog()
         self._update_key_legend()
         options = self.query_one("#selector-options", OptionList)
-        options.highlighted = self.highlighted if self.options else None
-        options.focus()
+        options.highlighted = self._selectable_index(self.options, self.highlighted)
+        if self.searchable:
+            self.query_one("#selector-filter", Input).focus()
+        else:
+            options.focus()
 
     def on_resize(self, _event: Any) -> None:
         apply_modal_responsive_classes(self)
@@ -611,6 +652,21 @@ class SelectorScreen(ModalScreen[str | None]):
     def select_option(self, event: OptionList.OptionSelected) -> None:
         self.dismiss(event.option_id)
 
+    @on(Input.Changed, "#selector-filter")
+    def filter_options(self, event: Input.Changed) -> None:
+        visible = self._filtered_options(event.value)
+        options = self.query_one("#selector-options", OptionList)
+        options.set_options(self._option_widgets(visible))
+        options.highlighted = self._selectable_index(visible)
+        self._fit_dialog()
+
+    @on(Input.Submitted, "#selector-filter")
+    def submit_filter(self, _event: Input.Submitted) -> None:
+        options = self.query_one("#selector-options", OptionList)
+        highlighted = options.highlighted_option
+        if highlighted is not None and highlighted.id is not None:
+            self.dismiss(highlighted.id)
+
     def action_cancel(self) -> None:
         self.dismiss(None)
 
@@ -620,7 +676,7 @@ class ApprovalScreen(ModalScreen[str]):
         Binding("escape", "deny", "Deny", show=False, priority=True),
         Binding("d", "deny", "Deny", show=False),
         Binding("a", "approve", "Allow once", show=False),
-        Binding("r", "read_auto", "Trust reads", show=False),
+        Binding("r", "read_auto", "Auto-allow project reads", show=False),
     ]
 
     def __init__(self, core: Any, call: dict[str, str], allow_read_auto: bool) -> None:
@@ -691,16 +747,21 @@ class ApprovalScreen(ModalScreen[str]):
             )
             with ScrollableContainer(id="approval-preview"):
                 yield Static(preview, classes="approval-code")
+            if self.allow_read_auto:
+                yield Static(
+                    "POLICY  Auto-allow project reads persists for future chats. Network, writes, and "
+                    "out-of-scope reads still require approval.",
+                    classes="approval-policy",
+                )
             with Horizontal(id="approval-actions"):
-                if self.deny_first:
-                    yield Button("DENY", id="deny", variant="default")
+                yield Button("DENY", id="deny", variant="default")
                 yield Button(self.approve_label(), id="approve", variant="primary")
-                if not self.deny_first:
-                    yield Button("DENY", id="deny", variant="default")
                 if self.allow_read_auto:
-                    yield Button("TRUST READS", id="read-auto", variant="default")
+                    yield Button("AUTO-ALLOW PROJECT READS", id="read-auto", variant="default")
             yield Static(
-                "A ALLOW ONCE   D DENY" + ("   R TRUST READS" if self.allow_read_auto else "") + "   ENTER CHOOSE",
+                "D DENY   A ALLOW ONCE"
+                + ("   R AUTO-ALLOW PROJECT READS" if self.allow_read_auto else "")
+                + "   ENTER CHOOSE",
                 classes="dialog-keys",
             )
 
@@ -708,27 +769,47 @@ class ApprovalScreen(ModalScreen[str]):
         if self.size.width < 34:
             value = "A ALLOW   D DENY   ENTER"
         elif self.size.width < 60:
-            value = "A ALLOW   D DENY" + ("   R READS" if self.allow_read_auto else "") + "   ENTER"
+            value = "D DENY   A ALLOW" + ("   R PROJECT READS" if self.allow_read_auto else "") + "   ENTER"
         else:
-            value = "A ALLOW ONCE   D DENY" + ("   R TRUST READS" if self.allow_read_auto else "") + "   ENTER CHOOSE"
+            value = (
+                "D DENY   A ALLOW ONCE"
+                + ("   R AUTO-ALLOW PROJECT READS" if self.allow_read_auto else "")
+                + "   ENTER CHOOSE"
+            )
         self.query_one(".dialog-keys", Static).update(value)
 
     def _update_action_labels(self) -> None:
         compact = self.size.width < 40
         self.query_one("#approve", Button).label = self.approve_label(compact)
         if self.allow_read_auto:
-            self.query_one("#read-auto", Button).label = "READS" if compact else "TRUST READS"
+            self.query_one("#read-auto", Button).label = "AUTO READS" if compact else "AUTO-ALLOW PROJECT READS"
+
+    def _fit_dialog(self) -> None:
+        name = str(self.call.get("name") or "")
+        preview = str(self.call.get("patch") or self.call.get("cmd") or self.presentation.get("target") or "")
+        preview_rows = max(1, preview.count("\n") + 1)
+        if name == "patch":
+            desired = min(34, max(22, preview_rows + 11))
+        elif name == "shell":
+            desired = min(28, max(16, preview_rows + 11))
+        else:
+            desired = min(24, max(15, preview_rows + (13 if self.allow_read_auto else 11)))
+        self.query_one("#approval-dialog", Vertical).styles.height = min(desired, max(12, self.size.height - 4))
 
     def on_mount(self) -> None:
+        risk = str(self.presentation.get("risk") or "read").lower()
+        self.set_class(risk in {"write", "system"}, "risk-high")
         apply_modal_responsive_classes(self)
         self._update_key_legend()
         self._update_action_labels()
+        self._fit_dialog()
         self.query_one("#deny" if self.deny_first else "#approve", Button).focus()
 
     def on_resize(self, _event: Any) -> None:
         apply_modal_responsive_classes(self)
         self._update_key_legend()
         self._update_action_labels()
+        self._fit_dialog()
 
     @on(Button.Pressed)
     def button_pressed(self, event: Button.Pressed) -> None:
@@ -999,10 +1080,7 @@ Screen {
 }
 
 #metabar {
-    height: 1;
-    padding: 0 1;
-    background: #0e100e;
-    color: #969282;
+    display: none;
 }
 
 #transcript {
@@ -1123,7 +1201,7 @@ TranscriptEntry MarkdownFence {
     color: #d5d0c0;
     background: #11130f;
     border-left: solid #766342;
-    scrollbar-size-horizontal: 0;
+    scrollbar-size-horizontal: 1;
 }
 TranscriptEntry MarkdownFence > Label { padding: 1 2; }
 TranscriptEntry MarkdownBlock > .code_inline {
@@ -1133,25 +1211,22 @@ TranscriptEntry MarkdownBlock > .code_inline {
 }
 
 #activity {
+    display: none;
     height: 1;
     padding: 0 1;
     color: #969282;
     background: #0e100e;
 }
 
+Screen.activity-visible #activity { display: block; }
+
 #composer-shell {
-    height: 6;
-    min-height: 5;
+    height: 3;
+    min-height: 3;
     max-height: 11;
     padding: 0 1;
     background: #11130f;
     border-top: solid #393a31;
-}
-
-#composer-title {
-    height: 1;
-    color: #a77c45;
-    text-style: bold;
 }
 
 #attachment-bar {
@@ -1166,7 +1241,7 @@ TranscriptEntry MarkdownBlock > .code_inline {
 Screen.has-attachments #attachment-bar { display: block; }
 
 #composer {
-    height: 3;
+    height: 2;
     min-height: 2;
     max-height: 7;
     padding: 0 1;
@@ -1196,10 +1271,7 @@ Screen.has-attachments #attachment-bar { display: block; }
 }
 
 #keybar {
-    height: 1;
-    padding: 0 1;
-    background: #1a1c16;
-    color: #888477;
+    display: none;
 }
 
 .dialog {
@@ -1261,6 +1333,17 @@ ModelTransferScreen {
     scrollbar-color: #545348;
 }
 
+#selector-filter {
+    height: 3;
+    margin: 0;
+    padding: 0 1;
+    border: tall #393a31;
+    background: #151711;
+    color: #ddd8c8;
+}
+
+#selector-filter:focus { border: tall #c4934f; }
+
 #selector-options > .option-list--option {
     padding: 0 1;
     color: #b8b3a4;
@@ -1282,7 +1365,9 @@ ModelTransferScreen {
 }
 
 #approval-dialog { height: 72%; max-height: 34; }
+ApprovalScreen.risk-high #approval-dialog { border-left: solid #c67a70; }
 .approval-reason { height: auto; min-height: 2; padding: 1; }
+.approval-policy { height: auto; min-height: 2; padding: 0 1; color: #888477; }
 #approval-preview {
     height: 1fr;
     padding: 1;
@@ -1444,9 +1529,7 @@ Screen.compact #transcript { padding: 1 1 0 1; }
 Screen.compact TranscriptEntry { padding-left: 1; }
 Screen.compact #composer-shell { padding: 0; }
 Screen.compact #empty-state { padding: 0 1; }
-Screen.short #metabar { display: none; }
-Screen.short #keybar { display: none; }
-Screen.short #composer-shell { min-height: 4; }
+Screen.short #composer-shell { min-height: 3; }
 Screen.short #empty-state { min-height: 5; padding: 0; }
 """
 
@@ -1465,7 +1548,7 @@ class DairackTextualBase(App[None]):
         Binding("ctrl+end", "tail", "Latest", show=False, priority=True),
         Binding("ctrl+t", "focus_transcript", "Transcript", show=False),
         Binding("ctrl+l", "clear_transcript_view", "Clear view", show=False),
-        Binding("f2", "model_picker", "Models", show=False),
+        Binding("f2", "model_picker", "Mode", show=False),
         Binding("f3", "chat_picker", "Chats", show=False),
         Binding("f4", "image_picker", "Images", show=False),
         Binding("f6", "model_library", "Model library", show=False, priority=True),
@@ -1585,7 +1668,6 @@ class DairackTextualBase(App[None]):
         yield VerticalScroll(id="transcript")
         yield Static(id="activity")
         with Vertical(id="composer-shell"):
-            yield Static("PROMPT", id="composer-title")
             yield Static(id="attachment-bar")
             yield Composer(
                 id="composer",
@@ -1882,68 +1964,72 @@ class DairackTextualBase(App[None]):
         return prefix
 
     def _topbar_content(self, width: int) -> Text:
+        target_width = max(8, width - 2)
         remote_compute = self.config.get("compute_mode") == "remote"
-        left = Text()
-        left.append(" DAIRACK ", style=f"bold {PALETTE['ink']} on {PALETTE['amber']}")
-        if width >= 58:
-            left.append("  LOCAL AGENT" if remote_compute else "  LOCAL INTELLIGENCE", style=f"bold {PALETTE['muted']}")
+        _, _, ratio = self._context_values()
+        model = self._display_model(width=width)
+        permission = str(self.config.get("permission_mode") or "ask").upper()
+        left = Text(" DAIRACK ", style=f"bold {PALETTE['ink']} on {PALETTE['amber']}")
         right = Text()
         if self._available_update:
             right.append(f"UPDATE {self._available_update.latest_version}", style=f"bold {PALETTE['brass']}")
             right.append(" / ", style=PALETTE["quiet"])
         if remote_compute:
             compute_name = clip_middle(str(self.config.get("compute_name") or "REMOTE"), 24).upper()
-            right.append(f"COMPUTE {compute_name} / ONLINE", style=PALETTE["olive"])
+            if width >= 96:
+                right.append(f"COMPUTE {compute_name} / CONNECTED", style=PALETTE["olive"])
+            elif width >= 72:
+                right.append("REMOTE / CONNECTED", style=PALETTE["olive"])
+            elif width >= 52:
+                right.append("REMOTE", style=PALETTE["olive"])
+            else:
+                right.append("RMT", style=PALETTE["olive"])
         else:
-            right.append(f"OLLAMA {self.version} / ONLINE", style=PALETTE["olive"])
-        available = width - len(left.plain) - len(right.plain) - 2
-        if available >= 1:
-            left.append(" " * available)
+            if width >= 96:
+                right.append("OLLAMA LOCAL / READY", style=PALETTE["olive"])
+            elif width >= 72:
+                right.append("LOCAL / READY", style=PALETTE["olive"])
+            elif width >= 52:
+                right.append("LOCAL", style=PALETTE["olive"])
+            else:
+                right.append("LOC", style=PALETTE["olive"])
+
+        fixed = len(left.plain) + len(right.plain) + 2
+        if width >= 96:
+            identity = "LOCAL AGENT" if remote_compute else "LOCAL INTELLIGENCE"
+            identity = identity if width >= 120 else ""
+            suffix = f"   CTX {ratio * 100:.0f}%   {permission}"
+            available = max(8, target_width - fixed - len(identity) - len(suffix) - 4)
+            if identity:
+                left.append(f"  {identity}   ", style=f"bold {PALETTE['muted']}")
+            else:
+                left.append("  ")
+            left.append(clip_model(model, available), style=f"bold {PALETTE['amber']}")
+            left.append(suffix, style=PALETTE["quiet"])
+        elif width >= 52:
+            suffix = f"  {ratio * 100:.0f}%  {permission}"
+            available = max(6, target_width - fixed - len(suffix))
+            left.append("  " + clip_model(model, available), style=f"bold {PALETTE['amber']}")
+            left.append(suffix, style=PALETTE["quiet"])
+        else:
+            compact_connection = right
+            right = Text(f"{ratio * 100:.0f}%  ", style=PALETTE["quiet"])
+            right.append_text(compact_connection)
+            available = max(5, target_width - len(left.plain) - len(right.plain) - 3)
+            left.append(" " + clip_model(model, available), style=f"bold {PALETTE['amber']}")
+
+        if len(left.plain) + len(right.plain) + 1 <= target_width:
+            left.append(" " * max(1, target_width - len(left.plain) - len(right.plain)))
             left.append_text(right)
-        elif width >= 34:
-            compact_right = (
-                Text(f" UPDATE {self._available_update.latest_version}", style=f"bold {PALETTE['brass']}")
-                if self._available_update
-                else Text(" ONLINE", style=PALETTE["olive"])
+        elif len(left.plain) < target_width:
+            left.append(
+                " " + clip_right(right.plain, max(0, target_width - len(left.plain) - 1)), style=PALETTE["olive"]
             )
-            gap = max(1, width - len(left.plain) - len(compact_right.plain) - 1)
-            left.append(" " * gap)
-            left.append_text(compact_right)
         return left
 
     def _metabar_content(self, width: int) -> Text:
-        used, budget, ratio = self._context_values()
-        model = self._display_model(width=width)
-        policy = str(self.config.get("permission_mode") or "ask").upper()
-        agent = "AGENT" if self.config.get("agent") else "CHAT"
-        band = width_band(width)
-        if band == "narrow":
-            value = Text(" MODE ", style=PALETTE["quiet"])
-            value.append(clip_model(model, max(6, width - 13)), style=f"bold {PALETTE['amber']}")
-            value.append(f"  {policy}", style=PALETTE["brass"])
-            return value
-        if band == "standard":
-            value = Text(" MODE ", style=PALETTE["quiet"])
-            value.append(clip_model(model, max(12, width - 34)), style=f"bold {PALETTE['amber']}")
-            value.append(f"  CTX {short_number(used)}/{short_number(budget)}", style=PALETTE["muted"])
-            value.append(f"  {policy}", style=PALETTE["brass"])
-            return value
-
-        cells = 10
-        filled = min(cells, int(round(ratio * cells)))
-        context_meter = "=" * filled + "-" * (cells - filled)
-        title = self.core.clean_chat_title(str(self.chat.get("title") or ""), "new chat")
-        value = Text(" MODE ", style=PALETTE["quiet"])
-        value.append(clip_model(model, 38), style=f"bold {PALETTE['amber']}")
-        value.append("   CTX ", style=PALETTE["quiet"])
-        meter_color = PALETTE["red"] if ratio >= 0.92 else PALETTE["brass"] if ratio >= 0.75 else PALETTE["olive"]
-        value.append(context_meter, style=meter_color)
-        value.append(f" {ratio * 100:2.0f}%", style=PALETTE["muted"])
-        value.append("   ACCESS ", style=PALETTE["quiet"])
-        value.append(f"{agent}/{policy}", style=PALETTE["brass"])
-        value.append("   CHAT ", style=PALETTE["quiet"])
-        value.append(clip_right(title, max(12, width - len(value.plain) - 2)), style=PALETTE["teal"])
-        return value
+        del width
+        return Text()
 
     def _activity_content(self, width: int) -> Text:
         now = time.monotonic()
@@ -2071,33 +2157,67 @@ class DairackTextualBase(App[None]):
             value.append(clip_middle(str(self.cwd), max(4, width - len(value.plain) - 2)), style=PALETTE["quiet"])
         return value
 
+    def _activity_visible(self, now: float | None = None) -> bool:
+        timestamp = time.monotonic() if now is None else now
+        completion_active = (
+            not self._reduced_motion and 0.0 <= timestamp - self._completion_glint_started < COMPLETION_GLINT_SECONDS
+        )
+        return bool(
+            self.busy
+            or self._unread
+            or (self._notice and timestamp < self._notice_until)
+            or (self._last_turn_stats and timestamp < self._last_turn_stats_until)
+            or completion_active
+        )
+
+    @staticmethod
+    def _slash_command_matches(source: str) -> list[str]:
+        normalized = source.lower().strip()
+        if not normalized.startswith("/") or " " in normalized or "\n" in normalized:
+            return []
+        hidden_aliases = {"/models", "/orchestrator"}
+        return [
+            command
+            for command in COMMAND_DESCRIPTIONS
+            if command not in hidden_aliases and command.startswith(normalized)
+        ]
+
     def _composer_meta_content(self, width: int) -> Text:
         composer = self.query_one("#composer", Composer)
         source = composer.text.strip()
-        if source.startswith("/") and " " not in source and "\n" not in source:
-            matches = [command for command in COMMAND_DESCRIPTIONS if command.startswith(source.lower())]
-            if matches:
-                command = matches[0]
-                value = Text("  ")
-                value.append(command, style=f"bold {PALETTE['amber']}")
+        matches = self._slash_command_matches(source)
+        if matches:
+            limit = 2 if width < 52 else 3 if width < 96 else 5
+            visible = matches[:limit]
+            command_width = max(len(command) for command in visible)
+            value = Text()
+            for index, command in enumerate(visible):
+                if index:
+                    value.append("\n")
                 value.append(
-                    "  " + clip_middle(COMMAND_DESCRIPTIONS[command], max(12, width - len(command) - 24)),
-                    style=PALETTE["muted"],
+                    "> " if index == 0 else "  ", style=f"bold {PALETTE['amber'] if index == 0 else PALETTE['quiet']}"
                 )
-                if source.lower() != command and width >= 48:
-                    value.append("   RIGHT COMPLETE", style=PALETTE["quiet"])
-                return value
+                value.append(
+                    command.ljust(command_width), style=f"bold {PALETTE['amber'] if index == 0 else PALETTE['paper']}"
+                )
+                available = max(0, width - command_width - 5)
+                if available:
+                    value.append("  " + clip_right(COMMAND_DESCRIPTIONS[command], available), style=PALETTE["muted"])
+            return value
         draft_held = self.busy and bool(self.query_one("#composer", Composer).text.strip())
         value = Text("  ")
         if draft_held:
             value.append("DRAFT" if width < 38 else "DRAFT HELD", style=f"bold {PALETTE['olive']}")
             value.append("   ", style=PALETTE["quiet"])
-        if self.size.height < 22:
-            value.append("^P CMD   /HELP" if width < 38 else "^P COMMANDS   /HELP", style=PALETTE["quiet"])
-        elif width >= 76:
-            value.append("ENTER SEND   SHIFT+ENTER NEWLINE", style=PALETTE["quiet"])
-        else:
-            value.append("ENTER SEND   /HELP", style=PALETTE["quiet"])
+        legends = (
+            "ENTER SEND   SHIFT+ENTER NEWLINE   CTRL+P COMMANDS",
+            "ENTER SEND   ^P COMMANDS   /HELP",
+            "^P COMMANDS   /HELP",
+            "/HELP",
+        )
+        available = max(0, width - 2 - len(value.plain))
+        legend = next((candidate for candidate in legends if len(candidate) <= available), legends[-1])
+        value.append(clip_right(legend, available), style=PALETTE["quiet"])
         return value
 
     def _attachment_bar_content(self, width: int) -> Text:
@@ -2241,18 +2361,23 @@ class DairackTextualBase(App[None]):
         append_signal_track(wordmark, track_width, cursor, wrap=False)
         wordmark.append("\n")
         if elapsed < 0.58:
-            state = "RUNTIME / ONLINE"
+            state = "RUNTIME / READY"
         elif elapsed < 1.18:
             state = "COORDINATOR / CALIBRATED"
         else:
             state = "NEW SESSION / READY"
         wordmark.append(state, style=f"bold {PALETTE['olive']}")
+        if settled:
+            working_width = max(12, min(72, width - 8))
+            wordmark.append("\n\nWORKING IN  ", style=f"bold {PALETTE['quiet']}")
+            wordmark.append(clip_middle(str(self.cwd), working_width), style=PALETTE["paper"])
         return wordmark
 
     def _feedback_tick(self) -> None:
         if not self._ui_ready or not self.is_running:
             return
         width = max(20, self.size.width)
+        self.screen.set_class(self._activity_visible(), "activity-visible")
         self._update_static("#activity", self._activity_content(width), False)
         self._update_welcome(width, False)
         self._update_signal_surfaces(time.monotonic())
@@ -2261,6 +2386,7 @@ class DairackTextualBase(App[None]):
         if not self._ui_ready or not self.is_running:
             return
         width = max(20, self.size.width)
+        self.screen.set_class(self._activity_visible(), "activity-visible")
         self._update_static("#topbar", self._topbar_content(width), force)
         self._update_static("#metabar", self._metabar_content(width), force)
         self._update_static("#activity", self._activity_content(width), force)
@@ -2714,10 +2840,9 @@ class DairackTextualBase(App[None]):
     def composer_changed(self, event: TextArea.Changed) -> None:
         source = event.text_area.text.strip()
         suggestion = ""
-        if source.startswith("/") and " " not in source and "\n" not in source:
-            matches = [command for command in COMMAND_DESCRIPTIONS if command.startswith(source.lower())]
-            if matches and matches[0] != source.lower():
-                suggestion = matches[0][len(source) :]
+        matches = self._slash_command_matches(source)
+        if matches and matches[0] != source.lower():
+            suggestion = matches[0][len(source) :]
         event.text_area.suggestion = suggestion
         self._resize_composer()
         self.refresh_chrome(force=True)
@@ -2736,8 +2861,13 @@ class DairackTextualBase(App[None]):
             display_lines += max(1, (cells + width - 1) // width)
         max_lines = 4 if self.size.height < 24 else 7
         lines = max(2, min(max_lines, display_lines))
+        meta = self._composer_meta_content(max(20, self.size.width))
+        meta_rows = max(1, meta.plain.count("\n") + 1)
         composer.styles.height = lines
-        self.query_one("#composer-shell", Vertical).styles.height = lines + (4 if self._pending_images else 3)
+        self.query_one("#composer-meta", Static).styles.height = meta_rows
+        self.query_one("#composer-shell", Vertical).styles.height = (
+            lines + meta_rows + (1 if self._pending_images else 0)
+        )
 
     def _record_prompt_history(self, text: str) -> None:
         try:
@@ -3266,34 +3396,29 @@ class DairackTextualBase(App[None]):
         for descriptor in self._model_library_models:
             record = registry.models.get(descriptor.name)
             profile = record.effective_runtime() if record else {}
-            capability = record.effective_capability() if record else None
             row = Text()
             active = str(self.config.get("model") or "") == descriptor.name
-            row.append("ACTIVE   " if active else "         ", style=f"bold {PALETTE['olive']}")
+            row.append("ACTIVE  " if active else "        ", style=f"bold {PALETTE['olive']}")
             row.append(
-                clip_middle(descriptor.name, max(18, min(48, self.size.width - 24))), style=f"bold {PALETTE['paper']}"
+                clip_model(descriptor.name, max(18, min(48, self.size.width - 30))),
+                style=f"bold {PALETTE['paper']}",
             )
-            row.append(f"  {descriptor.size / 1024**3:.1f} GiB", style=PALETTE["brass"])
-            row.append(f"\n         {record.role if record else 'Ollama model'}", style=PALETTE["muted"])
-            row.append(
-                f"  / {profile.get('fit', 'unknown')} fit  / ctx {profile.get('num_ctx', '?')}",
-                style=PALETTE["quiet"],
-            )
-            if capability:
-                source = (
-                    "CURATED"
-                    if "catalog" in capability.source
-                    else "CALIBRATED"
-                    if "user" in capability.source
-                    else "INFERRED"
-                )
-                row.append(
-                    f"  / {source} {capability.confidence * 100:.0f}%",
-                    style=PALETTE["olive"] if source != "INFERRED" else PALETTE["quiet"],
-                )
+            fit_label = str(profile.get("fit") or "unknown").upper() + " FIT"
+            row.append(f"  {fit_label}", style=PALETTE["olive"] if fit_label != "CONSTRAINED FIT" else PALETTE["brass"])
+            row.append(f"\n        {record.role if record else 'Ollama model'}", style=PALETTE["muted"])
             installed_options.append((f"model|{descriptor.name}", row))
 
-        options = [*action_options, *installed_options]
+        options = [
+            ("__heading__:actions", Text("ACTIONS", style=f"bold {PALETTE['quiet']}")),
+            *action_options,
+        ]
+        if installed_options:
+            options.extend(
+                [
+                    ("__heading__:installed", Text("INSTALLED", style=f"bold {PALETTE['quiet']}")),
+                    *installed_options,
+                ]
+            )
 
         hardware = result.hardware
         accelerator = hardware.primary_accelerator
@@ -3312,8 +3437,10 @@ class DairackTextualBase(App[None]):
                 else f"No models installed. Choose a fitted model set for {fit}, or enter any Ollama model name."
             ),
             options,
-            highlighted=0,
+            highlighted=1,
             family="library",
+            searchable=True,
+            filter_placeholder="Filter models and actions...",
         )
         self.push_screen(screen, self._model_library_result)
 
@@ -3565,6 +3692,24 @@ class DairackTextualBase(App[None]):
             self.set_notice("Model registry changed; reopen the library")
             return
         active = str(self.config.get("model") or "") == name
+        registry = load_registry(PATHS)
+        record = registry.models.get(name) if registry else None
+        profile_data = record.effective_runtime() if record else {}
+        capability = record.effective_capability() if record else None
+        source = ""
+        if capability:
+            source = (
+                "CURATED"
+                if "catalog" in capability.source
+                else "CALIBRATED"
+                if "user" in capability.source
+                else "INFERRED"
+            )
+        detail = (
+            f"{record.role if record else 'Ollama model'} / {descriptor.size / 1024**3:.1f} GiB / "
+            f"{str(profile_data.get('fit') or 'unknown').upper()} FIT / CTX {profile_data.get('num_ctx', '?')}"
+            + (f" / {source} {capability.confidence * 100:.0f}%" if capability else "")
+        )
         use = Text()
         use.append("ACTIVE  " if active else "        ", style=f"bold {PALETTE['olive']}")
         use.append("USE DIRECTLY", style=f"bold {PALETTE['paper']}")
@@ -3582,7 +3727,7 @@ class DairackTextualBase(App[None]):
         )
         screen = SelectorScreen(
             f"MODEL / {clip_middle(name, 60)}",
-            "Model actions are explicit. Updating preserves your profile overrides; removal does not affect chats.",
+            detail,
             [
                 (f"use|{name}", use),
                 (f"update|{name}", update),
