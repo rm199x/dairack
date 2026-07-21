@@ -47,45 +47,45 @@ from .config import (
     save_config as save_app_config,
 )
 from .coordinator.analysis import (
-    analyze_task as analyze_orchestrator_task,
+    analyze_task as analyze_orchestrator_task,  # noqa: F401  (re-export)
 )
 from .coordinator.analysis import (
-    execution_scope as coordinator_execution_scope,
+    execution_scope as coordinator_execution_scope,  # noqa: F401  (re-export)
 )
 from .coordinator.analysis import (
     extract_public_web_targets,
     is_direct_answer_route,
-    public_web_action_contract,
+    public_web_action_contract,  # noqa: F401  (re-export)
 )
 from .coordinator.analysis import (
-    merge_semantic_assessment as _merge_semantic_assessment,
+    merge_semantic_assessment as _merge_semantic_assessment,  # noqa: F401  (re-export)
 )
 from .coordinator.analysis import (
-    referenced_task_analysis as coordinator_referenced_task_analysis,
+    referenced_task_analysis as coordinator_referenced_task_analysis,  # noqa: F401  (re-export)
 )
 from .coordinator.analysis import (
-    semantic_context as coordinator_semantic_context,
+    semantic_context as coordinator_semantic_context,  # noqa: F401  (re-export)
 )
 from .coordinator.analysis import (
-    semantic_gate as coordinator_semantic_gate,
+    semantic_gate as coordinator_semantic_gate,  # noqa: F401  (re-export)
 )
 from .coordinator.analysis import (
     signal_hits as _signal_hits,  # noqa: F401  (compatibility export)
 )
 from .coordinator.analysis import (
-    task_kind as _coordinator_task_kind,
+    task_kind as _coordinator_task_kind,  # noqa: F401  (re-export)
 )
 from .coordinator.analysis import (
     task_role as _coordinator_task_role,
 )
-from .coordinator.calibration import estimate as calibration_estimate
-from .coordinator.calibration import load_state as load_calibration_state
+from .coordinator.calibration import estimate as calibration_estimate  # noqa: F401  (re-export)
+from .coordinator.calibration import load_state as load_calibration_state  # noqa: F401  (late-bound by selection)
 from .coordinator.calibration import observe_estimate as observe_calibration
 from .coordinator.calibration import report as calibration_report
 from .coordinator.calibration import reset as reset_calibration
 from .coordinator.control import (
     RoutingControl,  # noqa: F401  (compatibility export)
-    materially_larger,
+    materially_larger,  # noqa: F401  (re-export)
 )
 from .coordinator.delegation import (  # noqa: F401  (re-exported coordinator constants)
     COORDINATOR_DELEGATION_LIMITS,
@@ -100,26 +100,33 @@ from .coordinator.delegation import quality_demand as coordinator_quality_demand
 from .coordinator.delegation import select_specialist as select_coordinator_specialist
 from .coordinator.delegation import specialty as coordinator_specialty
 from .coordinator.policy import POLICIES as COORDINATOR_POLICY_DEFINITIONS  # noqa: F401  (re-export)
-from .coordinator.policy import policy_for
+from .coordinator.policy import policy_for  # noqa: F401  (re-export)
 from .coordinator.ranking import (
-    candidate_score as coordinator_candidate_score,
+    candidate_score as coordinator_candidate_score,  # noqa: F401  (re-export)
 )
 from .coordinator.ranking import (
     effective_learning_adjustment as coordinator_learning_adjustment,
 )
 from .coordinator.ranking import (
-    role_preference as coordinator_role_preference,
+    role_preference as coordinator_role_preference,  # noqa: F401  (re-export)
 )
 from .coordinator.ranking import (
-    semantic_router_model as select_semantic_router_model,
+    semantic_router_model as select_semantic_router_model,  # noqa: F401  (re-export)
 )
 from .coordinator.ranking import (
-    stage_model as select_coordinator_stage_model,
+    stage_model as select_coordinator_stage_model,  # noqa: F401  (re-export)
 )
-from .coordinator.semantic import assessment as coordinator_semantic_assessment
+from .coordinator.selection import candidate_score_for as _orchestrator_candidate_score  # noqa: F401  (re-export)
+from .coordinator.selection import direct_route  # noqa: F401  (re-export)
+from .coordinator.selection import executor_continuity as _executor_continuity  # noqa: F401  (re-export)
+from .coordinator.selection import role_preference as _coordinator_role_preference  # noqa: F401  (re-export)
+from .coordinator.selection import select_route as select_orchestrator_route
+from .coordinator.selection import semantic_router_model as _semantic_router_model  # noqa: F401  (re-export)
+from .coordinator.selection import specialist_model as _specialist_model  # noqa: F401  (re-export)
+from .coordinator.semantic import assessment as coordinator_semantic_assessment  # noqa: F401  (re-export)
 from .coordinator.semantic import reset_assessment_cache as reset_semantic_assessment_cache  # noqa: F401  (re-export)
-from .coordinator.tuning import DEFAULT_TUNING
-from .coordinator.tuning import for_config as coordinator_tuning_for_config
+from .coordinator.tuning import DEFAULT_TUNING  # noqa: F401  (re-export)
+from .coordinator.tuning import for_config as coordinator_tuning_for_config  # noqa: F401  (re-export)
 from .file_discovery import find_paths as discover_paths
 from .identity import APP_NAME, env_enabled
 from .machine import hardware_status as format_hardware_status
@@ -552,90 +559,12 @@ def runtime_failure_message(error: Exception | str, phase: str = "model response
     }
 
 
-def _orchestrator_candidate_score(
-    model: Any,
-    signals: dict[str, float],
-    policy: str,
-    resident: set[str],
-    preferred_model: str = "",
-    profile_confidence: float = 0.5,
-    learned_adjustment: float = 0.0,
-    task_complexity: float = 0.0,
-    tuning: Any = DEFAULT_TUNING,
-    routing_preference: str = "auto",
-    preference_strength: float = 0.0,
-) -> float:
-    return coordinator_candidate_score(
-        str(getattr(model, "name", model) or ""),
-        model_capabilities(model),
-        signals,
-        policy,
-        resident,
-        preferred_model,
-        profile_confidence,
-        learned_adjustment,
-        task_complexity,
-        tuning,
-        routing_preference,
-        preference_strength,
-    )
-
-
 def _effective_learning_adjustment(
     signals: dict[str, float],
     task_complexity: float,
     learned_adjustment: float,
 ) -> float:
     return coordinator_learning_adjustment(signals, task_complexity, learned_adjustment)
-
-
-def _coordinator_role_preference(config: dict[str, Any], role: str, models: list[Any]) -> str:
-    return coordinator_role_preference(config, role, models)
-
-
-def _specialist_model(
-    provider: Any,
-    candidates: list[dict[str, Any]],
-    purpose: str,
-    executor: str,
-    policy: str,
-    signals: dict[str, float],
-    preferred_model: str = "",
-) -> str:
-    return select_coordinator_stage_model(
-        provider,
-        candidates,
-        purpose,
-        executor,
-        policy,
-        signals,
-        model_supports_vision,
-        preferred_model,
-    )
-
-
-def _semantic_router_model(models: list[Any], resident: set[str]) -> str:
-    return select_semantic_router_model(models, resident, model_capabilities)
-
-
-def direct_route(config: dict[str, Any], model: str | None = None) -> dict[str, Any]:
-    selected = str(model or config.get("model") or "")
-    return {
-        "mode": "direct",
-        "policy": "direct",
-        "task_kind": "direct selection",
-        "executor": selected,
-        "planner": "",
-        "reviewer": "",
-        "strategy": "single",
-        "complexity": 0.0,
-        "confidence": 1.0,
-        "signals": {},
-        "evidence": ["direct model mode"],
-        "candidates": [{"model": selected, "score": 1.0}] if selected else [],
-        "delegations": [],
-        "created_at": now_iso(),
-    }
 
 
 COORDINATOR_SEMANTIC_SCHEMA: dict[str, Any] = {
@@ -695,389 +624,6 @@ COORDINATOR_SEMANTIC_SCHEMA: dict[str, Any] = {
     ],
     "additionalProperties": False,
 }
-
-
-def _executor_continuity(
-    scored: list[dict[str, Any]],
-    previous_route: dict[str, Any] | None,
-    policy: str,
-    signals: dict[str, float],
-) -> dict[str, Any] | None:
-    """Keep a resident incumbent executor when a cold challenger's lead is within the reload margin.
-
-    Switching models on local hardware pays a real load cost; a marginal score
-    lead does not. The margin scales with the incumbent's size (bigger models
-    cost more to reload) and the policy's efficiency stance, and never applies
-    when the challenger is already resident, when there is no incumbent, or when
-    the task needs vision the incumbent lacks.
-    """
-    if not isinstance(previous_route, dict) or not scored:
-        return None
-    incumbent = str(previous_route.get("executor") or "").strip()
-    if not incumbent or scored[0]["model"].lower() == incumbent.lower():
-        return None
-    entry = next((item for item in scored if str(item["model"]).lower() == incumbent.lower()), None)
-    if entry is None or not entry.get("resident") or scored[0].get("resident"):
-        return None
-    if float(signals.get("vision") or 0) > 0:
-        capabilities = entry.get("capabilities")
-        if not isinstance(capabilities, dict) or float(capabilities.get("vision") or 0) < 0.50:
-            return None
-    size_gb = float(getattr(entry.get("descriptor"), "size", 0) or 0) / 1e9
-    policy_scale = {"efficient": 1.4, "adaptive": 1.0, "quality": 0.5}.get(policy, 1.0)
-    margin = min(0.05, (0.015 + min(0.03, size_gb * 0.0035)) * policy_scale)
-    gap = float(scored[0]["score"]) - float(entry["score"])
-    if gap > margin:
-        return None
-    return {
-        "executor": str(entry["model"]),
-        "over": str(scored[0]["model"]),
-        "gap": round(gap, 4),
-        "margin": round(margin, 4),
-    }
-
-
-def select_orchestrator_route(
-    provider: Any,
-    config: dict[str, Any],
-    messages: list[dict[str, str]],
-    cwd: Path,
-    cancel_event: threading.Event | None = None,
-    previous_route: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    action_contract = public_web_action_contract(messages)
-    if str(config.get("model_mode") or "direct") != "orchestrator":
-        route = direct_route(config)
-        route["prompt"] = latest_user_task(messages)
-        route["action_contract"] = action_contract
-        return route
-    policy = str(config.get("orchestrator_policy") or "adaptive").lower()
-    if policy not in ORCHESTRATOR_POLICIES:
-        policy = "adaptive"
-    policy_definition = policy_for(policy)
-    tuning = coordinator_tuning_for_config(config)
-    try:
-        models = list(provider.list_models())
-    except Exception as exc:
-        route = direct_route(config)
-        route.update(
-            {
-                "mode": "orchestrator",
-                "policy": policy,
-                "task_kind": "registry fallback",
-                "confidence": 0.0,
-                "evidence": ["model registry unavailable; retained fallback model"],
-                "routing_error": str(exc),
-                "action_contract": action_contract,
-            }
-        )
-        return route
-    if not models:
-        route = direct_route(config)
-        route["prompt"] = latest_user_task(messages)
-        route["action_contract"] = action_contract
-        return route
-    try:
-        resident = set(provider.running_models())
-    except Exception:
-        resident = set()
-    analysis = analyze_orchestrator_task(messages, cwd)
-    signals = analysis["signals"]
-    complexity = float(analysis["complexity"])
-    resident_lower = {value.lower() for value in resident}
-    learning_state = (
-        load_calibration_state(PATHS.state_dir / "coordinator-learning.json")
-        if bool(config.get("coordinator_learning", True))
-        else {"records": {}}
-    )
-
-    def rank_candidates(
-        active_signals: dict[str, float],
-        active_complexity: float,
-        routing_control: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        routing_control = routing_control if isinstance(routing_control, dict) else {}
-        preference = str(routing_control.get("preference") or "auto") if routing_control.get("active") else "auto"
-        preference_strength = float(routing_control.get("strength") or 0) if routing_control.get("active") else 0.0
-        role = _coordinator_task_role(active_signals)
-        kind = _coordinator_task_kind(active_signals)
-        preferred = _coordinator_role_preference(config, role, models)
-        ranked: list[dict[str, Any]] = []
-        for model in models:
-            if float(active_signals.get("vision") or 0) > 0 and not model_supports_vision(provider, model.name):
-                continue
-            metadata = model_capability_metadata(model)
-            profile_confidence = float(metadata.get("confidence") or 0.5)
-            calibration = calibration_estimate(learning_state, model.name, role, kind)
-            raw_learned = calibration.value
-            learned = _effective_learning_adjustment(active_signals, active_complexity, raw_learned)
-            score = _orchestrator_candidate_score(
-                model,
-                active_signals,
-                policy,
-                resident,
-                preferred,
-                profile_confidence,
-                learned,
-                active_complexity,
-                tuning,
-                preference,
-                preference_strength,
-            )
-            ranked.append(
-                {
-                    "model": model.name,
-                    "descriptor": model,
-                    "score": score,
-                    "resident": model.name.lower() in resident_lower,
-                    "capabilities": model_capabilities(model),
-                    "preferred": bool(preferred and model.name.lower() == preferred.lower()),
-                    "confidence": profile_confidence,
-                    "profile_source": str(metadata.get("source") or "inferred"),
-                    "learned_adjustment": learned,
-                    "learning_evidence": calibration.effective_evidence,
-                    "learning_role_evidence": calibration.role_evidence,
-                    "learning_kind_evidence": calibration.kind_evidence,
-                    "learning_kind_weight": calibration.kind_weight,
-                    "learning_guarded": bool(raw_learned and not learned),
-                }
-            )
-        ranked.sort(
-            key=lambda item: (
-                -item["score"],
-                not item["resident"],
-                -float(item["capabilities"].get("efficiency") or 0),
-                item["model"].lower(),
-            )
-        )
-        return ranked
-
-    scored = rank_candidates(signals, complexity)
-    if not scored:
-        raise RuntimeError("no installed model can satisfy the required input modality")
-    score_gap = scored[0]["score"] - scored[1]["score"] if len(scored) > 1 else 1.0
-    semantic_model = _semantic_router_model(models, resident)
-    semantic_context = coordinator_semantic_context(messages)
-    semantic_trigger = coordinator_semantic_gate(policy, analysis, score_gap, bool(semantic_context))
-    referenced_analysis = (
-        coordinator_referenced_task_analysis(messages, cwd)
-        if semantic_trigger in {"conversation-dependent follow-up", "short contextual turn"}
-        else {}
-    )
-    should_assess = (
-        bool(config.get("orchestrator_semantic_routing", True))
-        and policy in {"adaptive", "quality"}
-        and bool(semantic_model)
-        and bool(semantic_trigger)
-    )
-    if should_assess and not (cancel_event and cancel_event.is_set()):
-        try:
-            assessment = coordinator_semantic_assessment(
-                provider,
-                config,
-                semantic_model,
-                latest_user_task(messages),
-                semantic_context,
-                f"attached images: {len(latest_user_images(messages))}",
-                cancel_event,
-                tuning,
-            )
-        except Exception as exc:
-            assessment = {"error": str(exc), "model": semantic_model}
-        if assessment and "error" not in assessment:
-            assessment["trigger"] = semantic_trigger
-            analysis = _merge_semantic_assessment(analysis, assessment, tuning, referenced_analysis)
-            signals = analysis["signals"]
-            complexity = float(analysis["complexity"])
-            baseline_scored = rank_candidates(signals, complexity)
-            routing_control = analysis.get("routing_control")
-            routing_control = dict(routing_control) if isinstance(routing_control, dict) else {}
-            if routing_control.get("active"):
-                controlled_scored = rank_candidates(signals, complexity, routing_control)
-                baseline = baseline_scored[0]
-                if routing_control.get("preference") == "higher_capacity":
-                    controlled_baseline = next(
-                        (
-                            candidate
-                            for candidate in controlled_scored
-                            if candidate["model"].lower() == baseline["model"].lower()
-                        ),
-                        baseline,
-                    )
-                    allowed_drop = 0.04 + float(routing_control.get("strength") or 0) * 0.06
-                    eligible = [
-                        candidate
-                        for candidate in controlled_scored
-                        if materially_larger(candidate["descriptor"], baseline["descriptor"])
-                        and float(candidate["capabilities"].get("efficiency") or 0) >= 0.25
-                        and float(candidate["score"]) >= float(controlled_baseline["score"]) - allowed_drop
-                    ]
-                    if eligible:
-                        selected_names = {candidate["model"].lower() for candidate in eligible}
-                        scored = eligible + [
-                            candidate
-                            for candidate in controlled_scored
-                            if candidate["model"].lower() not in selected_names
-                        ]
-                        routing_control["honored"] = True
-                    else:
-                        scored = baseline_scored
-                        routing_control["honored"] = False
-                        routing_control["status"] = "no suitable higher-capacity fit"
-                else:
-                    scored = controlled_scored
-                    routing_control["honored"] = True
-                routing_control["baseline_executor"] = baseline["model"]
-                routing_control["selected_executor"] = scored[0]["model"]
-                routing_control["changed_executor"] = scored[0]["model"].lower() != baseline["model"].lower()
-                analysis["routing_control"] = routing_control
-                semantic_assessment = analysis.get("semantic_assessment")
-                if isinstance(semantic_assessment, dict):
-                    semantic_assessment["routing_control"] = routing_control
-            else:
-                scored = baseline_scored
-        elif assessment:
-            assessment["trigger"] = semantic_trigger
-            analysis["semantic_assessment"] = assessment
-    executor = scored[0]["model"]
-    continuity = _executor_continuity(scored, previous_route, policy, signals)
-    if continuity:
-        executor = continuity["executor"]
-    planner = ""
-    reviewer = ""
-    use_plan = False
-    use_review = False
-    if policy == "quality":
-        use_plan = (
-            bool(config.get("orchestrator_planning", True))
-            and complexity >= policy_definition.planning_threshold
-            and (signals["agent"] >= 0.42 or signals["reasoning"] >= 0.48)
-        )
-        use_review = (
-            bool(config.get("orchestrator_review", True))
-            and complexity >= policy_definition.review_threshold
-            and (
-                signals["code"] >= 0.40
-                or signals["reasoning"] >= 0.48
-                or signals["risk"] >= 0.34
-                or signals["vision"] >= 0.50
-            )
-        )
-        if bool(config.get("orchestrator_review", True)) and signals["vision"] and complexity >= 0.30:
-            use_review = True
-    elif policy == "adaptive":
-        use_plan = (
-            bool(config.get("orchestrator_planning", True))
-            and complexity >= policy_definition.planning_threshold
-            and (signals["agent"] >= 0.50 or signals["reasoning"] >= 0.65)
-        )
-        use_review = (
-            bool(config.get("orchestrator_review", True))
-            and complexity >= policy_definition.review_threshold
-            and (
-                signals["code"] >= 0.52
-                or signals["reasoning"] >= 0.66
-                or signals["risk"] >= 0.42
-                or signals["vision"] >= 0.50
-            )
-        )
-    semantic_assessment = analysis.get("semantic_assessment")
-    if isinstance(semantic_assessment, dict) and policy != "efficient":
-        # Confident semantic assessments lower — never remove — the deterministic support floors,
-        # so requests the keyword layer cannot see are still eligible for planning and review.
-        semantic_confidence = max(0.0, min(1.0, float(semantic_assessment.get("confidence") or 0)))
-        floor_relax = 0.16 if semantic_confidence >= 0.72 else 0.08 if semantic_confidence >= 0.55 else 0.0
-        signal_relax = floor_relax / 2
-        semantic_plan_supported = complexity >= ((0.62 if policy == "adaptive" else 0.48) - floor_relax) and (
-            signals["agent"] >= 0.42 - signal_relax or signals["reasoning"] >= 0.48 - signal_relax
-        )
-        semantic_review_supported = complexity >= ((0.64 if policy == "adaptive" else 0.46) - floor_relax) and (
-            signals["code"] >= 0.40 - signal_relax
-            or signals["reasoning"] >= 0.48 - signal_relax
-            or signals["risk"] >= 0.34 - signal_relax
-            or signals["vision"] >= 0.50
-        )
-        if (
-            bool(config.get("orchestrator_planning", True))
-            and semantic_assessment.get("needs_plan")
-            and semantic_plan_supported
-        ):
-            use_plan = True
-        if (
-            bool(config.get("orchestrator_review", True))
-            and semantic_assessment.get("needs_review")
-            and semantic_review_supported
-        ):
-            use_review = True
-    if use_plan:
-        planner = _specialist_model(
-            provider,
-            scored,
-            "planner",
-            executor,
-            policy,
-            signals,
-            _coordinator_role_preference(config, "planner", models),
-        )
-    if use_review:
-        reviewer = _specialist_model(
-            provider,
-            scored,
-            "reviewer",
-            executor,
-            policy,
-            signals,
-            _coordinator_role_preference(config, "reviewer", models),
-        )
-    strategy = "plan-review" if planner and reviewer else "planned" if planner else "reviewed" if reviewer else "single"
-    gap = scored[0]["score"] - scored[1]["score"] if len(scored) > 1 else 0.25
-    profile_confidence = float(scored[0].get("confidence") or 0.5)
-    confidence = min(0.97, (0.57 + max(0.0, gap) * 2.4) * (0.82 + profile_confidence * 0.18))
-    return {
-        "mode": "orchestrator",
-        "policy": policy,
-        "prompt": analysis["prompt"],
-        "task_kind": analysis["task_kind"],
-        "executor": executor,
-        "planner": planner,
-        "reviewer": reviewer,
-        "strategy": strategy,
-        "complexity": complexity,
-        "confidence": round(confidence, 3),
-        "signals": signals,
-        "execution_scope": coordinator_execution_scope(
-            analysis["task_kind"],
-            signals,
-            analysis.get("action_contract") if isinstance(analysis.get("action_contract"), dict) else None,
-            analysis.get("routing_control") if isinstance(analysis.get("routing_control"), dict) else None,
-        ),
-        "evidence": analysis["evidence"],
-        "semantic_assessment": analysis.get("semantic_assessment") or {},
-        "routing_control": analysis.get("routing_control") or {},
-        "action_contract": analysis.get("action_contract") or action_contract,
-        "preference_role": _coordinator_task_role(signals),
-        "preferred_model": _coordinator_role_preference(config, _coordinator_task_role(signals), models),
-        "candidates": [
-            {
-                "model": item["model"],
-                "score": round(item["score"], 3),
-                "resident": item["resident"],
-                "preferred": item.get("preferred", False),
-                "confidence": round(float(item.get("confidence") or 0.5), 3),
-                "profile_source": item.get("profile_source") or "inferred",
-                "learned_adjustment": round(float(item.get("learned_adjustment") or 0), 4),
-                "learning_evidence": round(float(item.get("learning_evidence") or 0), 2),
-                "learning_role_evidence": round(float(item.get("learning_role_evidence") or 0), 2),
-                "learning_kind_evidence": round(float(item.get("learning_kind_evidence") or 0), 2),
-                "learning_kind_weight": round(float(item.get("learning_kind_weight") or 0), 3),
-                "learning_guarded": bool(item.get("learning_guarded")),
-            }
-            for item in scored
-        ],
-        "continuity": continuity or {},
-        "delegations": [],
-        "created_at": now_iso(),
-    }
 
 
 def format_route_report(route: dict[str, Any] | None) -> str:
