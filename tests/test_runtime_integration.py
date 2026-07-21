@@ -3102,6 +3102,148 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("Recovered after malformed tool output", transcript)
                     self.assertNotIn("XML syntax error", transcript)
 
+    async def test_thinking_stream_is_shown_dim_when_think_is_enabled(self) -> None:
+        class ThinkingProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                sink = kwargs.get("thinking_sink")
+                if callable(sink):
+                    sink("Consider the edge cases first.")
+                yield "The answer is settled."
+
+        for think, expected in ((True, True), (False, False)):
+            with self.subTest(think=think), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / ".git").mkdir()
+                CORE.CONFIG_PATH = root / "config.json"
+                CORE.HISTORY_PATH = root / "history"
+                CORE.CHAT_DIR = root / "chats"
+                CORE.INDEX_DB_PATH = root / "index.sqlite3"
+                CORE.CHECKPOINT_DIR = root / "checkpoints"
+                CORE.APP_DATA_DIR = root
+                config = coordinator_config(semantic=False)
+                config.update(
+                    {
+                        "model_mode": "direct",
+                        "model": "qwen3.5:9b",
+                        "agent": True,
+                        "auto_compact": False,
+                        "think": think,
+                    }
+                )
+                provider = ThinkingProvider()
+                app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+                async with app.run_test(size=(80, 26)) as pilot:
+                    app.query_one("#composer", ui.Composer).load_text("Weigh the options")
+                    await pilot.press("enter")
+                    for _ in range(160):
+                        await pilot.pause(0.025)
+                        if not app.busy and provider.calls:
+                            break
+
+                    transcript = app.render_transcript_text()
+                    self.assertIn("The answer is settled.", transcript)
+                    self.assertEqual("Consider the edge cases first." in transcript, expected)
+                    sink = provider.calls[0]["kwargs"].get("thinking_sink")
+                    self.assertEqual(callable(sink), expected)
+                    # Thinking is transcript-only; provider history must never carry it.
+                    self.assertFalse(
+                        any("Consider the edge cases" in str(m.get("content") or "") for m in app.messages)
+                    )
+
+    async def test_long_action_results_collapse_but_stay_in_transcript_text(self) -> None:
+        class ReadThenAnswerProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.round = 0
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                self.round += 1
+                sink = kwargs.get("tool_call_sink")
+                if self.round == 1 and callable(sink):
+                    sink({"function": {"name": "read_file", "arguments": {"path": "big.py"}}})
+                    return
+                yield "Reviewed the module."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            body = "\n".join(f"VALUE_{index} = {index}" for index in range(1, 41))
+            (root / "big.py").write_text(body + "\n", encoding="ascii")
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update(
+                {
+                    "model_mode": "direct",
+                    "model": "qwen3.5:9b",
+                    "agent": True,
+                    "auto_compact": False,
+                    "permission_mode": "read-auto",
+                }
+            )
+            provider = ReadThenAnswerProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(80, 26)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text("Read big.py")
+                await pilot.press("enter")
+                for _ in range(200):
+                    await pilot.pause(0.025)
+                    if not app.busy and provider.round >= 2:
+                        break
+
+                collapsibles = list(app.query(ui.Collapsible))
+                self.assertTrue(collapsibles)
+                self.assertTrue(all(widget.collapsed for widget in collapsibles))
+                # Full result fidelity is preserved for copy/export and assertions,
+                # including the windowed read's continuation hint deep in the fold.
+                transcript = app.render_transcript_text()
+                self.assertIn("VALUE_25 = 25", transcript)
+                self.assertIn("continue with start_line=", transcript)
+
+    async def test_at_token_suggests_project_paths_in_the_composer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            (root / "auth_notes.md").write_text("tokens\n", encoding="ascii")
+            (root / "src").mkdir()
+            (root / "src" / "colors.py").write_text("PALETTE = []\n", encoding="ascii")
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"model_mode": "direct", "model": "qwen3.5:9b", "agent": True, "auto_compact": False})
+            app = ui.build_textual_app(CORE, CORE.DairackTui, FakeProvider(()), "test", config, root)
+
+            async with app.run_test(size=(80, 26)) as pilot:
+                composer = app.query_one("#composer", ui.Composer)
+                composer.load_text("read @auth")
+                await pilot.pause(0.05)
+                self.assertEqual(composer.suggestion, "_notes.md")
+
+                composer.load_text("open @src/col")
+                await pilot.pause(0.05)
+                self.assertEqual(composer.suggestion, "ors.py")
+
+                composer.load_text("/mo")
+                await pilot.pause(0.05)
+                self.assertTrue(composer.suggestion.startswith("de"))
+
     async def test_prompt_typed_while_busy_queues_and_sends_when_the_turn_ends(self) -> None:
         release = threading.Event()
 

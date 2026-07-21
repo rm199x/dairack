@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
+import re
 import shlex
 import subprocess
 import threading
@@ -20,7 +22,7 @@ from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, Input, Markdown, OptionList, Static, TextArea
+from textual.widgets import Button, Collapsible, Input, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from .. import __version__
@@ -86,6 +88,10 @@ WELCOME_TAGLINE_START = 0.40
 WELCOME_READY_START = 0.64
 PROGRESS_RESPONSE_SECONDS = 0.12
 STREAM_RENDER_INTERVAL = 0.04
+ACTION_COLLAPSE_LINES = 8
+PATH_SUGGESTION_CACHE_SECONDS = 30.0
+PATH_SUGGESTION_LIMIT = 4000
+PATH_SUGGESTION_TOKEN = re.compile(r"@([A-Za-z0-9_\-./]*)$")
 WELCOME_WORDMARK = "DAIRACK"
 WELCOME_GLYPHS = (
     ("├─╮", "│ │", "├─╯"),
@@ -317,8 +323,6 @@ def apply_modal_responsive_classes(screen: ModalScreen[Any]) -> None:
 def styled_line_with_urls(line: str, base_style: str = "") -> Text:
     result = Text(style=base_style)
     cursor = 0
-    import re
-
     for match in re.finditer(r"https?://[^\s)\]>]+", line):
         result.append(line[cursor : match.start()])
         url = match.group(0)
@@ -357,12 +361,20 @@ def system_renderable(source: str, severity: str = "info") -> Text:
     return rendered
 
 
-def action_renderable(source: str) -> Text:
+def split_action_result(source: str) -> tuple[str, str | None]:
+    """Split a long action display into its headline and a collapsible remainder."""
+    lines = source.splitlines()
+    if len(lines) <= ACTION_COLLAPSE_LINES:
+        return source, None
+    return lines[0], "\n".join(lines[1:])
+
+
+def action_renderable(source: str, headline: bool = True) -> Text:
     rendered = Text()
     lines = source.splitlines() or [""]
     labels = ("QUERY", "URL", "PATH", "TASK", "IMAGE", "CHANGE", "ACCESS", "REASON")
     for index, line in enumerate(lines):
-        if index == 0:
+        if index == 0 and headline:
             failed = any(
                 state in line for state in ("FAILED", "INTERRUPTED", "TIMED OUT", "DENIED", "BLOCKED", "NOT RUN")
             )
@@ -382,6 +394,10 @@ def action_renderable(source: str) -> Text:
         if index < len(lines) - 1:
             rendered.append("\n")
     return rendered
+
+
+def thinking_renderable(source: str) -> Text:
+    return Text(source, style=PALETTE["quiet"])
 
 
 def coordinator_renderable(source: str) -> Text:
@@ -492,7 +508,19 @@ class TranscriptEntry(Vertical):
         elif self.role == "diff":
             self._body = Static(diff_renderable(self.source_text), classes="entry-plain diff-content")
         elif self.role == "action":
-            self._body = Static(action_renderable(self.source_text), classes="entry-plain action-content")
+            headline, remainder = split_action_result(self.source_text)
+            self._action_remainder = remainder
+            self._body = Static(
+                action_renderable(headline if remainder is not None else self.source_text),
+                classes="entry-plain action-content",
+            )
+            self._remainder_body = (
+                Static(action_renderable(remainder, headline=False), classes="entry-plain action-content")
+                if remainder is not None
+                else None
+            )
+        elif self.role == "thinking":
+            self._body = Static(thinking_renderable(self.source_text), classes="entry-plain thinking-content")
         elif self.role == "coordinator":
             self._body = Static(
                 coordinator_renderable(self.source_text),
@@ -516,6 +544,7 @@ class TranscriptEntry(Vertical):
             "you": "YOU",
             "assistant": "DAIRACK",
             "action": "ACTION",
+            "thinking": "THINKING",
             "coordinator": "COORDINATOR",
             "system": "SYSTEM",
             "diff": "PATCH",
@@ -528,6 +557,21 @@ class TranscriptEntry(Vertical):
                 yield self._body
         else:
             yield self._body
+            remainder_body = getattr(self, "_remainder_body", None)
+            if remainder_body is not None:
+                lines = len((self._action_remainder or "").splitlines())
+                with Collapsible(title=f"result · {lines} lines", collapsed=True, classes="action-collapsible"):
+                    yield remainder_body
+
+    def _apply_action_text(self) -> None:
+        headline, remainder = split_action_result(self.source_text)
+        remainder_body = getattr(self, "_remainder_body", None)
+        if remainder is not None and remainder_body is not None:
+            self._action_remainder = remainder
+            self._body.update(action_renderable(headline))
+            remainder_body.update(action_renderable(remainder, headline=False))
+        else:
+            self._body.update(action_renderable(self.source_text))
 
     async def _apply_source_text(self) -> None:
         if isinstance(self._body, Markdown):
@@ -535,7 +579,9 @@ class TranscriptEntry(Vertical):
         elif self.role == "diff":
             self._body.update(diff_renderable(self.source_text))
         elif self.role == "action":
-            self._body.update(action_renderable(self.source_text))
+            self._apply_action_text()
+        elif self.role == "thinking":
+            self._body.update(thinking_renderable(self.source_text))
         elif self.role == "coordinator":
             self._body.update(coordinator_renderable(self.source_text))
         else:
@@ -550,7 +596,9 @@ class TranscriptEntry(Vertical):
         elif self.role == "diff":
             self._body.update(diff_renderable(value))
         elif self.role == "action":
-            self._body.update(action_renderable(value))
+            self._apply_action_text()
+        elif self.role == "thinking":
+            self._body.update(thinking_renderable(value))
         elif self.role == "coordinator":
             self._body.update(coordinator_renderable(value))
         else:
@@ -3041,9 +3089,51 @@ class DairackTextualBase(App[None]):
         matches = self._slash_command_matches(source)
         if matches and matches[0] != source.lower():
             suggestion = matches[0][len(source) :]
+        elif not source.startswith("/"):
+            token = PATH_SUGGESTION_TOKEN.search(event.text_area.text)
+            if token:
+                suggestion = self._path_suggestion(token.group(1))
         event.text_area.suggestion = suggestion
         self._resize_composer()
         self.refresh_chrome(force=True)
+
+    def _project_path_candidates(self) -> list[str]:
+        now = time.monotonic()
+        root = self.core.project_scope_for_chat(self.chat, self.cwd)
+        cached = getattr(self, "_path_suggestion_cache", None)
+        if cached and cached[0] == str(root) and now - cached[1] < PATH_SUGGESTION_CACHE_SECONDS:
+            return cached[2]
+        excluded = {".git", ".venv", "venv", "node_modules", "__pycache__", ".cache"}
+        paths: list[str] = []
+        for base, directories, files in os.walk(root):
+            directories[:] = [name for name in directories if name not in excluded]
+            for name in files:
+                try:
+                    paths.append(str((Path(base) / name).relative_to(root)))
+                except ValueError:
+                    continue
+                if len(paths) >= PATH_SUGGESTION_LIMIT:
+                    break
+            if len(paths) >= PATH_SUGGESTION_LIMIT:
+                break
+        paths.sort(key=lambda path: (len(path), path.lower()))
+        self._path_suggestion_cache = (str(root), now, paths)
+        return paths
+
+    def _path_suggestion(self, fragment: str) -> str:
+        if not fragment:
+            return ""
+        lowered = fragment.lower()
+        candidates = self._project_path_candidates()
+        for path in candidates:
+            if path.lower().startswith(lowered):
+                return path[len(fragment) :]
+        if "/" not in fragment:
+            for path in candidates:
+                name = path.rsplit("/", 1)[-1]
+                if name.lower().startswith(lowered):
+                    return name[len(fragment) :]
+        return ""
 
     def _resize_composer(self) -> None:
         if not self._ui_ready:
@@ -5024,12 +5114,14 @@ class DairackTextualBase(App[None]):
                         request_messages,
                         runtime,
                         native_tools,
+                        finalizing=finalizing,
                     )
                 except self.core.RequestContextError:
                     request_messages, native_tools = self.core.fit_agent_request_context_messages(
                         build_request(include_retrieval=False),
                         runtime,
                         native_tools,
+                        finalizing=finalizing,
                     )
                     route["context_degraded"] = "project retrieval omitted to fit the context window"
                 self.set_busy(
@@ -5039,13 +5131,15 @@ class DairackTextualBase(App[None]):
                 execution_started = time.monotonic()
                 stream_retry_used = False
                 response_allowance = self.core.executor_response_allowance(request_messages, native_tools, runtime)
+                think_enabled = bool(runtime.get("think"))
+                thinking_parts: list[str] = []
                 generation_error: Exception | None = None
                 while True:
                     try:
                         for chunk in self.provider.chat_stream(
                             executor,
                             request_messages,
-                            think=bool(runtime.get("think")),
+                            think=think_enabled,
                             num_ctx=int(runtime.get("num_ctx") or 4096),
                             num_predict=response_allowance,
                             keep_alive=self.core.executor_keep_alive(runtime),
@@ -5053,6 +5147,7 @@ class DairackTextualBase(App[None]):
                             extra_options=self.core.ollama_options(runtime),
                             tools=native_tools or None,
                             tool_call_sink=native_calls.append,
+                            thinking_sink=thinking_parts.append if think_enabled else None,
                         ):
                             if self.cancel_event.is_set():
                                 break
@@ -5074,9 +5169,17 @@ class DairackTextualBase(App[None]):
                         stream_retry_used = True
                         assistant_text = ""
                         native_calls.clear()
+                        thinking_parts.clear()
                         first_chunk = True
                         self.replace_last_assistant_text("")
                         self.set_busy(True, f"reconnecting / {executor}")
+                if thinking_parts and not self.cancel_event.is_set():
+                    collected = "".join(thinking_parts).strip()
+                    if collected:
+                        shown = collected[-1200:]
+                        if len(collected) > len(shown):
+                            shown = "…" + shown
+                        self.append_block("thinking", shown)
                 if generation_error is not None:
                     replacement = (
                         self.core.coordinator_recovery_executor(route, executor)

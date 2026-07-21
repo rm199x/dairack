@@ -381,6 +381,7 @@ class OllamaProvider:
         keep_alive: str | int | None = None,
         tools: Iterable[Mapping[str, Any]] | None = None,
         tool_call_sink: Callable[[dict[str, Any]], None] | None = None,
+        thinking_sink: Callable[[str], None] | None = None,
     ) -> Iterator[str]:
         self.current_model = model
         self.last_stats = {}
@@ -429,6 +430,8 @@ class OllamaProvider:
                     self.stream_phase = "thinking"
                     thinking_chars += len(thinking)
                     self.current_stats["thinking_chars"] = thinking_chars
+                    if thinking_sink:
+                        thinking_sink(thinking)
                 if content:
                     self.stream_phase = "responding"
                     if not first_token_at:

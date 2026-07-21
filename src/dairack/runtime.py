@@ -6589,6 +6589,7 @@ class DairackTui:
                         request_messages,
                         runtime,
                         native_tools,
+                        finalizing=finalizing,
                     )
                 except RequestContextError:
                     reduced = request_context_messages(
@@ -6602,6 +6603,7 @@ class DairackTui:
                         canonicalize_messages(reduced, directives),
                         runtime,
                         native_tools,
+                        finalizing=finalizing,
                     )
                     route["context_degraded"] = "project retrieval omitted to fit the context window"
                 if finalizing:
@@ -8464,12 +8466,12 @@ def chat_turn(
         selected = request_context_messages(messages, chat, runtime, cwd, provider=provider)
         try:
             return fit_agent_request_context_messages(
-                canonicalize_messages(selected, directives), runtime, request_tools
+                canonicalize_messages(selected, directives), runtime, request_tools, finalizing=finalizing
             )
         except RequestContextError:
             reduced = request_context_messages(messages, chat, runtime, cwd, include_retrieval=False)
             fitted = fit_agent_request_context_messages(
-                canonicalize_messages(reduced, directives), runtime, request_tools
+                canonicalize_messages(reduced, directives), runtime, request_tools, finalizing=finalizing
             )
             route["context_degraded"] = "project retrieval omitted to fit the context window"
             return fitted

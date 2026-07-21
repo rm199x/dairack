@@ -41,4 +41,5 @@ class ModelProvider(Protocol):
         keep_alive: str | int | None = None,
         tools: Iterable[Mapping[str, Any]] | None = None,
         tool_call_sink: Callable[[dict[str, Any]], None] | None = None,
+        thinking_sink: Callable[[str], None] | None = None,
     ) -> Iterator[str]: ...
