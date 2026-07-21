@@ -157,7 +157,8 @@ your saved configuration.
 - <kbd>F4</kbd> or `/image` stages up to four supported images for a vision-capable model.
 - Agent actions show their target, permission, result, exit status, and elapsed time.
 - Code edits show additions and removals, run a dry check, and create a checkpoint before application.
-- <kbd>Esc</kbd> closes dialogs and interrupts work when the active operation supports cancellation.
+- <kbd>Esc</kbd> or <kbd>Ctrl</kbd>+<kbd>C</kbd> closes dialogs and interrupts work when the active operation supports
+  cancellation. Prompts typed while a response is running queue and send when it completes.
 
 The interface adapts to compact terminals and settles into a static ready state after startup. Set
 `DAIRACK_REDUCED_MOTION=1` when all non-essential movement should remain disabled.

@@ -58,7 +58,7 @@ change.
 | `bridge.py` | Authenticated inference-only Ollama proxy and verified server hardware metadata |
 | `coordinator/policy.py` | Named quality/cost policy controls |
 | `coordinator/tuning.py` | Small validated baseline tuning vector |
-| `coordinator/calibration.py` | Bounded per-machine model/role outcome residuals |
+| `coordinator/calibration.py` | Bounded model/role outcome residuals, refined per task kind with evidence backoff |
 | `ui/textual_app.py` | Textual presentation and interaction layer |
 | `turn.py` | Frontend-agnostic turn decision ladder (repair, completion, review, finalization) as pure functions |
 | `runtime.py` | Compatibility application core pending further domain extraction |
@@ -105,7 +105,10 @@ connection retries once silently, and an over-budget request omits project retri
 ladder that chooses each turn's next action lives in one frontend-agnostic core (`turn.py`) that every interface
 drives, so the Textual, fallback-terminal, and plain-CLI paths cannot diverge. Under `read-auto`, a response that
 returns several independently auto-approvable in-scope reads runs them together in one turn; the batch is gated so it
-can never execute anything that would not auto-run on its own.
+can never execute anything that would not auto-run on its own. A ripgrep-backed `grep` tool gives the agent live
+content search under the same scope and auto-approval rules as other reads. Prompts submitted while a turn is active
+are queued and dispatched when it ends; an interrupted turn returns queued input to the composer instead of sending
+it.
 
 Natural-language compute controls are a closed, schema-validated contract separate from task intent. They are
 confidence-gated, apply to one turn only, and cannot create action authority. A request for higher capacity must pass a

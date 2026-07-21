@@ -49,9 +49,20 @@ semantic versioning after 1.0.
 - Batched execution of multiple auto-approvable project reads returned in one response under `read-auto`, so
   independent lookups run in a single turn instead of failing the one-action check; each call still passes the same
   loop-guard, action-budget, and scope enforcement, and any non-read member disqualifies the whole batch.
+- Agent-invocable `grep` content search backed by ripgrep with a pure-Python fallback, scoped and auto-approvable
+  under `read-auto` exactly like other project reads, and eligible for batched execution.
+- Coordinator learning conditioned on the classified task kind: a bounded kind-level record refines the model/role
+  record when it has real evidence and backs off to it when it does not, so one kind of failure no longer dilutes
+  routing for unrelated work on the same model.
+- Prompts typed while a response is active queue and send automatically when the turn completes; interrupting a turn
+  returns queued input to the composer. `Ctrl+C` now interrupts the active turn in both terminal interfaces instead
+  of being unbound or exiting mid-stream.
 
 ### Changed
 
+- Native tool requests no longer embed the prose tool catalog in the system prompt; the schemas are authoritative
+  there, keeping native function tools active within the default 4096-token context window. The compatibility text
+  protocol retains the catalog.
 - Renamed the product, package, command, state roots, and compute protocol to Dairack, with non-destructive migration
   of existing user state and narrow compatibility aliases for previous installations.
 - Coordinator routing reads generated model metadata instead of fixed model-name tables.
