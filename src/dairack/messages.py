@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 MAX_ATTACHED_IMAGES = 4
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 SYSTEM_PARTS_KEY = "_dairack_system_parts"
 
 TOOL_RESULT_PREFIXES = (
