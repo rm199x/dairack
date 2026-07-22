@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
@@ -9,7 +10,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
-from dairack.bridge import BridgeConfig, ComputeBridgeServer
+from dairack.bridge import BridgeConfig, ComputeBridgeHandler, ComputeBridgeServer
 from dairack.compute import ComputeError
 from dairack.hardware import GIB, Accelerator, HardwareProfile
 from dairack.providers.ollama import OllamaError, OllamaProvider
@@ -20,7 +21,6 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
     hits: list[tuple[str, str]] = []
     chat_delay = 0.0
     chat_status = 200
-    chat_disconnected = threading.Event()
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -69,7 +69,7 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     self.close_connection = True
                 except OSError:
-                    FakeOllamaHandler.chat_disconnected.set()
+                    pass
             else:
                 self._write(payload, "application/x-ndjson")
         elif self.path == "/api/show":
@@ -85,7 +85,6 @@ class BridgeTests(unittest.TestCase):
         FakeOllamaHandler.hits = []
         FakeOllamaHandler.chat_delay = 0.0
         FakeOllamaHandler.chat_status = 200
-        FakeOllamaHandler.chat_disconnected = threading.Event()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaHandler)
         self.upstream_thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
         self.upstream_thread.start()
@@ -188,6 +187,16 @@ class BridgeTests(unittest.TestCase):
 
     def test_departed_client_cancels_upstream_before_headers_arrive(self) -> None:
         FakeOllamaHandler.chat_delay = 0.35
+        upstream_interrupted = threading.Event()
+        interrupt_upstream = ComputeBridgeHandler._interrupt_upstream
+
+        def record_interrupt(
+            connection: http.client.HTTPConnection,
+            response: http.client.HTTPResponse | None = None,
+        ) -> None:
+            upstream_interrupted.set()
+            interrupt_upstream(connection, response)
+
         request = urllib.request.Request(
             self.endpoint + "/api/chat",
             data=json.dumps({"model": "slow", "stream": True}).encode(),
@@ -200,11 +209,12 @@ class BridgeTests(unittest.TestCase):
         with (
             patch("dairack.bridge.STREAM_HEARTBEAT_SECONDS", 0.04),
             patch("dairack.bridge.STREAM_CLIENT_POLL_SECONDS", 0.02),
+            patch.object(ComputeBridgeHandler, "_interrupt_upstream", staticmethod(record_interrupt)),
         ):
             response = urllib.request.urlopen(request, timeout=1)
             self.assertEqual(response.readline(), b"\n")
             response.close()
-            self.assertTrue(FakeOllamaHandler.chat_disconnected.wait(1))
+            self.assertTrue(upstream_interrupted.wait(1))
 
     def test_fast_stream_error_retains_upstream_http_status(self) -> None:
         FakeOllamaHandler.chat_status = 404
