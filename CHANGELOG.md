@@ -101,6 +101,10 @@ semantic versioning after 1.0.
 
 ### Changed
 
+- Whole-file audits now recognize explicit actions after a short greeting, preserve complete long extensions such as
+  `.cpp`, `.hpp`, and `.tsx`, and reconcile Windows and POSIX path spellings in the persistent read ledger. Once a
+  bounded read has started, the ledger advances repeated model calls to the earliest unread line even if an older
+  saved route lacks its action contract.
 - Native action turns use a bounded generation allowance instead of the entire context residual, preventing a
   malformed tool call from consuming minutes of hybrid local inference. Final synthesis still receives the full safe
   residual.

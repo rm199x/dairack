@@ -88,7 +88,7 @@ DIRECT_RESPONSE_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 LOCAL_ACTION_REQUEST_PATTERN = re.compile(
-    r"(?:^\s*|[.;!?]\s+|\b(?:please|then|also|and\s+then)\s+)"
+    r"(?:^\s*|[,.:;!?]\s+|\b(?:please|then|also|and\s+then)\s+)"
     r"(?:please\s+)?"
     r"(?:(?:can|could|would|will)\s+(?:you|u)\s+|"
     r"(?:i(?:'d|\s+would)?\s+like|i\s+need)\s+(?:you|u)\s+to\s+)?"
@@ -125,7 +125,8 @@ LOCAL_ROOT_RESOURCE_PATTERN = re.compile(
 )
 LOCAL_FILE_TARGET_PATTERN = re.compile(
     r"(?P<target>(?:[a-z]:)?(?:\.{0,2}[/\\])?[a-z0-9_.-]+(?:[/\\][a-z0-9_. -]+)*\."
-    r"(?:py|js|ts|tsx|jsx|rs|go|java|c|cc|cpp|h|hpp|sh|ps1|md|txt|json|ya?ml|toml|ini|log))",
+    r"(?:tsx|jsx|cpp|hpp|json|yaml|toml|java|ps1|txt|yml|ini|log|md|sh|js|ts|rs|go|cc|py|c|h)"
+    r"(?![a-z0-9_.-]))",
     re.IGNORECASE,
 )
 RESOURCE_REQUIRED_ACTIONS = frozenset(

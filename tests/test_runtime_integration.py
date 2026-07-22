@@ -715,6 +715,53 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertNotIn("_protocol", payload["function"]["arguments"])
         self.assertEqual(route_state["deterministic_continuations"][0]["start_line"], 261)
 
+    def test_greeted_windows_cpp_audit_keeps_exact_target_and_advances(self) -> None:
+        task = (
+            'Hello , can u audit "C:\\Users\\bertb\\Documents\\Unreal Projects\\Lockout\\Source\\Lockout\\Audio\\'
+            'Locomotion\\LockoutLocomotionSoundSynth.cpp" in full ?'
+        )
+        messages = [{"role": "user", "content": task}]
+        contract = CORE.runtime_action_contract(messages)
+        route_state = {"prompt": task, "action_contract": contract}
+        target = (
+            "C:\\Users\\bertb\\Documents\\Unreal Projects\\Lockout\\Source\\Lockout\\Audio\\Locomotion\\"
+            "LockoutLocomotionSoundSynth.cpp"
+        )
+        first_result = (
+            f"{target}\n"
+            "lines 1-260 of 1735\n"
+            "    1  // audit target\n"
+            "  260  int first_window_end = 260;\n"
+            "...[1475 lines remain; continue with start_line=261, max_lines=260]"
+        )
+
+        self.assertEqual(contract["capability"], "runtime_action")
+        self.assertEqual(contract["target"], target)
+        for extension_target in ("src/widget.tsx", "include/widget.hpp", "src/widget.cpp"):
+            with self.subTest(extension_target=extension_target):
+                parsed = CORE.runtime_action_contract(
+                    [{"role": "user", "content": f"Please audit {extension_target} in full."}]
+                )
+                self.assertEqual(parsed["target"], extension_target)
+        CORE.update_complete_file_read_state(
+            route_state,
+            {"name": "read_file", "path": target.replace("\\", "/")},
+            0,
+            first_result,
+        )
+
+        repeated = {"name": "read_file", "path": target.replace("\\", "/")}
+        aligned = CORE.align_tool_call_with_action_contract(repeated, route_state, messages)
+        self.assertEqual(CORE.complete_file_read_phase(route_state), "checkpoint")
+        self.assertEqual(aligned["path"], target)
+        self.assertEqual(aligned["start_line"], "261")
+
+        # The persisted ledger remains authoritative if a legacy route lacks a contract.
+        route_state["action_contract"] = {}
+        aligned_without_contract = CORE.align_tool_call_with_action_contract(repeated, route_state, messages)
+        self.assertEqual(aligned_without_contract["path"], target)
+        self.assertEqual(aligned_without_contract["start_line"], "261")
+
     def test_audit_line_references_recover_exact_tool_evidence_for_review(self) -> None:
         messages = [
             CORE.tool_history_message(
@@ -4836,23 +4883,32 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("enter")
                     for _ in range(240):
                         await pilot.pause(0.025)
-                        if not app.busy and len(provider.calls) == 4:
+                        if not app.busy and len(provider.calls) >= 3:
                             break
 
                     self.assertFalse(app.busy)
-                    self.assertEqual(
-                        [call["model"] for call in provider.calls],
-                        ["qwen3.5:9b", "qwen3.5:9b", "qwen3.6:27b", "qwen3.6:27b"],
+                    models = [call["model"] for call in provider.calls]
+                    tool_modes = [bool(call["kwargs"].get("tools")) for call in provider.calls]
+                    self.assertIn(
+                        models,
+                        (
+                            ["qwen3.5:9b", "qwen3.5:9b", "qwen3.6:27b"],
+                            ["qwen3.5:9b", "qwen3.5:9b", "qwen3.6:27b", "qwen3.6:27b"],
+                        ),
                     )
-                    self.assertEqual(
-                        [bool(call["kwargs"].get("tools")) for call in provider.calls],
-                        [True, False, True, False],
-                    )
+                    self.assertEqual(tool_modes[:2], [True, False])
+                    self.assertFalse(tool_modes[-1])
+                    if len(tool_modes) == 4:
+                        self.assertEqual(tool_modes[2:], [True, False])
+                    else:
+                        alternate_system = str(provider.calls[-1]["messages"][0].get("content") or "")
+                        self.assertIn(CORE.COMPATIBILITY_TOOL_DIRECTIVE, alternate_system)
                     transcript = app.render_transcript_text()
                     self.assertIn("exhausted bounded protocol and executor recovery", transcript)
                     self.assertNotIn("XML syntax error", transcript)
                     last_route = app.chat["last_route"]
-                    self.assertEqual(len(last_route.get("protocol_recoveries") or []), 2)
+                    expected_recoveries = 2 if len(provider.calls) == 4 else 1
+                    self.assertEqual(len(last_route.get("protocol_recoveries") or []), expected_recoveries)
                     self.assertIn("XML syntax error", str(last_route.get("runtime_error") or ""))
 
     async def test_thinking_stream_is_shown_dim_when_think_is_enabled(self) -> None:

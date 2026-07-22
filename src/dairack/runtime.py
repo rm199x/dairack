@@ -1739,6 +1739,12 @@ def _merge_line_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def _portable_path_name(value: str) -> str:
+    """Return a basename consistently for POSIX and Windows path spellings."""
+    normalized = str(value or "").strip().strip("\"'").rstrip("/\\")
+    return re.split(r"[/\\]+", normalized)[-1].casefold() if normalized else ""
+
+
 def complete_file_read_progress(
     task: str,
     messages: list[dict[str, Any]],
@@ -1748,14 +1754,14 @@ def complete_file_read_progress(
     """Return exact consecutive coverage for an explicit whole-file read task."""
     if not requires_complete_file_coverage(task):
         return None
-    target_name = Path(target).name.casefold() if target else ""
+    target_name = _portable_path_name(target)
     ranges: list[tuple[int, int]] = []
     total = 0
     result_path = target
     task_digest = hashlib.sha256(task.strip().encode("utf-8")).hexdigest()[:16]
     if isinstance(saved_state, dict) and saved_state.get("task_digest") == task_digest:
         saved_path = str(saved_state.get("path") or "")
-        if not target_name or Path(saved_path).name.casefold() == target_name:
+        if not target_name or _portable_path_name(saved_path) == target_name:
             try:
                 saved_total = int(saved_state.get("total") or 0)
             except (TypeError, ValueError):
@@ -1774,7 +1780,7 @@ def complete_file_read_progress(
                     result_path = saved_path or target
                     total = saved_total
                     if saved_path and not target_name:
-                        target_name = Path(saved_path).name.casefold()
+                        target_name = _portable_path_name(saved_path)
     for message in messages:
         content = str(message.get("content") or "")
         if message.get("role") != "tool" and not content.startswith(TOOL_RESULT_PREFIXES):
@@ -1783,7 +1789,7 @@ def complete_file_read_progress(
         if not window:
             continue
         path, start, end, result_total, _numbered = window
-        if target_name and Path(path).name.casefold() != target_name:
+        if target_name and _portable_path_name(path) != target_name:
             continue
         result_path = path
         ranges.append((start, end))
@@ -1824,7 +1830,7 @@ def update_complete_file_read_state(
     path, start, end, total, numbered = window
     contract = route.get("action_contract")
     target = str(contract.get("target") or "") if isinstance(contract, dict) else ""
-    if target and Path(path).name.casefold() != Path(target).name.casefold():
+    if target and _portable_path_name(path) != _portable_path_name(target):
         return
     task_digest = hashlib.sha256(task.strip().encode("utf-8")).hexdigest()[:16]
     previous = route.get("read_progress")
@@ -4388,9 +4394,8 @@ def align_tool_call_with_action_contract(
     if not call or not isinstance(route, dict):
         return call
     contract = route.get("action_contract")
-    if not isinstance(contract, dict) or contract.get("capability") != "runtime_action":
-        return call
-    target = str(contract.get("target") or "").strip()
+    runtime_contract = isinstance(contract, dict) and contract.get("capability") == "runtime_action"
+    target = str(contract.get("target") or "").strip() if runtime_contract else ""
     name = str(call.get("name") or "")
     path = str(call.get("path") or "").strip()
     if name not in {"read_file", "edit_file", "grep"} or not path:
@@ -4416,10 +4421,10 @@ def align_tool_call_with_action_contract(
             }
         )
 
-    if target and Path(path).name.casefold() == Path(target).name.casefold():
+    if target and _portable_path_name(path) == _portable_path_name(target):
         correct("path", target, "aligned with exact user-supplied target")
 
-    task = latest_user_task(messages or [])
+    task = str(route.get("prompt") or "").strip() or latest_user_task(messages or [])
     if name != "read_file" or not requires_complete_file_coverage(task):
         return aligned
 
@@ -4433,6 +4438,8 @@ def align_tool_call_with_action_contract(
     )
     total = int(progress["total"]) if progress else 0
     cursor = int(progress["next_line"]) if progress else 1
+    if not target and progress and _portable_path_name(current_path) == _portable_path_name(str(progress["path"])):
+        correct("path", str(progress["path"]), "continued the runtime-managed whole-file read")
     if not total or cursor <= total:
         correct("start_line", str(cursor), "continued from the earliest unread returned line")
         aligned.pop("line", None)
