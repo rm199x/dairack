@@ -80,7 +80,74 @@ COORDINATOR_FAST_FACT_PATTERN = re.compile(
     r"^how\s+(?:many|much|old|far|long)\b"
 )
 COORDINATOR_JUDGMENT_PATTERN = re.compile(
-    r"\b(?:best|better|should|recommend|compare|versus|vs\.?|trade-?offs?|evaluate|analy[sz]e|design|diagnose)\b"
+    r"\b(?:best|better|should|recommend|compare|versus|vs\.?|trade-?offs?|audit|review|assess|"
+    r"evaluate|analy[sz]e|design|diagnose)\b"
+)
+SOURCE_CODE_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".cxx",
+        ".dart",
+        ".ex",
+        ".exs",
+        ".fs",
+        ".fsx",
+        ".go",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".hxx",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".kts",
+        ".lua",
+        ".m",
+        ".mm",
+        ".php",
+        ".py",
+        ".r",
+        ".rb",
+        ".rs",
+        ".scala",
+        ".sh",
+        ".sql",
+        ".svelte",
+        ".swift",
+        ".ts",
+        ".tsx",
+        ".vue",
+    }
+)
+LOCAL_FILE_SUFFIXES = SOURCE_CODE_SUFFIXES | frozenset(
+    {
+        ".css",
+        ".csv",
+        ".html",
+        ".ini",
+        ".json",
+        ".lock",
+        ".log",
+        ".md",
+        ".ps1",
+        ".toml",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
+LOCAL_FILE_SUFFIX_PATTERN = "|".join(
+    re.escape(suffix.removeprefix(".")) for suffix in sorted(LOCAL_FILE_SUFFIXES, key=len, reverse=True)
+)
+WEB_NON_DOMAIN_SUFFIXES.update(suffix.removeprefix(".") for suffix in LOCAL_FILE_SUFFIXES)
+SOURCE_EVALUATION_PATTERN = re.compile(
+    r"\b(?:audit|review|inspect|analy[sz]e|assess|evaluate|diagnose)\b",
+    re.IGNORECASE,
 )
 DIRECT_RESPONSE_PATTERN = re.compile(
     r"^\s*(?:please\s+)?(?:reply|respond|answer|say)\b"
@@ -88,11 +155,14 @@ DIRECT_RESPONSE_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 LOCAL_ACTION_REQUEST_PATTERN = re.compile(
-    r"(?:^\s*|[,.:;!?]\s+|\b(?:please|then|also|and\s+then)\s+)"
+    r"(?:^\s*|[.:;!?]\s+|"
+    r",\s+(?=(?:please\s+|(?:can|could|would|will)\s+(?:you|u)\s+|"
+    r"(?:i(?:'d|\s+would)?\s+like|i\s+need)\s+(?:you|u)\s+to\s+))|"
+    r"\b(?:please|then|also|and\s+then)\s+)"
     r"(?:please\s+)?"
     r"(?:(?:can|could|would|will)\s+(?:you|u)\s+|"
     r"(?:i(?:'d|\s+would)?\s+like|i\s+need)\s+(?:you|u)\s+to\s+)?"
-    r"(?P<verb>run|execute|build|edit|modify|change|fix|implement|create|write|apply|delete|remove|"
+    r"(?P<verb>run|execute|build|edit|modify|change|fix|implement|create|make|generate|save|write|apply|delete|remove|"
     r"rename|move|install|configure|deploy|commit|test|read|inspect|open|list|find|search|grep|review|audit|check)\b",
     re.IGNORECASE,
 )
@@ -109,14 +179,15 @@ LOCAL_RESOURCE_QUERY_PATTERN = re.compile(
 )
 LOCAL_TOOL_USE_PATTERN = re.compile(
     r"^\s*(?:please\s+)?use\s+(?:the\s+)?(?:available\s+)?"
-    r"(?P<tool>read_file|list_dir|find_paths|grep|hardware_status|search_project|index_project|shell|patch|tools?)\b",
+    r"(?P<tool>read_file|write_file|edit_file|list_dir|find_paths|grep|hardware_status|search_project|"
+    r"index_project|shell|patch|tools?)\b",
     re.IGNORECASE,
 )
 LOCAL_RESOURCE_PATTERN = re.compile(
     r"\b(?:file|folder|directory|project|repository|repo|codebase|source|tests?|suite|path|diff|logs?|"
     r"script|command|app|application|program|bug|workspace|read_file|list_dir|find_paths|search_project)\b|"
     r"(?:^|[\s`'\"])(?:\.{0,2}[/\\]|[a-z]:[/\\])|"
-    r"\b[\w.-]+\.(?:py|js|ts|tsx|jsx|rs|go|java|c|cc|cpp|h|hpp|sh|ps1|md|txt|json|ya?ml|toml|ini|log)\b",
+    rf"\b[\w.-]+\.(?:{LOCAL_FILE_SUFFIX_PATTERN})\b",
     re.IGNORECASE,
 )
 LOCAL_ROOT_RESOURCE_PATTERN = re.compile(
@@ -125,7 +196,7 @@ LOCAL_ROOT_RESOURCE_PATTERN = re.compile(
 )
 LOCAL_FILE_TARGET_PATTERN = re.compile(
     r"(?P<target>(?:[a-z]:)?(?:\.{0,2}[/\\])?[a-z0-9_.-]+(?:[/\\][a-z0-9_. -]+)*\."
-    r"(?:tsx|jsx|cpp|hpp|json|yaml|toml|java|ps1|txt|yml|ini|log|md|sh|js|ts|rs|go|cc|py|c|h)"
+    rf"(?:{LOCAL_FILE_SUFFIX_PATTERN})"
     r"(?![a-z0-9_.-]))",
     re.IGNORECASE,
 )
@@ -133,6 +204,9 @@ RESOURCE_REQUIRED_ACTIONS = frozenset(
     {
         "build",
         "create",
+        "make",
+        "generate",
+        "save",
         "implement",
         "write",
         "test",
@@ -147,6 +221,10 @@ RESOURCE_REQUIRED_ACTIONS = frozenset(
         "audit",
         "check",
     }
+)
+FILE_CREATION_OBJECT_PATTERN = re.compile(
+    r"\b(?:file|script|document|note|web\s*page|html\s*page|stylesheet)\b",
+    re.IGNORECASE,
 )
 
 
@@ -344,10 +422,18 @@ def runtime_action_contract(messages: list[dict[str, Any]]) -> dict[str, str]:
     if verb in RESOURCE_REQUIRED_ACTIONS and not has_local_resource:
         return {}
     target_match = LOCAL_FILE_TARGET_PATTERN.search(resource_context)
+    target = str(target_match.group("target") or "") if target_match else ""
+    creation_verb = verb in {"create", "make", "generate", "save", "write"}
+    modifying_existing = bool(re.search(r"\b(?:change|changes|edit|modify|update|append)\b", resource_context, re.I))
+    creates_text_file = bool(
+        creation_verb
+        and not modifying_existing
+        and (FILE_CREATION_OBJECT_PATTERN.search(resource_context) or (target and verb != "write"))
+    )
     return {
         "capability": "runtime_action",
-        "preferred_tool": "auto",
-        "target": str(target_match.group("target") or "") if target_match else "",
+        "preferred_tool": "write_file" if creates_text_file else "auto",
+        "target": target,
         "reason": "explicit local runtime action",
     }
 
@@ -411,6 +497,11 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
     action_contract = runtime_action_contract(messages)
     text = prompt.lower()
     direct_response = is_direct_response_request(prompt)
+    file_target_match = LOCAL_FILE_TARGET_PATTERN.search(prompt)
+    file_target = str(file_target_match.group("target") or "") if file_target_match else ""
+    portable_target = file_target.replace("\\", "/")
+    source_suffix = Path(portable_target).suffix.lower() if portable_target else ""
+    source_evaluation = bool(source_suffix in SOURCE_CODE_SUFFIXES and SOURCE_EVALUATION_PATTERN.search(prompt))
     code_hits = signal_hits(
         text,
         (
@@ -448,6 +539,8 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
             "```",
         ),
     )
+    if source_suffix in SOURCE_CODE_SUFFIXES and source_suffix not in code_hits:
+        code_hits.append(source_suffix)
     agent_hits = signal_hits(
         text,
         (
@@ -512,6 +605,9 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
             "signal processing",
             "dsp",
             "coherence",
+            "audit",
+            "review",
+            "assess",
         ),
     )
     research_hits = signal_hits(
@@ -561,11 +657,19 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
     reasoning = min(1.0, 0.27 + 0.14 * (len(reasoning_hits) - 1)) if reasoning_hits else 0.0
     research = min(1.0, 0.22 + 0.18 * (len(research_hits) - 1)) if research_hits else 0.0
     risk = min(1.0, 0.20 + 0.16 * (len(risk_hits) - 1)) if risk_hits else 0.0
+    if source_suffix in SOURCE_CODE_SUFFIXES:
+        code = max(code, 0.48)
+    if source_evaluation:
+        code = max(code, 0.56)
+        reasoning = max(reasoning, 0.42)
     if action_contract:
         agent = max(agent, 0.48)
         if action_contract.get("capability") == "public_web":
             research = max(research, 0.72)
     vision = 1.0 if image_paths else 0.0
+    in_git_repository = bool(cwd is not None and (cwd / ".git").exists() and (code >= 0.35 or agent >= 0.35))
+    if in_git_repository:
+        code = min(1.0, code + 0.08)
     simple = 0.92 if word_count <= 24 else 0.72 if word_count <= 55 else 0.38 if word_count <= 120 else 0.12
     task_difficulty = max(code, agent, reasoning, research, risk, vision * 0.35)
     simple *= max(0.20, 1.0 - 0.52 * task_difficulty)
@@ -605,8 +709,7 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
             evidence.append("explicit local runtime action")
     if image_paths:
         evidence.insert(0, f"vision input: {len(image_paths)} image{'s' if len(image_paths) != 1 else ''}")
-    if cwd is not None and (cwd / ".git").exists() and (code >= 0.35 or agent >= 0.35):
-        code = min(1.0, code + 0.08)
+    if in_git_repository:
         evidence.append("active Git repository")
 
     signals = {

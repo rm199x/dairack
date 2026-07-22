@@ -109,7 +109,9 @@ def stage_model(
     signals: dict[str, float],
     supports_vision: Callable[[Any, str], bool],
     preferred_model: str = "",
+    task_complexity: float = 0.0,
 ) -> str:
+    complexity = max(0.0, min(1.0, float(task_complexity)))
     has_resident = any(bool(candidate.get("resident")) for candidate in candidates)
     best_name = executor
     best_score = -1.0
@@ -143,17 +145,36 @@ def stage_model(
                 + sum(capabilities[key] * weight for key, weight in weights.items() if key != "route")
             ) / sum(weights.values())
         efficiency_mix = {"efficient": 0.32, "adaptive": 0.16, "quality": 0.03}[policy]
+        if purpose == "reviewer":
+            efficiency_mix *= max(0.18, 1.0 - complexity * 0.88)
         score = capability_score * (1.0 - efficiency_mix) + capabilities["efficiency"] * efficiency_mix
         same_executor = candidate["model"].lower() == executor.lower()
         if candidate.get("resident"):
-            score += {"efficient": 0.11, "adaptive": 0.07, "quality": 0.015}[policy]
+            residency = {"efficient": 0.11, "adaptive": 0.07, "quality": 0.015}[policy]
+            if purpose == "reviewer":
+                residency *= (
+                    1.0
+                    if policy == "efficient"
+                    else max(0.0, 1.0 - complexity * 1.60)
+                    if policy == "adaptive"
+                    else max(0.0, 1.0 - complexity * 1.25)
+                )
+            score += residency
         if same_executor:
             if purpose == "planner":
                 score += 0.08 if policy == "adaptive" and not has_resident else 0.015
             elif purpose == "reviewer":
-                score += {"efficient": 0.07, "adaptive": 0.04, "quality": 0.005}[policy]
+                score += {
+                    "efficient": 0.07,
+                    "adaptive": 0.035 * max(0.0, 1.0 - complexity),
+                    "quality": 0.005,
+                }[policy]
         elif purpose == "reviewer":
-            score += {"efficient": 0.0, "adaptive": 0.025, "quality": 0.055}[policy]
+            score += {
+                "efficient": 0.0,
+                "adaptive": 0.025 + complexity * 0.035,
+                "quality": 0.055,
+            }[policy]
         elif purpose == "planner":
             score += 0.005
         if preferred_model and candidate["model"].lower() == preferred_model.lower():

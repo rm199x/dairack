@@ -457,6 +457,33 @@ class CoordinatorRoutingTests(unittest.TestCase):
 
         self.assertFalse(decision.get("action_contract"))
 
+    def test_comma_delimited_prose_does_not_become_an_action_request(self) -> None:
+        statement = "In regulated systems, audit logs are useful for accountability."
+
+        self.assertEqual(CORE.runtime_action_contract([{"role": "user", "content": statement}]), {})
+
+        requested = CORE.runtime_action_contract([{"role": "user", "content": "Hello, can you audit src/engine.cpp?"}])
+        self.assertEqual(requested["capability"], "runtime_action")
+        self.assertEqual(requested["target"], "src/engine.cpp")
+
+    def test_text_file_creation_prefers_the_structured_write_tool(self) -> None:
+        prompts = (
+            "Can u write a quick text file on my desktop with a funny message?",
+            "Make a small html script on my desktop now?",
+            "Create C:\\Users\\bertb\\Desktop\\welcome.html",
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                contract = CORE.runtime_action_contract([{"role": "user", "content": prompt}])
+                self.assertEqual(contract["capability"], "runtime_action")
+                self.assertEqual(contract["preferred_tool"], "write_file")
+
+        existing_edit = CORE.runtime_action_contract(
+            [{"role": "user", "content": "Write tests in existing src/app.py and update its current function."}]
+        )
+        self.assertEqual(existing_edit["preferred_tool"], "auto")
+
     def test_direct_model_mode_enforces_an_explicit_local_action_contract(self) -> None:
         config = {
             **coordinator_config(semantic=False),
@@ -761,6 +788,85 @@ class CoordinatorRoutingTests(unittest.TestCase):
         aligned_without_contract = CORE.align_tool_call_with_action_contract(repeated, route_state, messages)
         self.assertEqual(aligned_without_contract["path"], target)
         self.assertEqual(aligned_without_contract["start_line"], "261")
+
+    def test_whole_file_coverage_does_not_merge_distinct_same_name_paths(self) -> None:
+        task = "Audit /project/primary/shared.cpp"
+        messages = [
+            CORE.tool_history_message(
+                {"name": "read_file", "path": "/project/other/shared.cpp", "start_line": "1"},
+                0,
+                "/project/other/shared.cpp\nlines 1-100 of 100\n    1  unrelated",
+            ),
+            CORE.tool_history_message(
+                {"name": "read_file", "path": "/project/primary/shared.cpp", "start_line": "1"},
+                0,
+                "/project/primary/shared.cpp\nlines 1-10 of 100\n    1  target",
+            ),
+        ]
+
+        progress = CORE.complete_file_read_progress(task, messages, "/project/primary/shared.cpp")
+
+        self.assertIsNotNone(progress)
+        self.assertFalse(progress["complete"])
+        self.assertEqual(progress["next_line"], 11)
+
+    def test_saved_whole_file_path_disambiguates_a_relative_target(self) -> None:
+        task = "Evaluate shared.cpp"
+        route_state = {
+            "prompt": task,
+            "action_contract": {"capability": "runtime_action", "target": "shared.cpp"},
+        }
+        CORE.update_complete_file_read_state(
+            route_state,
+            {"name": "read_file", "path": "/project/primary/shared.cpp", "start_line": "1"},
+            0,
+            "/project/primary/shared.cpp\nlines 1-10 of 100\n    1  target",
+        )
+        messages = [
+            CORE.tool_history_message(
+                {"name": "read_file", "path": "/project/other/shared.cpp", "start_line": "11"},
+                0,
+                "/project/other/shared.cpp\nlines 11-100 of 100\n   11  unrelated",
+            )
+        ]
+
+        progress = CORE.complete_file_read_progress(
+            task,
+            messages,
+            "shared.cpp",
+            route_state["read_progress"],
+        )
+
+        self.assertIsNotNone(progress)
+        self.assertFalse(progress["complete"])
+        self.assertEqual(progress["next_line"], 11)
+
+    def test_whole_file_coverage_uses_the_shared_local_extension_catalog(self) -> None:
+        for task in ("Evaluate Renderer.swift", "Diagnose Service.cs", "Review settings.yaml"):
+            with self.subTest(task=task):
+                self.assertTrue(CORE.requires_complete_file_coverage(task))
+
+    def test_whole_file_summary_keeps_its_objective_instead_of_becoming_an_audit(self) -> None:
+        task = "Read the entire README.md and summarize it."
+        route_state = {
+            "prompt": task,
+            "action_contract": {
+                "capability": "runtime_action",
+                "target": "README.md",
+            },
+        }
+        CORE.update_complete_file_read_state(
+            route_state,
+            {"name": "read_file", "path": "README.md", "start_line": "1"},
+            0,
+            "README.md\nlines 1-40 of 80\n    1  # Product overview",
+        )
+
+        directive = CORE.complete_file_read_directive(route_state)
+
+        self.assertIn("Managed whole-file checkpoint", directive)
+        self.assertIn("summary, extraction, comparison", directive)
+        self.assertNotIn("Prioritize correctness, security", directive)
 
     def test_audit_line_references_recover_exact_tool_evidence_for_review(self) -> None:
         messages = [
@@ -1085,6 +1191,67 @@ class CoordinatorRoutingTests(unittest.TestCase):
         moderate = {**challenger, "score": 0.725}
         self.assertIsNotNone(CORE._executor_continuity([moderate, incumbent], previous, "adaptive", signals))
         self.assertIsNone(CORE._executor_continuity([moderate, incumbent], previous, "quality", signals))
+
+    def test_executor_continuity_yields_to_a_material_capability_gap(self) -> None:
+        descriptor = CORE.ModelDescriptor(name="model", size=7_000_000_000)
+        specialist = {
+            "model": "specialist:large",
+            "score": 0.805,
+            "resident": False,
+            "descriptor": descriptor,
+            "capabilities": {"code": 0.94, "agent": 0.92, "reasoning": 0.82, "vision": 0.0},
+        }
+        incumbent = {
+            "model": "general:small",
+            "score": 0.780,
+            "resident": True,
+            "descriptor": descriptor,
+            "capabilities": {"code": 0.68, "agent": 0.74, "reasoning": 0.70, "vision": 0.0},
+        }
+
+        choice = CORE._executor_continuity(
+            [specialist, incumbent],
+            {"executor": "general:small"},
+            "adaptive",
+            {"code": 0.82, "agent": 0.76, "reasoning": 0.42, "vision": 0.0},
+        )
+
+        self.assertIsNone(choice)
+
+    def test_adaptive_source_audit_overrides_chat_continuity_and_uses_independent_review(self) -> None:
+        provider = FakeProvider(
+            response=semantic_json(
+                intent="coding",
+                code=1.0,
+                agent=1.0,
+                reasoning=0.2,
+                general=0.0,
+                risk=0.3,
+                complexity=0.75,
+                needs_plan=True,
+                needs_review=False,
+                requires_action=True,
+                confidence=1.0,
+                reason="audit a source file for material defects",
+            )
+        )
+        prompt = r'Audit "C:\projects\sample\engine.cpp".'
+        CORE.reset_semantic_assessment_cache()
+
+        decision = CORE.select_orchestrator_route(
+            provider,
+            coordinator_config(),
+            [{"role": "user", "content": prompt}],
+            Path("/tmp"),
+            previous_route={"executor": "qwen3.5:9b"},
+        )
+
+        self.assertEqual(decision["task_kind"], "coding agent")
+        self.assertNotEqual(decision["executor"], "qwen3.5:9b")
+        self.assertTrue(decision["reviewer"])
+        self.assertNotEqual(decision["reviewer"], decision["executor"])
+        self.assertNotEqual(decision["reviewer"], "qwen3.5:9b")
+        self.assertFalse(decision["continuity"])
 
     def test_adaptive_warm_pool_avoids_a_low_value_cold_load(self) -> None:
         cold = {
@@ -1413,6 +1580,57 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIn("lines 101-120 of 400", output)
         self.assertIn("continue with start_line=121, max_lines=20", output)
         self.assertNotIn("  121  line 121", output)
+
+    def test_write_file_creates_exact_multiline_content_outside_the_workspace_and_is_undoable(self) -> None:
+        content = (
+            "<!DOCTYPE html>\n"
+            '<html lang="en">\n'
+            "<body><button onclick=\"alert('Hello Bert!')\">Build it ✨</button></body>\n"
+            "</html>\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            desktop = root / "Desktop"
+            workspace.mkdir()
+            desktop.mkdir()
+            target = desktop / "welcome.html"
+            call = {"name": "write_file", "path": str(target), "content": content}
+
+            with patch.object(CORE, "CHECKPOINT_DIR", root / "checkpoints"):
+                preview = CORE.tool_approval_diff(call, workspace)
+                code, output = CORE.execute_tool_call(call, workspace, project_root=workspace)
+
+                self.assertEqual(code, 0, output)
+                self.assertTrue(preview.startswith("--- /dev/null\n+++ "))
+                self.assertIn("Build it ✨", preview)
+                self.assertEqual(target.read_text(encoding="utf-8"), content)
+                checkpoint = output.splitlines()[0].split(":", 1)[1].strip()
+                undo_code, undo_output = CORE.undo_checkpoint(checkpoint)
+
+            self.assertEqual(undo_code, 0, undo_output)
+            self.assertFalse(target.exists())
+
+    def test_write_file_refuses_to_overwrite_or_create_missing_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = root / "existing.txt"
+            existing.write_text("original", encoding="utf-8")
+            with patch.object(CORE, "CHECKPOINT_DIR", root / "checkpoints"):
+                code, output = CORE.execute_tool_call(
+                    {"name": "write_file", "path": str(existing), "content": "replacement"},
+                    root,
+                )
+                missing_code, missing_output = CORE.execute_tool_call(
+                    {"name": "write_file", "path": str(root / "missing" / "new.txt"), "content": "new"},
+                    root,
+                )
+
+            self.assertEqual(code, 1)
+            self.assertIn("refusing to overwrite", output)
+            self.assertEqual(existing.read_text(encoding="utf-8"), "original")
+            self.assertEqual(missing_code, 1)
+            self.assertIn("parent directory not found", missing_output)
 
     def test_directory_listing_reports_typed_entry_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1778,6 +1996,18 @@ class CoordinatorRoutingTests(unittest.TestCase):
                     route(FakeProvider(()), prompt, coordinator_config(semantic=False))["executor"],
                     "qwen3.5:9b",
                 )
+
+    def test_source_evaluations_are_detected_across_language_families(self) -> None:
+        for target in ("engine.cpp", "service.rs", "renderer.swift", "component.tsx"):
+            with self.subTest(target=target):
+                analysis = CORE.analyze_orchestrator_task(
+                    [{"role": "user", "content": f"Audit {target} for correctness."}],
+                    Path("/tmp"),
+                )
+                self.assertGreaterEqual(analysis["signals"]["code"], 0.56)
+                self.assertGreaterEqual(analysis["signals"]["reasoning"], 0.42)
+                self.assertEqual(analysis["task_kind"], "coding")
+                self.assertEqual(analysis["action_contract"]["target"], target)
 
     def test_trivial_routes_are_protected_from_learned_heavy_model_bias(self) -> None:
         learned_state = {
@@ -2149,7 +2379,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertEqual(provider.calls[0]["kwargs"]["extra_options"]["temperature"], 0)
         self.assertEqual(decision["executor"], "qwen3-coder:30b")
         self.assertEqual(decision["planner"], "qwen3.5:9b")
-        self.assertEqual(decision["reviewer"], "qwen3.5:9b")
+        self.assertEqual(decision["reviewer"], "qwen3.6:27b")
         self.assertEqual(decision["strategy"], "plan-review")
         self.assertTrue(decision["semantic_assessment"]["trigger"])
 
@@ -3039,7 +3269,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
         checkpoint_calls = [
             call
             for call in provider.calls
-            if "Managed audit checkpoint"
+            if "Managed evaluation checkpoint"
             in "\n".join(str(message.get("content") or "") for message in call["messages"])
         ]
         self.assertEqual(code, 0)
@@ -3609,6 +3839,22 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertIn("rejected multiple edits", note)
         self.assertIn("smallest unique exact anchor", note)
 
+    def test_action_loop_guard_blocks_repeated_shell_parser_failures_only(self) -> None:
+        guard = CORE.ActionLoopGuard()
+        shell = {"name": "shell", "cmd": "broken quoting"}
+        parser_error = (
+            "The string is missing the terminator: '@.\n"
+            "CategoryInfo : ParserError\nFullyQualifiedErrorId : TerminatorExpectedAtEndOfString"
+        )
+
+        self.assertEqual(guard.record(shell, parser_error, succeeded=False), "")
+        note = guard.record(shell, parser_error, succeeded=False)
+        self.assertIn("shell is unavailable", note)
+        self.assertIn("structured file/search tools", note)
+        self.assertIn("shell syntax failed repeatedly", guard.refusal(shell))
+        self.assertEqual(guard.refusal({"name": "write_file", "path": "new.html", "content": "ok"}), "")
+        self.assertFalse(CORE.shell_syntax_failure("script.py:1: SyntaxError: invalid syntax"))
+
     def test_action_loop_guard_allows_changed_read_results(self) -> None:
         guard = CORE.ActionLoopGuard()
         call = {"name": "web_search", "query": "current release", "reason": ""}
@@ -3937,6 +4183,47 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertNotIn("Recent tool evidence:\n(none)", prompt)
         self.assertIn("does not need to reproduce commands", prompt)
         self.assertIn("each finding must identify a distinct mechanism", prompt)
+
+    def test_review_receives_the_persistent_whole_file_checkpoint_ledger(self) -> None:
+        provider = FakeProvider(response="VERDICT: PASS")
+        task = "Audit module.py"
+        route_state = {
+            "prompt": task,
+            "reviewer": "qwen3.6:27b",
+            "executor": "devstral-small-2:latest",
+            "task_kind": "coding agent",
+            "action_contract": {
+                "capability": "runtime_action",
+                "target": "module.py",
+            },
+        }
+        CORE.update_complete_file_read_state(
+            route_state,
+            {"name": "read_file", "path": "module.py", "start_line": "1"},
+            0,
+            "module.py\nlines 1-40 of 80\n   12  first_window_risk();",
+        )
+        CORE.record_complete_file_checkpoint(route_state, "Line 12: retained first-window correctness risk.")
+        CORE.update_complete_file_read_state(
+            route_state,
+            {"name": "read_file", "path": "module.py", "start_line": "41"},
+            0,
+            "module.py\nlines 41-80 of 80\n   80  return result;",
+        )
+
+        result = CORE.orchestrator_review(
+            provider,
+            route_state,
+            [{"role": "user", "content": task}],
+            "No material issues found.",
+            coordinator_config(),
+        )
+
+        self.assertEqual(result["verdict"], "pass")
+        prompt = str(provider.calls[-1]["messages"][-1]["content"])
+        self.assertIn("Persistent managed-work ledger", prompt)
+        self.assertIn("retained first-window correctness risk", prompt)
+        self.assertIn("complete consecutive coverage 1-80", prompt)
 
     def test_plain_agent_executes_a_tool_then_delivers(self) -> None:
         class ToolThenAnswerProvider(FakeProvider):
@@ -4355,7 +4642,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 checkpoint_calls = [
                     provider_call
                     for provider_call in provider.calls
-                    if "Managed audit checkpoint"
+                    if "Managed evaluation checkpoint"
                     in "\n".join(str(message.get("content") or "") for message in provider_call["messages"])
                 ]
                 self.assertTrue(checkpoint_calls)
@@ -4363,7 +4650,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 synthesis_calls = [
                     provider_call
                     for provider_call in provider.calls
-                    if "Managed audit phase: coverage is complete"
+                    if "Managed evaluation phase: coverage is complete"
                     in "\n".join(str(message.get("content") or "") for message in provider_call["messages"])
                 ]
                 self.assertTrue(synthesis_calls)
@@ -5690,6 +5977,83 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("No further tool actions", denied[0]["content"])
                 self.assertEqual(app.messages[-1]["role"], "assistant")
                 self.assertIn("action was denied", app.messages[-1]["content"])
+
+    async def test_primary_ui_creates_quote_heavy_html_through_write_file(self) -> None:
+        class WriteThenAnswerProvider(FakeProvider):
+            def __init__(self, native_call: dict[str, Any]) -> None:
+                super().__init__(response="")
+                self.native_write = native_call
+                self.write_requested = False
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                if is_completion_arbiter_request(messages):
+                    yield completed_action_json()
+                    return
+                if not self.write_requested:
+                    self.write_requested = True
+                    sink = kwargs.get("tool_call_sink")
+                    if callable(sink):
+                        sink(self.native_write)
+                    return
+                yield "Created welcome.html on the Desktop."
+
+        content = (
+            "<!DOCTYPE html>\n"
+            '<html lang="en"><body>'
+            "<button onclick=\"alert('Hello Bert!')\">Build it ✨</button>"
+            "</body></html>\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            desktop = root / "Desktop"
+            desktop.mkdir()
+            target = desktop / "welcome.html"
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"model_mode": "direct", "model": "qwen3.5:9b", "agent": True})
+            native_call = {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": {
+                        "path": str(target),
+                        "content": content,
+                        "reason": "create the requested HTML file",
+                    },
+                },
+            }
+            provider = WriteThenAnswerProvider(native_call)
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(88, 28)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text("Make a small html script on my desktop now?")
+                await pilot.press("enter")
+                for _ in range(160):
+                    await pilot.pause(0.025)
+                    if isinstance(app.screen, ui.ApprovalScreen):
+                        break
+
+                self.assertIsInstance(app.screen, ui.ApprovalScreen)
+                self.assertEqual(app.pending_tool["name"], "write_file")
+                self.assertIn("welcome.html", str(app.screen.query_one(".approval-code", ui.Static).render()))
+                self.assertEqual(str(app.screen.query_one("#approve", ui.Button).label), "CREATE FILE")
+                await pilot.press("a")
+                for _ in range(240):
+                    await pilot.pause(0.025)
+                    if not app.busy and target.exists():
+                        break
+
+                self.assertFalse(app.busy)
+                self.assertEqual(target.read_text(encoding="utf-8"), content)
+                self.assertIn("FILE WRITE  CREATED", app.render_transcript_text())
+                self.assertIn("Created welcome.html", app.messages[-1]["content"])
 
     async def test_deny_mode_blocks_model_actions_without_opening_approval(self) -> None:
         class DenyThenConcludeProvider(FakeProvider):

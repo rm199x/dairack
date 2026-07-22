@@ -517,6 +517,7 @@ def review(
     runtime = _runtime().runtime_config_for_model(config, reviewer)
     task = latest_user_task(messages)
     recent_results = _runtime()._recent_action_evidence(messages, limit=7000)
+    managed_evidence = _runtime().complete_file_read_directive(route, 7000)
     cited_lines = _runtime().referenced_line_evidence(messages, answer)
     completion = route.get("action_completion")
     completion_text = repr(completion) if isinstance(completion, dict) else "(not assessed)"
@@ -524,6 +525,7 @@ def review(
         f"Original task:\n{task}\n\n"
         f"Candidate answer:\n{truncate(answer, 18000)}\n\n"
         f"Recent tool evidence:\n{recent_results or '(none)'}\n\n"
+        f"Persistent managed-work ledger:\n{managed_evidence or '(none)'}\n\n"
         f"Exact evidence for line references in the candidate:\n{cited_lines or '(no line references found)'}\n\n"
         f"Runtime completion assessment:\n{truncate(completion_text, 1200)}\n\n"
         "Check correctness, completeness, unsupported claims, task compliance, and whether reported actions are "

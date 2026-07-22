@@ -766,6 +766,8 @@ class ApprovalScreen(ModalScreen[str]):
         return {
             "shell": "RUN COMMAND",
             "patch": "APPLY PATCH",
+            "edit_file": "APPLY EDIT",
+            "write_file": "CREATE FILE",
             "read_file": "ALLOW READ",
             "list_dir": "ALLOW READ",
             "find_paths": "ALLOW SEARCH",
@@ -5672,6 +5674,12 @@ class DairackTextualBase(App[None]):
                 self.save_current_chat()
                 return "continue"
             self.run_tool_call(call, approved_by="coordinator")
+            return "continue"
+        repeat_refusal = self._loop_guard.refusal(call)
+        if repeat_refusal:
+            self.messages.append(self.core.denied_tool_history_message(call, repeat_refusal))
+            self.append_action(self.core.tool_denied_display(call, "repeated action cannot make progress", "NOT RUN"))
+            self.save_current_chat()
             return "continue"
         mode = str(self.config.get("permission_mode") or "ask")
         if mode == "deny":

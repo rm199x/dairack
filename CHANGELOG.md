@@ -43,6 +43,8 @@ semantic versioning after 1.0.
 - Restartable Linux user-service lifecycle for the remote compute bridge, including native status and removal commands.
 - Exact-string `edit_file` action for targeted single-occurrence edits, checkpointed for `/undo`, scoped to the
   working directory, and previewed as a diff during permission review alongside `patch`.
+- Structured `write_file` creation for exact UTF-8 content, including approved absolute targets such as a desktop;
+  new files are previewed, checkpointed for `/undo`, size-bounded, and never overwrite an existing path.
 - Frontend-agnostic turn decision core (`turn.py`) that owns the agent turn's repair, completion, review, and
   finalization ladder as pure tested functions; the agent-capable paths in Textual, the fallback terminal, and the
   plain CLI drive on it, replacing their duplicated decision ladders while retaining frontend-specific state adapters.
@@ -86,6 +88,8 @@ semantic versioning after 1.0.
 - Bounded malformed-tool recovery: a rejected native tool stream retries through the compatibility protocol on the
   same executor before Coordinator considers one pre-ranked alternate. Advisory planning failures now degrade to
   direct execution, while exhausted backend syntax diagnostics stay in `/route` instead of leaking into transcripts.
+- Repeated shell-parser failures now close the shell surface for that task and direct the executor toward structured
+  tools, preventing quote/redirection guess loops and redundant approval prompts.
 - Route-scoped whole-file coverage and evidence ledgers that survive compaction, resume at the exact unread line, and
   preserve requested headings or identifiers for the final response.
 - Plain-language file audits and reviews now establish whole-file coverage unless the user names a narrower scope.
@@ -101,6 +105,13 @@ semantic versioning after 1.0.
 
 ### Changed
 
+- Adaptive routing now recognizes evaluative source work across common language extensions, declines warm-model
+  continuity when a cold candidate has a material demanded-capability advantage, and reduces efficiency/residency
+  bias when choosing reviewers as task complexity rises. Substantive reviews receive the complete retained managed
+  evidence ledger, while routine conversational and bounded work keeps the existing efficient path.
+- Whole-file coverage now distinguishes evaluation from summaries, extraction, comparison, and other complete-read
+  objectives instead of applying audit instructions universally. Persistent coverage also compares normalized path
+  identities rather than basenames, preventing distinct same-name files from contributing to one ledger.
 - Whole-file audits now recognize explicit actions after a short greeting, preserve complete long extensions such as
   `.cpp`, `.hpp`, and `.tsx`, and reconcile Windows and POSIX path spellings in the persistent read ledger. Once a
   bounded read has started, the ledger advances repeated model calls to the earliest unread line even if an older

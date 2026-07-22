@@ -13,6 +13,7 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(schemas["index_project"]["parameters"]["required"], [])
         self.assertEqual(schemas["hardware_status"]["parameters"]["required"], [])
         self.assertEqual(schemas["find_paths"]["parameters"]["required"], ["query", "path"])
+        self.assertEqual(schemas["write_file"]["parameters"]["required"], ["path", "content"])
         self.assertIn("path", schemas["search_project"]["parameters"]["properties"])
         self.assertNotIn("analyze_image", schemas)
 
@@ -29,6 +30,18 @@ class ToolRegistryTests(unittest.TestCase):
         )
         self.assertFalse(error)
         self.assertEqual(call["name"], "find_paths")
+
+        content = "<button onclick=\"alert('Hello')\">Build it ✨</button>\n"
+        call, error = TOOL_REGISTRY.validate(
+            {
+                "name": "create_file",
+                "arguments": {"path": r"C:\Users\example\Desktop\welcome.html", "content": content},
+            }
+        )
+        self.assertFalse(error)
+        self.assertEqual(call["name"], "write_file")
+        self.assertEqual(call["path"], r"C:\Users\example\Desktop\welcome.html")
+        self.assertEqual(call["content"], content)
 
     def test_registry_owns_complete_action_presentation_metadata(self) -> None:
         allowed_risks = {"read", "write", "system", "local", "network", "coordinator"}

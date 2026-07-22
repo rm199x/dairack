@@ -97,13 +97,18 @@ the model/role level, then interpolates toward a task-kind estimate as its own e
 assessment may promote task signals past the keyword layer and lower — never remove — the deterministic support
 floors for planning and review, so paraphrased and non-English requests are routed on meaning. Semantic output cannot
 invent an image, bypass a capability or vision gate, erase deterministic risk evidence, or create action authority.
+Residency continuity is accepted only while the incumbent remains comparably capable for the task's material demands;
+a meaningful code, agent, reasoning, research, or vision deficit defeats the reload optimization. Reviewer selection
+similarly sheds efficiency and residency bias as complexity rises, preserving cheap stages for routine work without
+asking a convenient small model to judge a materially stronger executor on substantive work.
 
 Planning, independent review, and specialist delegation are separate bounded stages, each visible in route state and
 interruptible by the user. The planner receives indexed project context so execution briefs name real files rather
 than guesses. Review verdicts apply only with usable grounded feedback, revisions are announced in the transcript,
 and the revised answer is re-checked once; a still-disputed answer is kept and marked unresolved in route state.
 Review receives the same recent tool-result evidence and deterministic completion assessment used by the action
-arbiter, while keeping those internal logs out of a concise user-facing answer.
+arbiter. Managed whole-file work also supplies its complete retained checkpoint ledger, while keeping those internal
+logs out of a concise user-facing answer.
 
 The action loop is bounded and self-correcting: model-emitted action requests are parsed generously (including
 call-style near-misses and unescaped Windows path backslashes), malformed requests get one correction pass and then a
@@ -113,7 +118,9 @@ persistent repetition forces final synthesis, bounded tool output keeps its begi
 connection retries once silently, and an over-budget request omits project retrieval before failing. A malformed
 native tool stream switches the same executor to the validated compatibility protocol before Coordinator may try one
 pre-ranked alternate; advisory planning failures are recorded and skipped because a plan is not an execution
-prerequisite. Raw backend syntax remains in route diagnostics rather than the user transcript. A blank or
+prerequisite. Repeated shell-parser failures close shell execution for the rest of that task before another approval
+is shown, while leaving safer structured tools available. Raw backend syntax remains in route diagnostics rather than
+the user transcript. A blank or
 structurally incomplete continuation retries once on the same executor; Coordinator may then move once to the next
 pre-ranked eligible executor, while direct mode never switches implicitly. The decision
 ladder that chooses each agent turn's next action lives in one frontend-agnostic core (`turn.py`) used by each
@@ -140,11 +147,12 @@ The reviewer receives exact retained source lines for every line or range cited 
 only on truncated action excerpts. Bounded escalation reuses collected evidence and cannot reopen tool execution for
 a completed audit.
 
-Writes remain exact and previewed. Structured-file edits are parsed or compiled before checkpointing, obvious
-undefined Python self-references are rejected, and an exact-string mismatch can return a bounded unique anchor from
-the current file without applying a fuzzy change. Failed writes do not reset no-progress accounting. Unix shell
-pipelines run with `pipefail` where Bash is available, so output limiting cannot turn a failed test command into exit
-zero.
+Writes remain exact and previewed. `write_file` creates bounded UTF-8 content without shell quoting, refuses existing
+targets, and records an undo checkpoint rooted at the approved target directory, including explicit absolute targets
+outside the active project. Structured-file edits are parsed or compiled before checkpointing, obvious undefined
+Python self-references are rejected, and an exact-string mismatch can return a bounded unique anchor from the current
+file without applying a fuzzy change. Failed writes do not reset no-progress accounting. Unix shell pipelines run
+with `pipefail` where Bash is available, so output limiting cannot turn a failed test command into exit zero.
 
 Context policy is derived from the active executor's effective runtime profile. The hard model window is divided into
 an input budget and answer reserve; request accounting includes the system foundation, grounded macro memory, the live
@@ -158,9 +166,12 @@ evidence, and a completed action result is narrowed again when necessary so its 
 Compaction may run between model/action steps but never in the middle of a provider call.
 
 Whole-file tasks additionally keep a route-scoped coverage ledger: completed line ranges are merged, the next unread
-line is deterministic, and bounded requested evidence survives raw-message compaction. The completion arbiter cannot
-accept a whole-file result until coverage reaches the known final line, and exact requested headings must come from
-the preserved evidence rather than reconstruction.
+line is deterministic, and bounded requested evidence survives raw-message compaction. Path identity normalizes slash
+and case conventions without merging distinct same-name absolute files. Coverage is objective-neutral: audit and
+evaluation requests retain issue-focused checkpoints, while summaries, extraction, comparison, and other complete
+reads retain facts for the user's stated objective. The completion arbiter cannot accept a whole-file result until
+coverage reaches the known final line, and exact requested headings must come from the preserved evidence rather than
+reconstruction.
 
 The answer reserve is enforced, not advisory: request fitting protects a generation floor that binds exactly when a
 raised budget ratio, a small window, thinking mode, or final synthesis would otherwise let a packed prompt starve the

@@ -9,7 +9,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-REASON_PROPERTY = {"type": "string", "description": "Why this action is needed now."}
+# The field name is self-describing. Repeating prose for it in every native
+# schema materially reduces the working window on 4K models.
+REASON_PROPERTY = {"type": "string"}
 
 
 @dataclass(frozen=True)
@@ -231,6 +233,23 @@ TOOL_REGISTRY = ToolRegistry(
             },
             display_name="Edit",
             activity="Editing file",
+            target_field="path",
+            target_label="PATH",
+            risk="write",
+        ),
+        ToolSpec(
+            "write_file",
+            "Create one new UTF-8 text file from exact content; refuses to overwrite an existing path.",
+            {
+                "path": {"type": "string", "description": "New file path."},
+                "content": {"type": "string", "description": "Complete file content."},
+            },
+            required=("path", "content"),
+            aliases=("create_file", "save_file"),
+            field_aliases={"file": "path", "text": "content", "body": "content"},
+            body_field="content",
+            display_name="File write",
+            activity="Creating file",
             target_field="path",
             target_label="PATH",
             risk="write",

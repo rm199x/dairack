@@ -78,6 +78,7 @@ def specialist_model(
     policy: str,
     signals: dict[str, float],
     preferred_model: str = "",
+    task_complexity: float = 0.0,
 ) -> str:
     return stage_model(
         provider,
@@ -88,11 +89,34 @@ def specialist_model(
         signals,
         _runtime().model_supports_vision,
         preferred_model,
+        task_complexity,
     )
 
 
 def semantic_router_model(models: list[Any], resident: set[str]) -> str:
     return ranking_semantic_router_model(models, resident, _runtime().model_capabilities)
+
+
+def _capability_fit_gap(
+    winner: dict[str, Any],
+    incumbent: dict[str, Any],
+    signals: dict[str, float],
+    floors: dict[str, float],
+) -> float:
+    """Return the demanded-capability advantage of one candidate over another."""
+    requirements = [
+        (name, max(0.0, float(signals.get(name) or 0)))
+        for name, floor in floors.items()
+        if float(signals.get(name) or 0) >= floor
+    ]
+    if not requirements:
+        return 0.0
+    winner_capabilities = winner.get("capabilities") or {}
+    incumbent_capabilities = incumbent.get("capabilities") or {}
+    weight = sum(demand for _name, demand in requirements)
+    winner_fit = sum(float(winner_capabilities.get(name) or 0) * demand for name, demand in requirements) / weight
+    incumbent_fit = sum(float(incumbent_capabilities.get(name) or 0) * demand for name, demand in requirements) / weight
+    return winner_fit - incumbent_fit
 
 
 def direct_route(config: dict[str, Any], model: str | None = None) -> dict[str, Any]:
@@ -141,6 +165,20 @@ def executor_continuity(
         capabilities = entry.get("capabilities")
         if not isinstance(capabilities, dict) or float(capabilities.get("vision") or 0) < 0.50:
             return None
+    capability_gap = _capability_fit_gap(
+        scored[0],
+        entry,
+        signals,
+        {
+            "code": 0.52,
+            "agent": 0.58,
+            "reasoning": 0.58,
+            "research": 0.62,
+            "vision": 0.25,
+        },
+    )
+    if capability_gap >= 0.10:
+        return None
     size_gb = float(getattr(entry.get("descriptor"), "size", 0) or 0) / 1e9
     policy_scale = {"efficient": 1.4, "adaptive": 1.0, "quality": 0.5}.get(policy, 1.0)
     margin = min(0.05, (0.015 + min(0.03, size_gb * 0.0035)) * policy_scale)
@@ -152,6 +190,7 @@ def executor_continuity(
         "over": str(scored[0]["model"]),
         "gap": round(gap, 4),
         "margin": round(margin, 4),
+        "capability_gap": round(capability_gap, 4),
     }
 
 
@@ -177,19 +216,14 @@ def warm_pool_continuity(
         return None
     winner_efficiency = float((scored[0].get("capabilities") or {}).get("efficiency") or 0)
     warm_efficiency = float((warm.get("capabilities") or {}).get("efficiency") or 0)
-    requirements = [
-        (name, float((signals or {}).get(name) or 0))
-        for name, floor in (("code", 0.60), ("agent", 0.65), ("research", 0.70))
-        if float((signals or {}).get(name) or 0) >= floor
-    ]
-    if requirements:
-        winner_capabilities = scored[0].get("capabilities") or {}
-        warm_capabilities = warm.get("capabilities") or {}
-        weight = sum(demand for _name, demand in requirements)
-        winner_fit = sum(float(winner_capabilities.get(name) or 0) * demand for name, demand in requirements) / weight
-        warm_fit = sum(float(warm_capabilities.get(name) or 0) * demand for name, demand in requirements) / weight
-        if winner_fit - warm_fit >= 0.12:
-            return None
+    capability_gap = _capability_fit_gap(
+        scored[0],
+        warm,
+        signals or {},
+        {"code": 0.60, "agent": 0.65, "research": 0.70},
+    )
+    if capability_gap >= 0.12:
+        return None
     efficiency_gain = max(0.0, warm_efficiency - winner_efficiency)
     policy_base = 0.055 if policy == "efficient" else 0.025
     margin = policy_base + max(0.0, 1.0 - complexity) * 0.05 + efficiency_gain * 0.08
@@ -528,6 +562,7 @@ def select_route(
             policy,
             signals,
             role_preference(config, "planner", models),
+            complexity,
         )
     if use_review:
         reviewer = specialist_model(
@@ -538,6 +573,7 @@ def select_route(
             policy,
             signals,
             role_preference(config, "reviewer", models),
+            complexity,
         )
     strategy = "plan-review" if planner and reviewer else "planned" if planner else "reviewed" if reviewer else "single"
     gap = scored[0]["score"] - scored[1]["score"] if len(scored) > 1 else 0.25
