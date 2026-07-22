@@ -126,7 +126,12 @@ def _stream_json(
                 if not isinstance(event, dict):
                     continue
                 if event.get("error"):
-                    raise OllamaError(str(event["error"]))
+                    raw_status = event.get("status")
+                    try:
+                        status = int(raw_status) if raw_status is not None else None
+                    except (TypeError, ValueError):
+                        status = None
+                    raise OllamaError(str(event["error"]), status)
                 yield event
     except (AttributeError, OSError, ValueError) as exc:
         if not (cancel_event and cancel_event.is_set()):

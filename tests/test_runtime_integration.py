@@ -3883,6 +3883,13 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertFalse(CORE.transient_stream_error(CORE.OllamaError("Ollama returned HTTP 404: no such model")))
         self.assertFalse(CORE.transient_stream_error(ValueError("unrelated")))
 
+    def test_stream_timeout_display_does_not_implicate_local_file_reads(self) -> None:
+        message = CORE.runtime_failure_display(TimeoutError("The read operation timed out"))
+
+        self.assertIn("compute stream", message.lower())
+        self.assertIn("not a local file-read failure", message.lower())
+        self.assertIn("did not treat the interrupted response as a completed action", message.lower())
+
     @unittest.skipIf(os.name == "nt", "Unix pipeline semantics")
     def test_shell_pipeline_preserves_an_earlier_command_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

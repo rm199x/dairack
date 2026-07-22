@@ -4165,6 +4165,20 @@ def runtime_failure_display(error: Exception | str) -> str:
             f"The request exceeded the active model context ({overflow.group(1)}/{overflow.group(2)} tokens). "
             "Dairack could not recover this turn; use /compact or retry with a larger-context model."
         )
+    lowered = raw.lower()
+    if "read operation timed out" in lowered or any(
+        marker in lowered
+        for marker in (
+            "model output timed out",
+            "stream stalled",
+            "network request exceeded its total timeout",
+        )
+    ):
+        return (
+            "The compute stream stopped delivering model output before the turn completed. "
+            "This was not a local file-read failure, and Dairack did not treat the interrupted response as a "
+            "completed action. Retry the turn or inspect /route for diagnostics."
+        )
     return truncate(raw, 1200) or "The model request failed."
 
 

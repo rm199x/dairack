@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 from dairack.bridge import BridgeConfig, ComputeBridgeServer
 from dairack.compute import ComputeError
@@ -16,6 +18,9 @@ from dairack.providers.ollama import OllamaError, OllamaProvider
 class FakeOllamaHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     hits: list[tuple[str, str]] = []
+    chat_delay = 0.0
+    chat_status = 200
+    chat_disconnected = threading.Event()
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -42,10 +47,31 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
         if length:
             self.rfile.read(length)
         if self.path == "/api/chat":
-            self._write(
-                b'{"message":{"content":"hello"},"done":false}\n{"message":{"content":""},"done":true}\n',
-                "application/x-ndjson",
-            )
+            if self.chat_status != 200:
+                if self.chat_delay:
+                    time.sleep(self.chat_delay)
+                detail = b'{"error":"test upstream failure"}'
+                self.send_response(self.chat_status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(detail)))
+                self.end_headers()
+                self.wfile.write(detail)
+                return
+            payload = b'{"message":{"content":"hello"},"done":false}\n{"message":{"content":""},"done":true}\n'
+            if self.chat_delay:
+                time.sleep(self.chat_delay)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                    self.close_connection = True
+                except OSError:
+                    FakeOllamaHandler.chat_disconnected.set()
+            else:
+                self._write(payload, "application/x-ndjson")
         elif self.path == "/api/show":
             self._write(b'{"capabilities":["completion"]}')
         elif self.path == "/api/embed":
@@ -57,6 +83,9 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
 class BridgeTests(unittest.TestCase):
     def setUp(self) -> None:
         FakeOllamaHandler.hits = []
+        FakeOllamaHandler.chat_delay = 0.0
+        FakeOllamaHandler.chat_status = 200
+        FakeOllamaHandler.chat_disconnected = threading.Event()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaHandler)
         self.upstream_thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
         self.upstream_thread.start()
@@ -133,6 +162,73 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(chunks, ["hello"])
         self.assertEqual(provider.last_stats["done_reason"], "stop")
         self.assertIn(("POST", "/api/chat"), FakeOllamaHandler.hits)
+
+    def test_silent_ndjson_generation_receives_protocol_safe_heartbeats(self) -> None:
+        FakeOllamaHandler.chat_delay = 0.25
+        request = urllib.request.Request(
+            self.endpoint + "/api/chat",
+            data=json.dumps({"model": "slow", "stream": True}).encode(),
+            headers={
+                "Authorization": "Bearer test-token-value-that-is-long",
+                "Content-Type": "application/json",
+            },
+        )
+
+        started = time.monotonic()
+        with patch("dairack.bridge.STREAM_HEARTBEAT_SECONDS", 0.04):
+            with urllib.request.urlopen(request, timeout=1) as response:
+                self.assertEqual(response.readline(), b"\n")
+                heartbeat_at = time.monotonic() - started
+                first_event = b""
+                while not first_event.strip():
+                    first_event = response.readline()
+
+        self.assertLess(heartbeat_at, 0.20)
+        self.assertEqual(json.loads(first_event)["message"]["content"], "hello")
+
+    def test_departed_client_cancels_upstream_before_headers_arrive(self) -> None:
+        FakeOllamaHandler.chat_delay = 0.35
+        request = urllib.request.Request(
+            self.endpoint + "/api/chat",
+            data=json.dumps({"model": "slow", "stream": True}).encode(),
+            headers={
+                "Authorization": "Bearer test-token-value-that-is-long",
+                "Content-Type": "application/json",
+            },
+        )
+
+        with (
+            patch("dairack.bridge.STREAM_HEARTBEAT_SECONDS", 0.04),
+            patch("dairack.bridge.STREAM_CLIENT_POLL_SECONDS", 0.02),
+        ):
+            response = urllib.request.urlopen(request, timeout=1)
+            self.assertEqual(response.readline(), b"\n")
+            response.close()
+            self.assertTrue(FakeOllamaHandler.chat_disconnected.wait(1))
+
+    def test_fast_stream_error_retains_upstream_http_status(self) -> None:
+        FakeOllamaHandler.chat_status = 404
+        provider = OllamaProvider(self.endpoint, "test-token-value-that-is-long")
+
+        with self.assertRaises(OllamaError) as caught:
+            list(provider.chat_stream("missing", [{"role": "user", "content": "hi"}], think=False, num_ctx=4096))
+
+        self.assertEqual(caught.exception.status_code, 404)
+        self.assertIn("test upstream failure", str(caught.exception))
+
+    def test_slow_stream_error_after_heartbeat_retains_upstream_status(self) -> None:
+        FakeOllamaHandler.chat_delay = 0.12
+        FakeOllamaHandler.chat_status = 503
+        provider = OllamaProvider(self.endpoint, "test-token-value-that-is-long")
+
+        with (
+            patch("dairack.bridge.STREAM_HEARTBEAT_SECONDS", 0.04),
+            self.assertRaises(OllamaError) as caught,
+        ):
+            list(provider.chat_stream("busy", [{"role": "user", "content": "hi"}], think=False, num_ctx=4096))
+
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertIn("Ollama returned HTTP 503", str(caught.exception))
 
     def test_embedding_inference_is_available_through_the_allowlist(self) -> None:
         provider = OllamaProvider(self.endpoint, "test-token-value-that-is-long")

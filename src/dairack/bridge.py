@@ -7,12 +7,15 @@ import http.client
 import json
 import os
 import secrets
+import select
 import socket
 import tempfile
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import BoundedSemaphore
+from queue import Empty, Full, Queue
+from threading import BoundedSemaphore, Event, Thread
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -30,6 +33,11 @@ from .identity import (
 
 MAX_REQUEST_BYTES = 128 * 1024 * 1024
 BRIDGE_PROTOCOL_VERSION = 1
+STREAM_HEARTBEAT_SECONDS = 15.0
+STREAM_CLIENT_POLL_SECONDS = 0.25
+STREAM_RELAY_QUEUE_DEPTH = 16
+STREAM_RELAY_EOF = object()
+STREAMING_ROUTES = {"/api/chat", "/api/pull"}
 ALLOWED_ROUTES = {
     ("GET", "/api/version"),
     ("GET", "/api/tags"),
@@ -205,6 +213,252 @@ class ComputeBridgeHandler(BaseHTTPRequestHandler):
             raise ComputeError(f"request exceeds the {MAX_REQUEST_BYTES // 1024**2} MiB bridge limit")
         return self.rfile.read(length)
 
+    @staticmethod
+    def _interrupt_upstream(
+        connection: http.client.HTTPConnection,
+        response: http.client.HTTPResponse | None = None,
+    ) -> None:
+        sockets = [
+            getattr(connection, "sock", None),
+            getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None) if response else None,
+        ]
+        for upstream_socket in sockets:
+            if upstream_socket is None:
+                continue
+            try:
+                upstream_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        if response is not None:
+            try:
+                response.close()
+            except (OSError, ValueError):
+                pass
+
+    @staticmethod
+    def _stream_requested(path: str, body: bytes | None) -> bool:
+        if path not in STREAMING_ROUTES:
+            return False
+        try:
+            payload = json.loads(body or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return True
+        return not isinstance(payload, dict) or payload.get("stream", True) is not False
+
+    def _send_stream_headers(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def _write_stream_error(self, error: Exception | str, status: int | None = None) -> None:
+        message = str(error).strip() or "local Ollama stream failed"
+        payload: dict[str, Any] = {"error": message}
+        if status is not None:
+            payload["status"] = status
+        self.wfile.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
+        self.wfile.flush()
+
+    def _downstream_disconnected(self) -> bool:
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+        except (OSError, ValueError):
+            return True
+        if not readable:
+            return False
+        try:
+            return not self.connection.recv(1, socket.MSG_PEEK)
+        except BlockingIOError:
+            return False
+        except ValueError:
+            # Some wrapped sockets reject MSG_PEEK. Heartbeat writes remain the fallback.
+            return False
+        except OSError:
+            return True
+
+    def _relay_upstream_response(
+        self,
+        connection: http.client.HTTPConnection,
+        response: http.client.HTTPResponse,
+        *,
+        preacknowledged: bool = False,
+    ) -> None:
+        if preacknowledged and response.status >= 400:
+            detail = response.read(64 * 1024).decode(errors="replace").strip()
+            self._write_stream_error(
+                f"Ollama returned HTTP {response.status}: {detail or response.reason}",
+                response.status,
+            )
+            return
+        content_type = response.getheader("Content-Type")
+        content_length = response.getheader("Content-Length")
+        if not preacknowledged:
+            self.send_response(response.status, response.reason)
+            if content_type:
+                self.send_header("Content-Type", content_type)
+            if content_length:
+                self.send_header("Content-Length", content_length)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+        if content_type and "application/x-ndjson" in content_type.lower() and not content_length:
+            self._relay_ndjson_stream(connection, response)
+            return
+        read = getattr(response, "read1", response.read)
+        while True:
+            chunk = read(64 * 1024)
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+            self.wfile.flush()
+
+    def _proxy_stream(
+        self,
+        connection: http.client.HTTPConnection,
+        path: str,
+        body: bytes | None,
+        headers: dict[str, str],
+    ) -> None:
+        """Open an upstream stream while keeping the downstream connection alive.
+
+        Ollama can delay HTTP response headers until a native tool call is fully
+        generated. Once that delay reaches the heartbeat interval, acknowledge
+        the downstream NDJSON stream and send a blank line. Fast upstream errors
+        retain their original HTTP status; errors after acknowledgement become
+        ordinary NDJSON error events understood by the provider.
+        """
+
+        opened: Queue[http.client.HTTPResponse | BaseException] = Queue(maxsize=1)
+        response_ref: list[http.client.HTTPResponse | None] = [None]
+
+        def open_upstream() -> None:
+            try:
+                connection.request(self.command, path, body=body, headers=headers)
+                response = connection.getresponse()
+                response_ref[0] = response
+                opened.put(response)
+            except (OSError, http.client.HTTPException) as exc:
+                opened.put(exc)
+
+        opener = Thread(target=open_upstream, daemon=True, name="dairack-bridge-open-stream")
+        opener.start()
+        response_started = False
+        interrupted = False
+        next_heartbeat = time.monotonic() + max(0.01, STREAM_HEARTBEAT_SECONDS)
+        try:
+            while True:
+                try:
+                    remaining = max(0.01, next_heartbeat - time.monotonic())
+                    event = opened.get(timeout=min(STREAM_CLIENT_POLL_SECONDS, remaining))
+                    break
+                except Empty:
+                    if self._downstream_disconnected():
+                        raise ConnectionAbortedError("compute client disconnected") from None
+                    if time.monotonic() < next_heartbeat:
+                        continue
+                    if not response_started:
+                        self._send_stream_headers()
+                        response_started = True
+                    self.wfile.write(b"\n")
+                    self.wfile.flush()
+                    next_heartbeat = time.monotonic() + max(0.01, STREAM_HEARTBEAT_SECONDS)
+
+            if isinstance(event, BaseException):
+                if response_started:
+                    self._write_stream_error(f"local Ollama unavailable: {event}")
+                else:
+                    self._send_json(502, {"error": f"local Ollama unavailable: {event}"})
+                return
+
+            response = event
+            if response_started:
+                self._relay_upstream_response(connection, response, preacknowledged=True)
+                return
+
+            response_started = True
+            self._relay_upstream_response(connection, response)
+        except (OSError, http.client.HTTPException, ValueError):
+            interrupted = True
+            if not response_started:
+                raise
+        finally:
+            if interrupted or opener.is_alive():
+                self._interrupt_upstream(connection, response_ref[0])
+            opener.join(timeout=0.5)
+
+    def _relay_ndjson_stream(
+        self,
+        connection: http.client.HTTPConnection,
+        response: http.client.HTTPResponse,
+    ) -> None:
+        """Relay complete NDJSON records while keeping silent generations alive.
+
+        Ollama may buffer native tool-call arguments until the call is complete.
+        A blank NDJSON line is protocol-safe and prevents remote proxies and
+        clients from mistaking that healthy generation interval for a dead
+        connection. The heartbeat write also detects a departed client, at
+        which point closing the upstream socket cancels otherwise orphaned work.
+        """
+
+        events: Queue[bytes | BaseException | object] = Queue(maxsize=STREAM_RELAY_QUEUE_DEPTH)
+        stopped = Event()
+
+        def enqueue(item: bytes | BaseException | object) -> None:
+            while not stopped.is_set():
+                try:
+                    events.put(item, timeout=0.1)
+                    return
+                except Full:
+                    continue
+
+        def read_upstream() -> None:
+            try:
+                while not stopped.is_set():
+                    line = response.readline()
+                    if not line:
+                        break
+                    enqueue(line)
+            except (OSError, http.client.HTTPException, ValueError) as exc:
+                enqueue(exc)
+            finally:
+                enqueue(STREAM_RELAY_EOF)
+
+        reader = Thread(target=read_upstream, daemon=True, name="dairack-bridge-stream")
+        reader.start()
+        interrupted = False
+        next_heartbeat = time.monotonic() + max(0.01, STREAM_HEARTBEAT_SECONDS)
+        try:
+            while True:
+                try:
+                    remaining = max(0.01, next_heartbeat - time.monotonic())
+                    event = events.get(timeout=min(STREAM_CLIENT_POLL_SECONDS, remaining))
+                except Empty:
+                    if self._downstream_disconnected():
+                        raise ConnectionAbortedError("compute client disconnected") from None
+                    if time.monotonic() < next_heartbeat:
+                        continue
+                    self.wfile.write(b"\n")
+                    self.wfile.flush()
+                    next_heartbeat = time.monotonic() + max(0.01, STREAM_HEARTBEAT_SECONDS)
+                    continue
+                if event is STREAM_RELAY_EOF:
+                    break
+                if isinstance(event, BaseException):
+                    raise event
+                self.wfile.write(event)
+                self.wfile.flush()
+        except (OSError, http.client.HTTPException, ValueError):
+            interrupted = True
+            raise
+        finally:
+            stopped.set()
+            if interrupted or reader.is_alive():
+                self._interrupt_upstream(connection, response)
+            reader.join(timeout=0.5)
+
     def _proxy(self, path: str) -> None:
         try:
             body = self._request_body()
@@ -221,27 +475,13 @@ class ComputeBridgeHandler(BaseHTTPRequestHandler):
         }
         response_started = False
         try:
+            if self._stream_requested(path, body):
+                self._proxy_stream(connection, path, body, headers)
+                return
             connection.request(self.command, path, body=body, headers=headers)
             response = connection.getresponse()
-            self.send_response(response.status, response.reason)
             response_started = True
-            content_type = response.getheader("Content-Type")
-            content_length = response.getheader("Content-Length")
-            if content_type:
-                self.send_header("Content-Type", content_type)
-            if content_length:
-                self.send_header("Content-Length", content_length)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
-            read = getattr(response, "read1", response.read)
-            while True:
-                chunk = read(64 * 1024)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+            self._relay_upstream_response(connection, response)
         except (OSError, http.client.HTTPException) as exc:
             if not response_started and not self.wfile.closed:
                 try:

@@ -232,6 +232,12 @@ through the normal permission engine, execute there, and may then be included as
 Configured compute endpoints are direct peers and do not inherit ambient operating-system proxy settings. Web access
 and release discovery use their own transports and policies.
 
+The compute bridge relays complete NDJSON records as they arrive. Ollama may buffer native tool-call arguments before
+it sends either HTTP response headers or stream records, so the bridge acknowledges a still-silent stream after a
+bounded interval and sends blank NDJSON heartbeat lines; clients ignore the blanks while network idle timers remain
+satisfied. The relay also polls for a departed downstream peer and closes the upstream Ollama socket promptly,
+preventing an abandoned generation from retaining the model slot.
+
 Initialization has three hardware modes:
 
 1. Local Ollama uses detected client hardware.

@@ -105,6 +105,9 @@ semantic versioning after 1.0.
 
 ### Changed
 
+- Silent remote tool-call generation now remains connected through protocol-safe compute-bridge heartbeats. A
+  departed client closes the upstream Ollama stream instead of leaving an orphaned generation occupying the model
+  slot, and exhausted stream failures are identified as compute failures rather than local file-read failures.
 - Adaptive routing now recognizes evaluative source work across common language extensions, declines warm-model
   continuity when a cold candidate has a material demanded-capability advantage, and reduces efficiency/residency
   bias when choosing reviewers as task complexity rises. Substantive reviews receive the complete retained managed
