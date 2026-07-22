@@ -124,6 +124,19 @@ cancellable child process and shares the same generated-state exclusions. Prompt
 queued and dispatched when it ends. A pending approval holds that queue until the user allows or denies the action; an
 interrupted turn returns queued input to the composer instead of sending it.
 
+An unqualified request to audit or review a file is a deterministic whole-file evidence contract. Returned line
+ranges, rather than requested chunk sizes, own progress. If completion verification finds unread lines, the runtime
+constructs the next bounded `read_file` call itself and sends it through the same scope, permission, cancellation,
+loop-guard, and action-budget controls as a model-requested read. The action allowance can expand within its fixed hard
+maximum from the observed context-fitted window size, so constrained models do not stop merely because safe chunks are
+smaller than anticipated. Between windows, tools are withheld while the executor records a short, line-grounded
+checkpoint. Those quoted, untrusted notes survive compaction and are supplied to final synthesis and independent
+review; the final pass runs tool-less once exact coverage is complete. If the independent reviewer still rejects an
+answer after the single normal revision, Coordinator may ask the next pre-ranked executor for one final correction.
+The reviewer receives exact retained source lines for every line or range cited by the candidate, rather than relying
+only on truncated action excerpts. Bounded escalation reuses collected evidence and cannot reopen tool execution for
+a completed audit.
+
 Writes remain exact and previewed. Structured-file edits are parsed or compiled before checkpointing, obvious
 undefined Python self-references are rejected, and an exact-string mismatch can return a bounded unique anchor from
 the current file without applying a fuzzy change. Failed writes do not reset no-progress accounting. Unix shell

@@ -5071,6 +5071,8 @@ class DairackTextualBase(App[None]):
                     return
                 action_limit = self.core.agent_action_limit(self.config, route)
                 finalizing = self._agent_steps_used >= action_limit or self._loop_guard.force_synthesis
+                audit_phase = "" if finalizing else self.core.complete_file_read_phase(route)
+                request_finalizing = finalizing or audit_phase == "synthesize"
                 if finalizing:
                     synthesis_attempts += 1
                     if synthesis_attempts > 2:
@@ -5128,7 +5130,7 @@ class DairackTextualBase(App[None]):
                 native_calls: list[dict[str, Any]] = []
                 native_tools = (
                     []
-                    if finalizing
+                    if finalizing or audit_phase
                     else self.core.native_tools_for(
                         self.provider,
                         executor,
@@ -5141,18 +5143,20 @@ class DairackTextualBase(App[None]):
                         request_messages,
                         runtime,
                         native_tools,
-                        finalizing=finalizing,
+                        finalizing=request_finalizing,
                         allow_compatibility_tools=bool(self.config.get("agent"))
-                        and not self.core.is_direct_answer_route(route),
+                        and not self.core.is_direct_answer_route(route)
+                        and not audit_phase,
                     )
                 except self.core.RequestContextError:
                     request_messages, native_tools = self.core.fit_agent_request_context_messages(
                         build_request(include_retrieval=False),
                         runtime,
                         native_tools,
-                        finalizing=finalizing,
+                        finalizing=request_finalizing,
                         allow_compatibility_tools=bool(self.config.get("agent"))
-                        and not self.core.is_direct_answer_route(route),
+                        and not self.core.is_direct_answer_route(route)
+                        and not audit_phase,
                     )
                     route["context_degraded"] = "project retrieval omitted to fit the context window"
                 self.set_busy(
@@ -5162,6 +5166,11 @@ class DairackTextualBase(App[None]):
                 execution_started = time.monotonic()
                 stream_retry_used = False
                 response_allowance = self.core.executor_response_allowance(request_messages, native_tools, runtime)
+                if audit_phase == "checkpoint":
+                    response_allowance = min(
+                        response_allowance,
+                        max(256, min(512, int(runtime.get("num_ctx") or 4096) // 12)),
+                    )
                 think_enabled = bool(runtime.get("think"))
                 thinking_parts: list[str] = []
                 generation_error: Exception | None = None
@@ -5246,12 +5255,15 @@ class DairackTextualBase(App[None]):
                     self.set_busy(True, "continuing")
                     continue
                 visible_text = self._visible_stream_text(assistant_text)
-                call, parse_error = self.core.resolve_request_tool_response(
-                    assistant_text,
-                    native_calls,
-                    native_tools,
-                    request_messages,
-                )
+                if audit_phase:
+                    call, parse_error = None, ""
+                else:
+                    call, parse_error = self.core.resolve_request_tool_response(
+                        assistant_text,
+                        native_calls,
+                        native_tools,
+                        request_messages,
+                    )
                 call = self.core.align_tool_call_with_action_contract(call, route, self.messages)
                 internal_call = bool(
                     call and self.core.is_internal_coordinator_call(self.core.normalize_coordinator_tool_call(call))
@@ -5285,12 +5297,14 @@ class DairackTextualBase(App[None]):
                 assistant_message: dict[str, Any] = {"role": "assistant", "content": assistant_text}
                 if accepted_native_calls:
                     assistant_message["tool_calls"] = accepted_native_calls
+                if audit_phase == "checkpoint":
+                    assistant_message["runtime_checkpoint"] = True
                 self.messages.append(assistant_message)
                 self._executor_stats = dict(getattr(self.provider, "last_stats", {}) or {})
                 self._last_turn_stats = dict(self._executor_stats)
                 self.save_current_chat()
                 incomplete_reason = ""
-                if not call and not parse_error:
+                if not call and not parse_error and audit_phase != "checkpoint":
                     incomplete_reason = self.core.response_incomplete_reason(
                         assistant_text,
                         self._executor_stats,
@@ -5400,30 +5414,41 @@ class DairackTextualBase(App[None]):
                         completion = {"error": str(exc)}
                     if completion:
                         route["action_completion"] = completion
-                    enforce_completion = bool(
-                        completion
-                        and not completion.get("error")
-                        and not completion.get("complete")
-                        and float(completion.get("confidence") or 0) >= 0.65
-                    )
-                    outcome = self.core.completion_arbiter_outcome(state, enforce_completion)
-                    if outcome is self.core.CompletionOutcome.REPAIR:
-                        action_completion_repairs += 1
+                    continuation = self.core.deterministic_action_continuation(completion, route, self.messages)
+                    if continuation:
+                        if audit_phase == "checkpoint":
+                            self.core.record_complete_file_checkpoint(route, assistant_text)
+                        call = continuation
                         if self.messages and self.messages[-1].get("role") == "assistant":
-                            self.messages.pop()
-                        self._route_action_feedback = self.core.action_completion_directive(completion)
-                        repairing_action = True
-                        self.replace_last_assistant_text("")
-                        self.set_busy(True, "continuing requested action")
-                        self.save_current_chat()
-                        continue
-                    if outcome is self.core.CompletionOutcome.STOP:
-                        reason = str(completion.get("reason") or "completion could not be verified")
-                        self.replace_last_assistant_text("The requested action did not complete.")
-                        self.append_error(f"Agent stopped after two completion corrections.\n{reason}")
-                        self.save_current_chat()
-                        return
-                    action = self.core.next_action(state, facts, route_facts, finalizing, completion_checked=True)
+                            self.messages[-1]["tool_calls"] = [self.core.native_tool_call_payload(call)]
+                        self.replace_last_assistant_text(self.core.tool_request_display(call))
+                        action_completion_repairs = 0
+                        action = self.core.TurnAction.EXECUTE_CALL
+                    else:
+                        enforce_completion = bool(
+                            completion
+                            and not completion.get("error")
+                            and not completion.get("complete")
+                            and float(completion.get("confidence") or 0) >= 0.65
+                        )
+                        outcome = self.core.completion_arbiter_outcome(state, enforce_completion)
+                        if outcome is self.core.CompletionOutcome.REPAIR:
+                            action_completion_repairs += 1
+                            if self.messages and self.messages[-1].get("role") == "assistant":
+                                self.messages.pop()
+                            self._route_action_feedback = self.core.action_completion_directive(completion)
+                            repairing_action = True
+                            self.replace_last_assistant_text("")
+                            self.set_busy(True, "continuing requested action")
+                            self.save_current_chat()
+                            continue
+                        if outcome is self.core.CompletionOutcome.STOP:
+                            reason = str(completion.get("reason") or "completion could not be verified")
+                            self.replace_last_assistant_text("The requested action did not complete.")
+                            self.append_error(f"Agent stopped after two completion corrections.\n{reason}")
+                            self.save_current_chat()
+                            return
+                        action = self.core.next_action(state, facts, route_facts, finalizing, completion_checked=True)
                 if action is self.core.TurnAction.SYNTHESIZE_RETRY:
                     if call:
                         self.messages.append(
@@ -5549,6 +5574,30 @@ class DairackTextualBase(App[None]):
                         continue
                     if review_result is self.core.ReviewOutcome.UNRESOLVED:
                         review["unresolved"] = True
+                        replacement = (
+                            self.core.coordinator_recovery_executor(route, executor)
+                            if not executor_recovery_attempted
+                            else ""
+                        )
+                        if replacement:
+                            executor_recovery_attempted = True
+                            feedback = str(review.get("feedback") or "")
+                            self.core.record_executor_recovery(
+                                route,
+                                executor,
+                                replacement,
+                                "independent review remained unresolved after one revision",
+                            )
+                            review["escalated_to"] = replacement
+                            if self.messages and self.messages[-1].get("role") == "assistant":
+                                self.messages.pop()
+                            self._route_config = self.core.runtime_config_for_model(self.config, replacement)
+                            runtime = self._route_config
+                            self._route_feedback = feedback
+                            self.set_busy(True, f"correcting / {replacement}")
+                            self.chat["last_route"] = route
+                            self.save_current_chat()
+                            continue
                         self.append_system(
                             "Independent review still requests changes after one revision; "
                             "kept the revised answer. Details are available with /route."
@@ -5570,6 +5619,7 @@ class DairackTextualBase(App[None]):
                     return
                 outcome = self.handle_tool_request(call)
                 if outcome == "continue":
+                    action_completion_repairs = 0
                     self.set_busy(True, "continuing")
                     continue
                 return

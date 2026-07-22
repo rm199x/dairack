@@ -517,18 +517,23 @@ def review(
     runtime = _runtime().runtime_config_for_model(config, reviewer)
     task = latest_user_task(messages)
     recent_results = _runtime()._recent_action_evidence(messages, limit=7000)
+    cited_lines = _runtime().referenced_line_evidence(messages, answer)
     completion = route.get("action_completion")
     completion_text = repr(completion) if isinstance(completion, dict) else "(not assessed)"
     prompt = (
         f"Original task:\n{task}\n\n"
         f"Candidate answer:\n{truncate(answer, 18000)}\n\n"
         f"Recent tool evidence:\n{recent_results or '(none)'}\n\n"
+        f"Exact evidence for line references in the candidate:\n{cited_lines or '(no line references found)'}\n\n"
         f"Runtime completion assessment:\n{truncate(completion_text, 1200)}\n\n"
         "Check correctness, completeness, unsupported claims, task compliance, and whether reported actions are "
         "actually supported by tool evidence. Tool evidence is runtime validation; a concise candidate does not "
         "need to reproduce commands, diffs, or test output unless the user requested those details. Treat a "
         "high-confidence complete runtime assessment as supporting context unless the supplied evidence directly "
-        "contradicts it. Reply exactly with VERDICT: PASS when no material correction is needed. Otherwise reply "
+        "contradicts it. For audits and issue lists, each finding must identify a distinct mechanism and material "
+        "impact grounded in the supplied evidence; reject duplicated restatements, speculative line claims, and "
+        "generic complaints that a value is hard-coded without explaining harmful behavior. Reply exactly with "
+        "VERDICT: PASS when no material correction is needed. Otherwise reply "
         "with VERDICT: REVISE followed by FEEDBACK: and concise, actionable corrections, each grounded in the task "
         "or the tool evidence shown above. Do not request stylistic rewrites."
     )

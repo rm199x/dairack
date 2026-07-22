@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -645,6 +645,100 @@ class CoordinatorRoutingTests(unittest.TestCase):
             "",
         )
 
+    def test_unqualified_file_audit_owns_complete_coverage_and_next_window(self) -> None:
+        task = "Audit this file"
+        route_state = {
+            "prompt": task,
+            "action_contract": {"capability": "runtime_action", "preferred_tool": "auto", "target": ""},
+        }
+        first_result = (
+            "/tmp/project/large.cpp\n"
+            "lines 1-260 of 1735\n"
+            "    1  // audit target\n"
+            "...[1475 lines remain; continue with start_line=261, max_lines=260]"
+        )
+
+        self.assertTrue(CORE.requires_complete_file_coverage(task))
+        self.assertTrue(CORE.requires_complete_file_coverage("Review this source file"))
+        self.assertTrue(CORE.requires_complete_file_coverage("Audit src/runtime.cpp"))
+        self.assertTrue(CORE.requires_complete_file_coverage("Read notes.md"))
+        self.assertFalse(CORE.requires_complete_file_coverage("Review the source code architecture"))
+        self.assertFalse(CORE.requires_complete_file_coverage("Review lines 40-80 in this file"))
+        self.assertFalse(CORE.requires_complete_file_coverage("Audit this method in the file"))
+        self.assertFalse(CORE.requires_complete_file_coverage("Audit method parse_value in this file"))
+
+        CORE.update_complete_file_read_state(
+            route_state,
+            {"name": "read_file", "path": "/tmp/project/large.cpp", "start_line": "1", "max_lines": "260"},
+            0,
+            first_result,
+        )
+        self.assertEqual(CORE.complete_file_read_phase(route_state), "checkpoint")
+        CORE.record_complete_file_checkpoint(route_state, "- Line 12: first-window finding")
+        self.assertEqual(route_state["read_progress"]["checkpoints"][0]["start"], 1)
+        checkpoint_directive = CORE.complete_file_read_directive(route_state)
+        self.assertIn("first-window finding", checkpoint_directive)
+        self.assertIn("runtime owns the next consecutive read", checkpoint_directive)
+        messages = [
+            {"role": "user", "content": task},
+            CORE.tool_history_message(
+                {"name": "read_file", "path": "/tmp/project/large.cpp"},
+                0,
+                first_result,
+            ),
+        ]
+        assessment = CORE.assess_action_completion(
+            FakeProvider(()),
+            coordinator_config(semantic=False),
+            route_state,
+            messages,
+            "I am continuing the audit. Please allow me a moment.",
+        )
+        blank_assessment = CORE.assess_action_completion(
+            FakeProvider(()),
+            coordinator_config(semantic=False),
+            route_state,
+            messages,
+            "",
+        )
+        continuation = CORE.deterministic_action_continuation(assessment, route_state, messages)
+
+        self.assertEqual(assessment["model"], "deterministic read ledger")
+        self.assertEqual(blank_assessment["model"], "deterministic read ledger")
+        self.assertIsNotNone(continuation)
+        self.assertEqual(continuation["name"], "read_file")
+        self.assertEqual(continuation["path"], "/tmp/project/large.cpp")
+        self.assertEqual(continuation["start_line"], "261")
+        self.assertEqual(continuation["max_lines"], "260")
+        self.assertEqual(continuation["_protocol"], "native")
+        payload = CORE.native_tool_call_payload(continuation)
+        self.assertNotIn("_protocol", payload["function"]["arguments"])
+        self.assertEqual(route_state["deterministic_continuations"][0]["start_line"], 261)
+
+    def test_audit_line_references_recover_exact_tool_evidence_for_review(self) -> None:
+        messages = [
+            CORE.tool_history_message(
+                {"name": "read_file", "path": "module.py", "start_line": "190"},
+                0,
+                (
+                    "/tmp/project/module.py\n"
+                    "lines 190-201 of 400\n"
+                    "  192  first = risky_value()\n"
+                    "  193  second = first + 1\n"
+                    "  200  return second\n"
+                ),
+            )
+        ]
+
+        evidence = CORE.referenced_line_evidence(
+            messages,
+            "The issue begins at lines 192\u2013193 and reaches line 200.",
+        )
+
+        self.assertIn("/tmp/project/module.py:192: first = risky_value()", evidence)
+        self.assertIn("/tmp/project/module.py:193: second = first + 1", evidence)
+        self.assertIn("/tmp/project/module.py:200: return second", evidence)
+
     def test_local_action_contract_ignores_explanations_and_abstract_verbs(self) -> None:
         for prompt in (
             "Explain how I can run tests on Windows",
@@ -1152,6 +1246,18 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertGreater(
             CORE.tool_result_char_budget(messages, chat, large),
             CORE.tool_result_char_budget(messages, chat, small),
+        )
+        audit_chat = {
+            **chat,
+            "last_route": {
+                "prompt": "Audit source.py",
+                "action_contract": {"capability": "runtime_action", "target": "source.py"},
+            },
+        }
+        read_call = {"name": "read_file", "path": "source.py"}
+        self.assertGreater(
+            CORE.tool_result_char_budget(messages, audit_chat, small, read_call),
+            CORE.tool_result_char_budget(messages, chat, small, read_call),
         )
 
     def test_omitted_current_turn_tool_results_leave_a_compact_evidence_ledger(self) -> None:
@@ -1916,13 +2022,19 @@ class CoordinatorRoutingTests(unittest.TestCase):
         sanitized = CORE.sanitize_messages(
             [
                 {"role": "system", "content": "old"},
-                {"role": "assistant", "content": "", "tool_calls": [raw]},
+                {
+                    "role": "assistant",
+                    "content": "Lines 1-120: CHECKPOINT_SENTINEL",
+                    "tool_calls": [raw],
+                    "runtime_checkpoint": True,
+                },
                 result,
             ],
             Path("/tmp"),
             True,
         )
         self.assertEqual(sanitized[1]["tool_calls"], [raw])
+        self.assertTrue(sanitized[1]["runtime_checkpoint"])
         self.assertEqual(sanitized[2], result)
 
     def test_route_history_updates_a_turn_instead_of_duplicating_it(self) -> None:
@@ -2776,6 +2888,143 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("VISIBLE_RESPONSE", output.getvalue())
 
+    def test_action_one_shot_uses_agent_turn_instead_of_ungrounded_direct_chat(self) -> None:
+        class OneShotActionProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.executor_calls = 0
+
+            def chat(self, model: str, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                if is_completion_arbiter_request(messages):
+                    return completed_action_json()
+                self.executor_calls += 1
+                has_read_result = any("tool: read_file" in str(message.get("content") or "") for message in messages)
+                if not has_read_result:
+                    sink = kwargs.get("tool_call_sink")
+                    if callable(sink):
+                        sink({"function": {"name": "read_file", "arguments": {"path": "audit.py"}}})
+                    return ""
+                return "Audit complete: audit.py contains the expected marker."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "audit.py").write_text("EXPECTED_MARKER = True\n", encoding="ascii")
+            provider = OneShotActionProvider()
+            config = coordinator_config(semantic=False)
+            config.update(
+                {
+                    "model_mode": "direct",
+                    "model": "qwen3.5:9b",
+                    "agent": True,
+                    "permission_mode": "read-auto",
+                    "auto_compact": False,
+                }
+            )
+            args = SimpleNamespace(host=None, model=None, no_stream=True, max_tokens=None)
+            output = io.StringIO()
+            with (
+                patch.object(CORE, "provider_from_config", return_value=provider),
+                patch.object(CORE.Path, "cwd", return_value=root),
+                redirect_stdout(output),
+            ):
+                code = CORE.one_shot(args, config, "Audit audit.py")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(provider.executor_calls, 2)
+        self.assertTrue(any(call["kwargs"].get("tools") for call in provider.calls))
+        self.assertIn("EXPECTED_MARKER", output.getvalue())
+        self.assertIn("Audit complete", output.getvalue())
+
+    def test_action_one_shot_manages_a_multiwindow_audit_without_tool_prompt_churn(self) -> None:
+        class MultiwindowAuditProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+
+            def chat(self, model: str, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                if is_completion_arbiter_request(messages):
+                    return completed_action_json()
+                results = [
+                    str(message.get("content") or "")
+                    for message in messages
+                    if "tool: read_file" in str(message.get("content") or "")
+                ]
+                if not results:
+                    sink = kwargs.get("tool_call_sink")
+                    if callable(sink):
+                        sink({"function": {"name": "read_file", "arguments": {"path": "large.py"}}})
+                    return ""
+                window = CORE._read_result_window(results[-1])
+                if window and window[2] < window[3]:
+                    return f"Lines {window[1]}-{window[2]}: retained checkpoint marker_{window[2]}."
+                return "Audit complete: every line of large.py was covered."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "large.py").write_text(
+                "\n".join(f"marker_{line} = {line}" for line in range(1, 621)) + "\n",
+                encoding="ascii",
+            )
+            provider = MultiwindowAuditProvider()
+            config = coordinator_config(semantic=False)
+            config.update(
+                {
+                    "model_mode": "direct",
+                    "model": "qwen3.5:9b",
+                    "agent": True,
+                    "permission_mode": "read-auto",
+                    "auto_compact": True,
+                    "num_ctx": 4096,
+                }
+            )
+            args = SimpleNamespace(host=None, model=None, no_stream=True, max_tokens=None)
+            output = io.StringIO()
+            with (
+                patch.object(CORE, "provider_from_config", return_value=provider),
+                patch.object(CORE.Path, "cwd", return_value=root),
+                redirect_stdout(output),
+            ):
+                code = CORE.one_shot(args, config, "Audit large.py")
+
+        checkpoint_calls = [
+            call
+            for call in provider.calls
+            if "Managed audit checkpoint"
+            in "\n".join(str(message.get("content") or "") for message in call["messages"])
+        ]
+        self.assertEqual(code, 0)
+        self.assertGreater(len(checkpoint_calls), 1)
+        self.assertTrue(all(not call["kwargs"].get("tools") for call in checkpoint_calls))
+        self.assertIn("Audit complete", output.getvalue())
+        self.assertNotIn("Agent stopped", output.getvalue())
+
+    def test_action_one_shot_fails_closed_when_agent_mode_is_off(self) -> None:
+        config = {**coordinator_config(semantic=False), "model_mode": "direct", "agent": False}
+        args = SimpleNamespace(host=None, model=None, no_stream=True, max_tokens=None)
+        error = io.StringIO()
+        with patch.object(CORE, "provider_from_config", return_value=FakeProvider()), redirect_stderr(error):
+            code = CORE.one_shot(args, config, "Audit audit.py")
+
+        self.assertEqual(code, 2)
+        self.assertIn("requires local actions", error.getvalue())
+
+    def test_action_one_shot_interrupt_exits_without_traceback(self) -> None:
+        config = {**coordinator_config(semantic=False), "model_mode": "direct", "agent": True}
+        args = SimpleNamespace(host=None, model=None, no_stream=True, max_tokens=None)
+        error = io.StringIO()
+        with (
+            patch.object(CORE, "provider_from_config", return_value=FakeProvider()),
+            patch.object(CORE, "chat_turn", side_effect=KeyboardInterrupt),
+            redirect_stderr(error),
+        ):
+            code = CORE.one_shot(args, config, "Audit audit.py")
+
+        self.assertEqual(code, 130)
+        self.assertEqual(error.getvalue().strip(), "Interrupted.")
+
     def test_agent_prompt_preserves_read_only_audit_scope(self) -> None:
         prompt = CORE.system_prompt(Path("/tmp"), agent=True)
         directive = CORE.coordinator_executor_directive(
@@ -3136,6 +3385,19 @@ class CoordinatorRoutingTests(unittest.TestCase):
                 "content": "Structured tool result:\nsummary: read_file critical.py\nexit_code: 0\noutput:\ncritical evidence",
             }
         )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "Lines 201-300: AUDIT_CHECKPOINT_SENTINEL",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": {"path": "critical.py"}},
+                    }
+                ],
+                "runtime_checkpoint": True,
+            }
+        )
         messages.extend(
             {"role": "assistant", "content": f"Assistant detail {index} " + "y" * 1000} for index in range(12)
         )
@@ -3143,6 +3405,8 @@ class CoordinatorRoutingTests(unittest.TestCase):
         summary = CORE.grounded_memory_summary(messages, len(messages), config, {"cwd": "/tmp"})
 
         self.assertIn("Action result [13]: read_file critical.py", summary)
+        self.assertIn("Audit checkpoint [14]", summary)
+        self.assertIn("AUDIT_CHECKPOINT_SENTINEL", summary)
 
 
 class LoopResilienceTests(unittest.TestCase):
@@ -3424,6 +3688,60 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertEqual(chat["last_route"]["review"]["verdict"], "pass")
         self.assertEqual(chat["last_route"]["review"]["round"], 2)
 
+    def test_unresolved_review_escalates_one_final_correction_to_next_ranked_executor(self) -> None:
+        class EscalatingReviewProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.answers = ["Initial answer.", "Still disputed answer.", "Escalated grounded answer."]
+                self.answer_models: list[str] = []
+                self.reviews = [
+                    "VERDICT: REVISE\nFEEDBACK: first correction",
+                    "VERDICT: REVISE\nFEEDBACK: distinct evidence is still missing",
+                ]
+
+            def chat(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> str:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.answer_models.append(model)
+                self.last_stats = {"done_reason": "stop"}
+                return self.answers.pop(0)
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.last_stats = {"done_reason": "stop"}
+                yield self.reviews.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = coordinator_config(semantic=False)
+            config.update({"agent": True, "auto_compact": False})
+            route = {
+                "mode": "orchestrator",
+                "reviewer": "qwen3.5:9b",
+                "executor": "devstral-small-2:latest",
+                "policy": "adaptive",
+                "task_kind": "coding",
+                "candidates": [
+                    {"model": "devstral-small-2:latest", "score": 0.81},
+                    {"model": "qwen3-coder:30b", "score": 0.79},
+                    {"model": "qwen3.5:9b", "score": 0.76},
+                ],
+            }
+            chat: dict[str, Any] = {"summary": "", "project_root": "", "last_route": route}
+            messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "Audit module.py"}]
+            provider = EscalatingReviewProvider()
+            output = io.StringIO()
+            with redirect_stdout(output), patch.object(CORE, "select_orchestrator_route", return_value=route):
+                CORE.chat_turn(provider, "devstral-small-2:latest", messages, config, root, chat)
+
+        self.assertEqual(
+            provider.answer_models,
+            ["devstral-small-2:latest", "devstral-small-2:latest", "qwen3-coder:30b"],
+        )
+        self.assertIn("review remained unresolved; escalating final correction", output.getvalue())
+        self.assertIn("Escalated grounded answer.", output.getvalue())
+        self.assertEqual(messages[-1]["content"], "Escalated grounded answer.")
+        self.assertEqual(chat["last_route"]["review"]["escalated_to"], "qwen3-coder:30b")
+        self.assertEqual(chat["last_route"]["executor_recoveries"][-1]["to"], "qwen3-coder:30b")
+
     def test_review_receives_tool_role_evidence_and_completion_assessment(self) -> None:
         provider = FakeProvider(response="VERDICT: PASS")
         route_state = {
@@ -3447,13 +3765,23 @@ class LoopResilienceTests(unittest.TestCase):
                 "role": "tool",
                 "content": "Shell tool result:\ncommand: pytest -q\nexit_code: 0\noutput:\n2 passed",
             },
+            {
+                "role": "assistant",
+                "content": "Lines 1-120: distinct checkpoint evidence",
+                "runtime_checkpoint": True,
+            },
+            CORE.tool_history_message(
+                {"name": "read_file", "path": "calculator.py", "start_line": "40"},
+                0,
+                "calculator.py\nlines 40-42 of 80\n   41  return total + 1",
+            ),
         ]
 
         result = CORE.orchestrator_review(
             provider,
             route_state,
             messages,
-            "Fixed the off-by-one error in calculator.py; all tests pass.",
+            "Fixed the off-by-one error at line 41 in calculator.py; all tests pass.",
             coordinator_config(),
         )
 
@@ -3461,9 +3789,12 @@ class LoopResilienceTests(unittest.TestCase):
         prompt = str(provider.calls[-1]["messages"][-1]["content"])
         self.assertIn("edit_file calculator.py", prompt)
         self.assertIn("2 passed", prompt)
+        self.assertIn("distinct checkpoint evidence", prompt)
+        self.assertIn("calculator.py:41: return total + 1", prompt)
         self.assertIn("'complete': True", prompt)
         self.assertNotIn("Recent tool evidence:\n(none)", prompt)
         self.assertIn("does not need to reproduce commands", prompt)
+        self.assertIn("each finding must identify a distinct mechanism", prompt)
 
     def test_plain_agent_executes_a_tool_then_delivers(self) -> None:
         class ToolThenAnswerProvider(FakeProvider):
@@ -3767,6 +4098,138 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("WEB PAGE  COMPLETE", transcript)
                     self.assertIn("Official ReaperCorp Broadcast Site", transcript)
                     self.assertIn("LOCKOUT is presented", transcript)
+
+    async def test_primary_ui_completes_plain_language_large_file_audit_deterministically(self) -> None:
+        class StallingAuditProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.executor_rounds = 0
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                if is_completion_arbiter_request(messages):
+                    yield completed_action_json()
+                    return
+                self.executor_rounds += 1
+                results = [
+                    str(message.get("content") or "")
+                    for message in messages
+                    if "tool: read_file" in str(message.get("content") or "")
+                ]
+                if not results:
+                    sink = kwargs.get("tool_call_sink")
+                    if callable(sink):
+                        sink({"function": {"name": "read_file", "arguments": {"path": "large.cpp"}}})
+                    return
+                match = CORE.READ_WINDOW_RANGE_PATTERN.search(results[-1])
+                if match and int(match.group(2)) < int(match.group(3)):
+                    yield "I am continuing the audit. Please allow me a moment."
+                    return
+                yield "Audit complete. The file was reviewed from beginning to end."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            (root / "large.cpp").write_text(
+                "\n".join(f"int audit_line_{line} = {line};" for line in range(1, 1736)) + "\n",
+                encoding="ascii",
+            )
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update(
+                {
+                    "model_mode": "direct",
+                    "model": "qwen3.5:9b",
+                    "agent": True,
+                    "auto_compact": False,
+                    "permission_mode": "read-auto",
+                    "num_ctx": 8192,
+                }
+            )
+            provider = StallingAuditProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text("Audit this file")
+                await pilot.press("enter")
+                for _ in range(600):
+                    await pilot.pause(0.025)
+                    if not app.busy and provider.executor_rounds >= 8:
+                        break
+
+                self.assertFalse(app.busy)
+                read_results = [
+                    message
+                    for message in app.messages
+                    if message.get("role") == "tool" and "tool: read_file" in str(message.get("content") or "")
+                ]
+                self.assertGreater(len(read_results), 1)
+                self.assertLessEqual(len(read_results), 16)
+                returned_ranges = [
+                    window[1:3]
+                    for message in read_results
+                    if (window := CORE._read_result_window(str(message.get("content") or "")))
+                ]
+                self.assertEqual(CORE._merge_line_ranges(returned_ranges), [(1, 1735)])
+                starts = [
+                    int(call["function"]["arguments"].get("start_line", 1))
+                    for message in app.messages
+                    for call in message.get("tool_calls") or []
+                    if call.get("function", {}).get("name") == "read_file"
+                ]
+                self.assertEqual(starts, [start for start, _end in returned_ranges])
+                self.assertTrue(
+                    all(
+                        int(call["function"]["arguments"].get("max_lines", 260)) <= 260
+                        for message in app.messages
+                        for call in message.get("tool_calls") or []
+                        if call.get("function", {}).get("name") == "read_file"
+                    )
+                )
+                progress = CORE.complete_file_read_progress(
+                    "Audit this file",
+                    app.messages,
+                    saved_state=app.chat["last_route"].get("read_progress"),
+                )
+                self.assertIsNotNone(progress)
+                self.assertTrue(progress["complete"])
+                self.assertEqual(progress["ranges"], [(1, 1735)])
+                self.assertEqual(
+                    len(app.chat["last_route"].get("deterministic_continuations") or []),
+                    len(read_results) - 1,
+                )
+                checkpoints = app.chat["last_route"]["read_progress"].get("checkpoints") or []
+                self.assertEqual(len(checkpoints), len(read_results) - 1)
+                self.assertEqual(
+                    len([message for message in app.messages if message.get("runtime_checkpoint")]),
+                    len(read_results) - 1,
+                )
+                checkpoint_calls = [
+                    provider_call
+                    for provider_call in provider.calls
+                    if "Managed audit checkpoint"
+                    in "\n".join(str(message.get("content") or "") for message in provider_call["messages"])
+                ]
+                self.assertTrue(checkpoint_calls)
+                self.assertTrue(all(not provider_call["kwargs"].get("tools") for provider_call in checkpoint_calls))
+                synthesis_calls = [
+                    provider_call
+                    for provider_call in provider.calls
+                    if "Managed audit phase: coverage is complete"
+                    in "\n".join(str(message.get("content") or "") for message in provider_call["messages"])
+                ]
+                self.assertTrue(synthesis_calls)
+                self.assertTrue(all(not provider_call["kwargs"].get("tools") for provider_call in synthesis_calls))
+                transcript = app.render_transcript_text()
+                self.assertIn("Audit complete", transcript)
+                self.assertNotIn("Agent stopped after two completion corrections", transcript)
+                self.assertNotIn("Please allow me a moment", transcript)
 
     async def test_primary_ui_rejects_a_future_promise_after_an_action(self) -> None:
         class SequencedProvider(FakeProvider):
@@ -4278,10 +4741,11 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(collapsibles)
                 self.assertTrue(all(widget.collapsed for widget in collapsibles))
                 # Full result fidelity is preserved for copy/export and assertions,
-                # including the windowed read's continuation hint deep in the fold.
+                # including the final line deep in the collapsed output. A complete
+                # managed read no longer emits a synthetic continuation hint.
                 transcript = app.render_transcript_text()
                 self.assertIn("VALUE_25 = 25", transcript)
-                self.assertIn("continue with start_line=", transcript)
+                self.assertIn("VALUE_40 = 40", transcript)
 
     async def test_at_token_suggests_project_paths_in_the_composer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

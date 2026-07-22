@@ -85,6 +85,16 @@ semantic versioning after 1.0.
 - Searchable model-library sections with concise installed-model rows and progressively disclosed profile details.
 - Route-scoped whole-file coverage and evidence ledgers that survive compaction, resume at the exact unread line, and
   preserve requested headings or identifiers for the final response.
+- Plain-language file audits and reviews now establish whole-file coverage unless the user names a narrower scope.
+  When completion verification finds a known unread window, the runtime schedules that exact bounded `read_file`
+  continuation through the normal permission and action-budget path instead of asking the model to retry the call;
+  the budget adapts to the context-fitted window size within the existing hard cap. Tool-less, line-grounded
+  checkpoints retain findings between windows and through compaction, while the final synthesis and reviewer receive
+  that evidence without exposing internal checkpoint chatter in the completed transcript.
+- A second unresolved independent-review verdict now triggers one final correction from the next pre-ranked
+  Coordinator executor when available, instead of knowingly returning the disputed revision. Direct-model routes and
+  successful reviews are unchanged, and completed whole-file audits remain tool-less during this bounded escalation.
+  Review requests also include exact retained source text for each line or range cited by an audit answer.
 
 ### Changed
 
