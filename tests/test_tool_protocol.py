@@ -51,6 +51,10 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertFalse(error)
         self.assertEqual(call, {"name": "shell", "reason": "inspect", "cmd": "pwd"})
 
+        call, error = TOOL_REGISTRY.validate({"name": "run", "arguments": {"command": "pytest -q"}})
+        self.assertFalse(error)
+        self.assertEqual(call, {"name": "shell", "reason": "", "cmd": "pytest -q"})
+
         call, error = TOOL_REGISTRY.validate({"name": "read_file", "arguments": {"path": "app.py", "line": 12}})
         self.assertFalse(error)
         self.assertEqual(call, {"name": "read_file", "reason": "", "path": "app.py", "line": "12"})
@@ -87,6 +91,20 @@ class ToolRegistryTests(unittest.TestCase):
                 self.assertFalse(error)
                 self.assertEqual(call, {"name": "list_dir", "reason": "", "path": "."})
                 self.assertEqual(strip_tool_protocol(payload), "")
+
+    def test_decoder_accepts_literal_escaped_whitespace_at_envelope_boundary(self) -> None:
+        payload = (
+            '<tool>{"name":"read_file","arguments":{"path":"report.md","start_line":175}}'
+            r"\n</tool>"
+        )
+
+        call, error, recognized = decode_text_tool_call(payload)
+
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(call["name"], "read_file")
+        self.assertEqual(call["path"], "report.md")
+        self.assertEqual(call["start_line"], "175")
 
     def test_decoder_distinguishes_prose_from_malformed_action_protocol(self) -> None:
         call, error, recognized = decode_text_tool_call("This is an ordinary answer.")
@@ -142,6 +160,24 @@ class ToolRegistryTests(unittest.TestCase):
         call, error, recognized = decode_text_tool_call('some_function(argument="value")')
         self.assertIsNone(call)
         self.assertFalse(recognized)
+
+    def test_call_style_body_inside_tool_envelope_is_recovered(self) -> None:
+        call, error, recognized = decode_text_tool_call(
+            '<tool>read_file(path="report.md", start_line=41, max_lines=20)</tool>'
+        )
+
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(
+            call,
+            {
+                "name": "read_file",
+                "reason": "",
+                "path": "report.md",
+                "start_line": "41",
+                "max_lines": "20",
+            },
+        )
 
     def test_trailing_call_style_after_prose_is_recognized_as_the_action(self) -> None:
         text = 'Let me inspect that folder for you.\n<list_dir(path="C:\\Users\\example\\project")>'
@@ -232,6 +268,14 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(call["name"], "search_project")
         self.assertEqual(call["query"], "LOCKOUT")
         self.assertEqual(strip_tool_protocol(payload), "")
+
+        narrated = "I'll inspect the project root.\n<list_dir> path=/tmp/dairack-live-project</list_dir>"
+        call, error, recognized = decode_text_tool_call(narrated)
+        self.assertTrue(recognized)
+        self.assertFalse(error)
+        self.assertEqual(call["name"], "list_dir")
+        self.assertEqual(call["path"], "/tmp/dairack-live-project")
+        self.assertEqual(strip_tool_protocol(narrated), "I'll inspect the project root.")
 
     def test_near_miss_markup_never_reaches_visible_text(self) -> None:
         prose = 'However, there is a hidden folder:\n<list_dir(path="C:\\Users\\example\\.hidden")>'

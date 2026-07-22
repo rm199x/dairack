@@ -4933,7 +4933,7 @@ class DairackTextualBase(App[None]):
         ]
         if marker_positions:
             return source[: min(marker_positions)].rstrip()
-        return self.core.strip_tool_markup(source)
+        return self.core.strip_reasoning_markup(self.core.strip_tool_markup(source))
 
     def _request_start_label(self, model: str) -> str:
         try:
@@ -4975,7 +4975,7 @@ class DairackTextualBase(App[None]):
             route["timings"] = {"route": round(time.monotonic() - route_started, 3)}
             route["passes"] = 0
             route["tool_steps"] = self._agent_steps_used
-            route["tool_limit"] = self.core.agent_action_limit(self.config)
+            route["tool_limit"] = self.core.agent_action_limit(self.config, route)
             executor = str(route.get("executor") or self.config.get("model") or "")
             if not executor:
                 raise RuntimeError("no compute model is available for this route")
@@ -5069,7 +5069,7 @@ class DairackTextualBase(App[None]):
                     return
                 if not self.maybe_auto_compact(runtime, str(route["executor"])):
                     return
-                action_limit = self.core.agent_action_limit(self.config)
+                action_limit = self.core.agent_action_limit(self.config, route)
                 finalizing = self._agent_steps_used >= action_limit or self._loop_guard.force_synthesis
                 if finalizing:
                     synthesis_attempts += 1
@@ -5117,6 +5117,7 @@ class DairackTextualBase(App[None]):
                                     self._agent_steps_used,
                                     action_limit,
                                     retry=synthesis_attempts > 1,
+                                    unavailable_reason=self._loop_guard.synthesis_reason,
                                 )
                             ],
                         )
@@ -5141,6 +5142,8 @@ class DairackTextualBase(App[None]):
                         runtime,
                         native_tools,
                         finalizing=finalizing,
+                        allow_compatibility_tools=bool(self.config.get("agent"))
+                        and not self.core.is_direct_answer_route(route),
                     )
                 except self.core.RequestContextError:
                     request_messages, native_tools = self.core.fit_agent_request_context_messages(
@@ -5148,6 +5151,8 @@ class DairackTextualBase(App[None]):
                         runtime,
                         native_tools,
                         finalizing=finalizing,
+                        allow_compatibility_tools=bool(self.config.get("agent"))
+                        and not self.core.is_direct_answer_route(route),
                     )
                     route["context_degraded"] = "project retrieval omitted to fit the context window"
                 self.set_busy(
@@ -5172,7 +5177,7 @@ class DairackTextualBase(App[None]):
                             cancel_event=self.cancel_event,
                             extra_options=self.core.ollama_options(runtime),
                             tools=native_tools or None,
-                            tool_call_sink=native_calls.append,
+                            tool_call_sink=native_calls.append if native_tools else None,
                             thinking_sink=thinking_parts.append if think_enabled else None,
                         ):
                             if self.cancel_event.is_set():
@@ -5228,18 +5233,26 @@ class DairackTextualBase(App[None]):
                         self.save_current_chat()
                         continue
                     raise generation_error
+                assistant_text = self.core.strip_reasoning_markup(assistant_text)
+                accepted_native_calls = self.core.native_calls_for_request(native_calls, native_tools)
                 timings = route.setdefault("timings", {})
                 timings["execute"] = round(float(timings.get("execute") or 0) + time.monotonic() - execution_started, 3)
                 route["passes"] = int(route.get("passes") or 0) + 1
                 if not self.cancel_event.is_set() and self.maybe_run_read_batch(
-                    native_calls,
+                    accepted_native_calls,
                     assistant_text,
                     finalizing=finalizing,
                 ):
                     self.set_busy(True, "continuing")
                     continue
                 visible_text = self._visible_stream_text(assistant_text)
-                call, parse_error = self.core.resolve_tool_request(assistant_text, native_calls)
+                call, parse_error = self.core.resolve_request_tool_response(
+                    assistant_text,
+                    native_calls,
+                    native_tools,
+                    request_messages,
+                )
+                call = self.core.align_tool_call_with_action_contract(call, route, self.messages)
                 internal_call = bool(
                     call and self.core.is_internal_coordinator_call(self.core.normalize_coordinator_tool_call(call))
                 )
@@ -5270,8 +5283,8 @@ class DairackTextualBase(App[None]):
                     self.save_current_chat()
                     return
                 assistant_message: dict[str, Any] = {"role": "assistant", "content": assistant_text}
-                if native_calls:
-                    assistant_message["tool_calls"] = native_calls
+                if accepted_native_calls:
+                    assistant_message["tool_calls"] = accepted_native_calls
                 self.messages.append(assistant_message)
                 self._executor_stats = dict(getattr(self.provider, "last_stats", {}) or {})
                 self._last_turn_stats = dict(self._executor_stats)
@@ -5281,7 +5294,10 @@ class DairackTextualBase(App[None]):
                     incomplete_reason = self.core.response_incomplete_reason(
                         assistant_text,
                         self._executor_stats,
+                        self.messages,
                     )
+                    if not incomplete_reason:
+                        incomplete_reason = self.core.output_constraint_violation(route, assistant_text)
                 agent_enabled = bool(self.config.get("agent"))
                 state = self.core.TurnState(
                     action_limit=action_limit,
@@ -5582,9 +5598,13 @@ class DairackTextualBase(App[None]):
             return "continue"
         mode = str(self.config.get("permission_mode") or "ask")
         if mode == "deny":
-            self.messages.append(self.core.denied_tool_history_message(call, "by permissions policy"))
+            self._loop_guard.require_synthesis("The permissions policy denied the requested action")
+            self.messages.append(
+                self.core.denied_tool_history_message(call, "by permissions policy", close_actions=True)
+            )
             self.append_action(self.core.tool_denied_display(call, "permissions policy", "BLOCKED"))
-            return "stop"
+            self.save_current_chat()
+            return "continue"
         if mode == "read-auto" and self.core.is_auto_approvable_tool_call(
             call,
             self.cwd,
@@ -5657,7 +5677,7 @@ class DairackTextualBase(App[None]):
                 self.core.tool_denied_display(
                     call,
                     "task action budget reached "
-                    f"({self._agent_steps_used}/{self.core.agent_action_limit(self.config)})",
+                    f"({self._agent_steps_used}/{self.core.agent_action_limit(self.config, self._active_route)})",
                     "NOT RUN",
                 )
             )
@@ -5665,7 +5685,7 @@ class DairackTextualBase(App[None]):
             self.set_busy(True, "continuing")
             self.start_worker(self.generate_worker, "dairack-continue")
             return
-        step_label = f"{self._agent_steps_used}/{self.core.agent_action_limit(self.config)}"
+        step_label = f"{self._agent_steps_used}/{self.core.agent_action_limit(self.config, self._active_route)}"
         self.begin_tool_action(call, step_label)
         self.set_busy(True, f"attached terminal / {step_label}")
         started = time.monotonic()
@@ -5684,7 +5704,7 @@ class DairackTextualBase(App[None]):
         except Exception as exc:
             code = 1
             result = f"interactive action failed: {exc}"
-        self._loop_guard.record(call, result)
+        self._loop_guard.record(call, result, code == 0)
         try:
             self.append_action(
                 self.core.tool_result_display(call, code, result, approved_by, time.monotonic() - started)
@@ -5711,12 +5731,14 @@ class DairackTextualBase(App[None]):
             return
         call = self.pending_tool
         self.pending_tool = None
-        self.messages.append(self.core.denied_tool_history_message(call, "by user"))
+        self._loop_guard.require_synthesis("The user denied the requested action")
+        self.messages.append(self.core.denied_tool_history_message(call, "by user", close_actions=True))
         self.append_action(self.core.tool_denied_display(call, "denied by user"))
         self.save_current_chat()
         self.query_one("#composer", Composer).focus()
         self.set_warning_notice("Action denied")
-        self.flush_queued_prompt(False)
+        self.set_busy(True, "concluding without action")
+        self.start_worker(self.generate_worker, "dairack-continue")
 
 
 def build_textual_app(

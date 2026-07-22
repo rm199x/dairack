@@ -12,15 +12,15 @@ from .analysis import (
     analyze_task,
     execution_scope,
     merge_semantic_assessment,
-    public_web_action_contract,
     referenced_task_analysis,
+    runtime_action_contract,
     semantic_context,
     semantic_gate,
     task_kind,
     task_role,
 )
 from .calibration import estimate
-from .control import materially_larger
+from .control import explicit_routing_control, materially_larger
 from .policy import policy_for
 from .ranking import candidate_score, stage_model
 from .ranking import role_preference as ranking_role_preference
@@ -155,6 +155,57 @@ def executor_continuity(
     }
 
 
+def warm_pool_continuity(
+    scored: list[dict[str, Any]],
+    policy: str,
+    complexity: float,
+    signals: dict[str, float] | None = None,
+    task_kind: str = "",
+) -> dict[str, Any] | None:
+    """Prefer a near-best warm executor when loading the winner is poor value."""
+    if (
+        policy == "quality"
+        or not scored
+        or scored[0].get("resident")
+        or complexity >= 0.78
+        or float((signals or {}).get("reasoning") or 0) >= 0.85
+        or task_kind == "deep reasoning"
+    ):
+        return None
+    warm = next((candidate for candidate in scored[1:] if candidate.get("resident")), None)
+    if warm is None:
+        return None
+    winner_efficiency = float((scored[0].get("capabilities") or {}).get("efficiency") or 0)
+    warm_efficiency = float((warm.get("capabilities") or {}).get("efficiency") or 0)
+    requirements = [
+        (name, float((signals or {}).get(name) or 0))
+        for name, floor in (("code", 0.60), ("agent", 0.65), ("research", 0.70))
+        if float((signals or {}).get(name) or 0) >= floor
+    ]
+    if requirements:
+        winner_capabilities = scored[0].get("capabilities") or {}
+        warm_capabilities = warm.get("capabilities") or {}
+        weight = sum(demand for _name, demand in requirements)
+        winner_fit = sum(float(winner_capabilities.get(name) or 0) * demand for name, demand in requirements) / weight
+        warm_fit = sum(float(warm_capabilities.get(name) or 0) * demand for name, demand in requirements) / weight
+        if winner_fit - warm_fit >= 0.12:
+            return None
+    efficiency_gain = max(0.0, warm_efficiency - winner_efficiency)
+    policy_base = 0.055 if policy == "efficient" else 0.025
+    margin = policy_base + max(0.0, 1.0 - complexity) * 0.05 + efficiency_gain * 0.08
+    margin = min(0.14 if policy == "efficient" else 0.09, margin)
+    gap = float(scored[0]["score"]) - float(warm["score"])
+    if gap > margin:
+        return None
+    return {
+        "executor": str(warm["model"]),
+        "over": str(scored[0]["model"]),
+        "gap": round(gap, 4),
+        "margin": round(margin, 4),
+        "source": "warm pool",
+    }
+
+
 def select_route(
     provider: Any,
     config: dict[str, Any],
@@ -163,11 +214,12 @@ def select_route(
     cancel_event: threading.Event | None = None,
     previous_route: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    action_contract = public_web_action_contract(messages)
+    action_contract = runtime_action_contract(messages)
     if str(config.get("model_mode") or "direct") != "orchestrator":
         route = direct_route(config)
         route["prompt"] = latest_user_task(messages)
         route["action_contract"] = action_contract
+        route["execution_scope"] = "agentic" if action_contract else "direct-answer"
         return route
     policy = str(config.get("orchestrator_policy") or "adaptive").lower()
     if policy not in _runtime().ORCHESTRATOR_POLICIES:
@@ -203,6 +255,22 @@ def select_route(
     except Exception:
         resident = set()
     analysis = analyze_task(messages, cwd)
+    prior_analysis = referenced_task_analysis(messages, cwd)
+    explicit_control = explicit_routing_control(
+        str(analysis.get("prompt") or ""),
+        str(prior_analysis.get("prompt") or ""),
+    )
+    if explicit_control.active:
+        control_payload = explicit_control.to_dict()
+        if explicit_control.applies_to_previous and prior_analysis:
+            current_prompt = str(analysis.get("prompt") or "")
+            current_contract = analysis.get("action_contract")
+            analysis = dict(prior_analysis)
+            analysis["prompt"] = current_prompt
+            if isinstance(current_contract, dict) and current_contract.get("capability"):
+                analysis["action_contract"] = current_contract
+        analysis["routing_control"] = control_payload
+        analysis["evidence"] = ["explicit per-turn compute directive", *list(analysis.get("evidence") or [])][:6]
     signals = analysis["signals"]
     complexity = float(analysis["complexity"])
     resident_lower = {value.lower() for value in resident}
@@ -283,8 +351,9 @@ def select_route(
     context_text = semantic_context(messages)
     semantic_trigger = semantic_gate(policy, analysis, score_gap, bool(context_text))
     referenced_analysis = (
-        referenced_task_analysis(messages, cwd)
+        prior_analysis
         if semantic_trigger in {"conversation-dependent follow-up", "short contextual turn"}
+        or explicit_control.applies_to_previous
         else {}
     )
     should_assess = (
@@ -312,58 +381,68 @@ def select_route(
             analysis = merge_semantic_assessment(analysis, assessed, tuning, referenced_analysis)
             signals = analysis["signals"]
             complexity = float(analysis["complexity"])
-            baseline_scored = rank_candidates(signals, complexity)
-            routing_control = analysis.get("routing_control")
-            routing_control = dict(routing_control) if isinstance(routing_control, dict) else {}
-            if routing_control.get("active"):
-                controlled_scored = rank_candidates(signals, complexity, routing_control)
-                baseline = baseline_scored[0]
-                if routing_control.get("preference") == "higher_capacity":
-                    controlled_baseline = next(
-                        (
-                            candidate
-                            for candidate in controlled_scored
-                            if candidate["model"].lower() == baseline["model"].lower()
-                        ),
-                        baseline,
-                    )
-                    allowed_drop = 0.04 + float(routing_control.get("strength") or 0) * 0.06
-                    eligible = [
-                        candidate
-                        for candidate in controlled_scored
-                        if materially_larger(candidate["descriptor"], baseline["descriptor"])
-                        and float(candidate["capabilities"].get("efficiency") or 0) >= 0.25
-                        and float(candidate["score"]) >= float(controlled_baseline["score"]) - allowed_drop
-                    ]
-                    if eligible:
-                        selected_names = {candidate["model"].lower() for candidate in eligible}
-                        scored = eligible + [
-                            candidate
-                            for candidate in controlled_scored
-                            if candidate["model"].lower() not in selected_names
-                        ]
-                        routing_control["honored"] = True
-                    else:
-                        scored = baseline_scored
-                        routing_control["honored"] = False
-                        routing_control["status"] = "no suitable higher-capacity fit"
-                else:
-                    scored = controlled_scored
-                    routing_control["honored"] = True
-                routing_control["baseline_executor"] = baseline["model"]
-                routing_control["selected_executor"] = scored[0]["model"]
-                routing_control["changed_executor"] = scored[0]["model"].lower() != baseline["model"].lower()
-                analysis["routing_control"] = routing_control
-                semantic_assessment = analysis.get("semantic_assessment")
-                if isinstance(semantic_assessment, dict):
-                    semantic_assessment["routing_control"] = routing_control
-            else:
-                scored = baseline_scored
         elif assessed:
             assessed["trigger"] = semantic_trigger
             analysis["semantic_assessment"] = assessed
+        # Semantic arbitration is itself an inference and may have made the
+        # efficient router resident. Re-sample before the final ranking so the
+        # executor decision uses current, not pre-arbitration, load state.
+        try:
+            resident = set(provider.running_models())
+            resident_lower = {value.lower() for value in resident}
+        except Exception:
+            pass
+    baseline_scored = rank_candidates(signals, complexity)
+    routing_control = analysis.get("routing_control")
+    routing_control = dict(routing_control) if isinstance(routing_control, dict) else {}
+    scored = baseline_scored
+    if routing_control.get("active"):
+        controlled_scored = rank_candidates(signals, complexity, routing_control)
+        baseline = baseline_scored[0]
+        if routing_control.get("preference") == "higher_capacity":
+            controlled_baseline = next(
+                (
+                    candidate
+                    for candidate in controlled_scored
+                    if candidate["model"].lower() == baseline["model"].lower()
+                ),
+                baseline,
+            )
+            allowed_drop = 0.04 + float(routing_control.get("strength") or 0) * 0.06
+            eligible = [
+                candidate
+                for candidate in controlled_scored
+                if materially_larger(candidate["descriptor"], baseline["descriptor"])
+                and float(candidate["capabilities"].get("efficiency") or 0) >= 0.25
+                and float(candidate["score"]) >= float(controlled_baseline["score"]) - allowed_drop
+            ]
+            if eligible:
+                selected_names = {candidate["model"].lower() for candidate in eligible}
+                scored = eligible + [
+                    candidate for candidate in controlled_scored if candidate["model"].lower() not in selected_names
+                ]
+                routing_control["honored"] = True
+            else:
+                routing_control["honored"] = False
+                routing_control["status"] = "no suitable higher-capacity fit"
+        else:
+            scored = controlled_scored
+            routing_control["honored"] = True
+        routing_control["baseline_executor"] = baseline["model"]
+        routing_control["selected_executor"] = scored[0]["model"]
+        routing_control["changed_executor"] = scored[0]["model"].lower() != baseline["model"].lower()
+        analysis["routing_control"] = routing_control
+        semantic_assessment = analysis.get("semantic_assessment")
+        if isinstance(semantic_assessment, dict):
+            semantic_assessment["routing_control"] = routing_control
     executor = scored[0]["model"]
-    continuity = executor_continuity(scored, previous_route, policy, signals)
+    continuity = (
+        None
+        if routing_control.get("active") and routing_control.get("honored")
+        else executor_continuity(scored, previous_route, policy, signals)
+    )
+    if continuity is None and not routing_control.get("active"):
+        continuity = warm_pool_continuity(scored, policy, complexity, signals, str(analysis.get("task_kind") or ""))
     if continuity:
         executor = continuity["executor"]
     planner = ""
@@ -404,6 +483,14 @@ def select_route(
                 or signals["vision"] >= 0.50
             )
         )
+        if (
+            bool(config.get("orchestrator_review", True))
+            and str(analysis.get("task_kind") or "") == "coding agent"
+            and complexity >= 0.52
+            and signals["code"] >= 0.60
+            and signals["agent"] >= 0.65
+        ):
+            use_review = True
     semantic_assessment = analysis.get("semantic_assessment")
     if isinstance(semantic_assessment, dict) and policy != "efficient":
         # Confident semantic assessments lower — never remove — the deterministic support floors,

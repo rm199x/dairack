@@ -83,9 +83,25 @@ semantic versioning after 1.0.
 - `@`-path completion in the composer: a trailing `@fragment` ghost-suggests matching project file paths, preferring
   path prefixes, then basename prefixes, from a briefly cached bounded scan.
 - Searchable model-library sections with concise installed-model rows and progressively disclosed profile details.
+- Route-scoped whole-file coverage and evidence ledgers that survive compaction, resume at the exact unread line, and
+  preserve requested headings or identifiers for the final response.
 
 ### Changed
 
+- Native action turns use a bounded generation allowance instead of the entire context residual, preventing a
+  malformed tool call from consuming minutes of hybrid local inference. Final synthesis still receives the full safe
+  residual.
+- Validated text-form tool calls may recover a request that was authorized with native schemas; calls remain rejected
+  when agent tools were not offered. Common `run` calls normalize to the shell tool without a repair round.
+- Exact edits reject invalid Python/JSON/TOML and undefined module-level self-references before writing, recover
+  numbered read previews, and return a unique exact anchor after a mismatch. Repeated failed writes no longer count as
+  progress.
+- Independent review receives real tool-role evidence and the completion assessment, so concise verified answers are
+  not rejected for omitting internal logs. Adaptive substantive coding-agent routes use a capable executor and a
+  bounded review even when semantic review was not requested explicitly.
+- Unix shell pipelines preserve upstream failures with `pipefail`, denied-action summaries recognize plain blocked or
+  could-not wording, and ordinary requests to report exactly what changed are no longer mistaken for literal-only
+  output contracts.
 - Embedding-only utility models are excluded from chat defaults, direct selectors, Coordinator routing, and specialist
   delegation; the compute bridge now explicitly allowlists embedding inference so hybrid retrieval works through the
   authenticated remote-compute path as well as direct Ollama.

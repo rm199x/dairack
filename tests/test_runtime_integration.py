@@ -83,6 +83,24 @@ def semantic_json(**overrides: Any) -> str:
     return json.dumps(payload, separators=(",", ":"))
 
 
+def is_completion_arbiter_request(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        "completion arbiter inside an agent runtime" in str(message.get("content") or "") for message in messages
+    )
+
+
+def completed_action_json() -> str:
+    return json.dumps(
+        {
+            "complete": True,
+            "needs_action": False,
+            "confidence": 0.99,
+            "reason": "the requested action completed",
+        },
+        separators=(",", ":"),
+    )
+
+
 SEMANTIC_JSON = semantic_json(
     intent="coding",
     code=1,
@@ -322,6 +340,67 @@ class CoordinatorRoutingTests(unittest.TestCase):
                 )
                 self.assertFalse(admitted)
 
+    def test_exact_response_instruction_cannot_gain_tool_authority(self) -> None:
+        provider = FakeProvider(
+            response=semantic_json(
+                intent="system_action",
+                agent=0.95,
+                complexity=0.3,
+                requires_action=True,
+                confidence=0.98,
+                reason="incorrectly inferred system action",
+            )
+        )
+        decision = route(provider, "Reply with exactly BRIDGE-OK and nothing else.")
+
+        self.assertEqual(decision["execution_scope"], "direct-answer")
+        self.assertFalse(decision["action_contract"])
+        self.assertLess(decision["signals"]["agent"], 0.34)
+        self.assertEqual(CORE.native_tools_for(provider, decision["executor"], True, decision), [])
+
+    def test_pure_reasoning_does_not_pay_for_an_agent_tool_surface(self) -> None:
+        provider = FakeProvider(
+            response=semantic_json(
+                intent="reasoning",
+                reasoning=0.94,
+                general=0.72,
+                complexity=0.66,
+                confidence=0.96,
+                reason="self-contained conceptual comparison",
+            )
+        )
+        decision = route(provider, "Compare B-trees and LSM trees for a write-heavy database.")
+
+        self.assertEqual(decision["task_kind"], "deep reasoning")
+        self.assertEqual(decision["execution_scope"], "direct-answer")
+        self.assertEqual(CORE.native_tools_for(provider, decision["executor"], True, decision), [])
+
+    def test_attached_image_description_does_not_invent_an_external_action(self) -> None:
+        provider = FakeProvider(
+            response=semantic_json(
+                intent="visual",
+                agent=0.9,
+                vision=1,
+                complexity=0.3,
+                requires_action=True,
+                confidence=0.98,
+                reason="incorrectly inferred an action for attached input",
+            )
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": "Describe the attached interface.",
+                "image_paths": ["/tmp/reference.png"],
+            }
+        ]
+        decision = CORE.select_orchestrator_route(provider, coordinator_config(), messages, Path("/tmp"))
+
+        self.assertEqual(decision["task_kind"], "visual analysis")
+        self.assertEqual(decision["execution_scope"], "direct-answer")
+        self.assertFalse(decision["action_contract"])
+        self.assertEqual(CORE.native_tools_for(provider, decision["executor"], True, decision), [])
+
     def test_public_website_request_gets_an_agentic_open_contract(self) -> None:
         provider = FakeProvider(())
         decision = route(
@@ -360,7 +439,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
         directive = CORE.coordinator_executor_directive(decision, coordinator_config())
         self.assertIn("real function", CORE.system_prompt(Path("/tmp"), True, coordinator_config()))
         self.assertIn("supplied function tool", directive)
-        self.assertIn("Do not print commands", directive)
+        self.assertIn("Return no prose with a tool call", directive)
 
     def test_explanatory_request_does_not_gain_an_action_contract(self) -> None:
         provider = FakeProvider(
@@ -377,6 +456,254 @@ class CoordinatorRoutingTests(unittest.TestCase):
         decision = route(provider, "Explain how I can find an Unreal project on Windows")
 
         self.assertFalse(decision.get("action_contract"))
+
+    def test_direct_model_mode_enforces_an_explicit_local_action_contract(self) -> None:
+        config = {
+            **coordinator_config(semantic=False),
+            "model_mode": "direct",
+            "model": "qwen3.5:9b",
+        }
+        decision = route(
+            FakeProvider(()),
+            "Read dairack-audit-report.md in consecutive read_file windows and report the findings.",
+            config,
+        )
+
+        self.assertEqual(decision["mode"], "direct")
+        self.assertEqual(decision["execution_scope"], "agentic")
+        self.assertEqual(decision["action_contract"]["capability"], "runtime_action")
+        self.assertEqual(decision["action_contract"]["target"], "dairack-audit-report.md")
+        directive = CORE.coordinator_executor_directive(decision, config)
+        self.assertIn("Call one supplied function tool now", directive)
+        self.assertIn("dairack-audit-report.md", directive)
+        self.assertTrue(CORE.action_completion_required(decision, 1, True))
+
+    def test_direct_response_turn_disables_native_and_compatibility_tool_surfaces(self) -> None:
+        config = {
+            **coordinator_config(semantic=False),
+            "model_mode": "direct",
+            "model": "qwen3.5:9b",
+            "num_ctx": 4096,
+        }
+        provider = FakeProvider(())
+        prompt = "Update the remembered deployment region to WEST-PIER. Reply with exactly UPDATED."
+        decision = route(provider, prompt, config)
+        messages = [
+            {"role": "system", "content": CORE.system_prompt(Path("/tmp"), True)},
+            {"role": "user", "content": prompt},
+        ]
+
+        native = CORE.native_tools_for(provider, "qwen3.5:9b", True, decision)
+        fitted, request_tools = CORE.fit_agent_request_context_messages(
+            messages,
+            config,
+            native,
+            allow_compatibility_tools=not CORE.is_direct_answer_route(decision),
+        )
+        rendered = "\n".join(str(message.get("content") or "") for message in fitted)
+
+        self.assertEqual(decision["execution_scope"], "direct-answer")
+        self.assertEqual(native, [])
+        self.assertEqual(request_tools, [])
+        self.assertNotIn(CORE.COMPATIBILITY_TOOL_DIRECTIVE, rendered)
+        self.assertNotIn("Agent mode is enabled", rendered)
+        self.assertNotIn("Available tools:", rendered)
+        self.assertIn(CORE.TOOLLESS_REQUEST_DIRECTIVE, rendered)
+        self.assertIn("Final output requirement", CORE.coordinator_executor_directive(decision, config))
+        state = CORE.context_state(
+            messages,
+            "",
+            config,
+            {"last_route": decision, "summary_upto": 1},
+        )
+        self.assertEqual(state["mode"], "conversation")
+        self.assertEqual(state["tool_tokens"], 0)
+
+    def test_file_actions_align_a_distorted_relative_target_before_permission_review(self) -> None:
+        route_state = {
+            "tool_steps": 0,
+            "action_contract": {
+                "capability": "runtime_action",
+                "target": "docs/report.md",
+            },
+        }
+        call = {"name": "read_file", "path": "/home/user/report.md", "start_line": "1"}
+
+        aligned = CORE.align_tool_call_with_action_contract(call, route_state)
+
+        self.assertEqual(aligned["path"], "docs/report.md")
+        self.assertEqual(call["path"], "/home/user/report.md")
+        self.assertEqual(route_state["contract_corrections"][0]["from"], "/home/user/report.md")
+        route_state["tool_steps"] = 1
+        self.assertEqual(CORE.align_tool_call_with_action_contract(call, route_state)["path"], "docs/report.md")
+        unrelated = {"name": "read_file", "path": "/etc/passwd"}
+        route_state["tool_steps"] = 0
+        self.assertEqual(CORE.align_tool_call_with_action_contract(unrelated, route_state), unrelated)
+
+    def test_complete_file_contract_enforces_actual_continuation_and_expands_only_its_budget(self) -> None:
+        config = coordinator_config(semantic=False)
+        task = (
+            "Read docs/report.md from beginning to end using consecutive read_file windows of at most 120 lines. "
+            "Report the exact H2 heading."
+        )
+        route_state = {
+            "prompt": task,
+            "tool_steps": 1,
+            "action_contract": {"capability": "runtime_action", "target": "docs/report.md"},
+        }
+        messages = [
+            {"role": "user", "content": task},
+            {
+                "role": "tool",
+                "content": (
+                    "Structured tool result:\n"
+                    "tool: read_file\n"
+                    "summary: read_file docs/report.md:1+\n"
+                    "exit_code: 0\n"
+                    "output:\n"
+                    "/tmp/project/docs/report.md\n"
+                    "lines 1-29 of 417\n"
+                    "    1  heading\n"
+                    "...[continue with start_line=30, max_lines=29]"
+                ),
+            },
+        ]
+        call = {
+            "name": "read_file",
+            "path": "/home/user/report.md",
+            "start_line": "80",
+            "max_lines": "150",
+        }
+
+        aligned = CORE.align_tool_call_with_action_contract(call, route_state, messages)
+
+        self.assertEqual(aligned["path"], "docs/report.md")
+        self.assertEqual(aligned["start_line"], "30")
+        self.assertEqual(aligned["max_lines"], "120")
+        self.assertEqual(CORE.agent_action_limit(config), CORE.DEFAULT_AGENT_ACTION_LIMIT)
+        self.assertEqual(CORE.agent_action_limit(config, route_state), 32)
+
+        progress = CORE.complete_file_read_progress(task, messages, "docs/report.md")
+        self.assertIsNotNone(progress)
+        self.assertEqual(progress["next_line"], 30)
+        self.assertEqual(progress["total"], 417)
+        self.assertFalse(progress["complete"])
+
+        provider = FakeProvider(())
+        completion = CORE.assess_action_completion(
+            provider,
+            config,
+            route_state,
+            messages,
+            "H2. Premature answer",
+        )
+        self.assertFalse(completion["complete"])
+        self.assertTrue(completion["needs_action"])
+        self.assertEqual(completion["model"], "deterministic read ledger")
+        self.assertIn("start_line=30", completion["reason"])
+        self.assertEqual(provider.calls, [])
+
+        first_result = str(messages[1]["content"]).partition("\noutput:\n")[2]
+        CORE.update_complete_file_read_state(route_state, call, 0, first_result)
+        persisted = CORE.complete_file_read_progress(
+            task,
+            [],
+            "docs/report.md",
+            route_state["read_progress"],
+        )
+        self.assertIsNotNone(persisted)
+        self.assertEqual(persisted["next_line"], 30)
+        directive = CORE.complete_file_read_directive(route_state)
+        self.assertIn("authoritative across compaction", directive)
+        self.assertIn("start_line=30", directive)
+
+        second_result = (
+            "/tmp/project/docs/report.md\n"
+            "lines 30-43 of 417\n"
+            "   39  ### H2. Exact checkpoint heading\n"
+            "...[continue with start_line=44, max_lines=120]"
+        )
+        CORE.update_complete_file_read_state(
+            route_state,
+            {"name": "read_file", "path": "docs/report.md", "start_line": "30", "max_lines": "120"},
+            0,
+            second_result,
+        )
+        directive = CORE.complete_file_read_directive(route_state)
+        self.assertIn("start_line=44", directive)
+        self.assertIn("### H2. Exact checkpoint heading", directive)
+
+        completed_route = deepcopy(route_state)
+        completed_route["read_progress"]["total"] = 43
+        completed_route["read_progress"]["ranges"] = [[1, 43]]
+        self.assertIn(
+            "H2",
+            CORE.output_constraint_violation(completed_route, "H2: Exact checkpoint"),
+        )
+        self.assertEqual(
+            CORE.output_constraint_violation(completed_route, "H2: Exact checkpoint heading"),
+            "",
+        )
+
+    def test_local_action_contract_ignores_explanations_and_abstract_verbs(self) -> None:
+        for prompt in (
+            "Explain how I can run tests on Windows",
+            "Review this proposed API design",
+            "Test whether 17 is prime",
+            "Check the square root of 81",
+            "Review this root cause analysis",
+            "Can you check my reasoning?",
+            "Reply with exactly run tests",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(CORE.runtime_action_contract([{"role": "user", "content": prompt}]))
+
+    def test_local_resource_inventory_question_creates_an_action_contract(self) -> None:
+        for prompt in (
+            "What folders are in the project root?",
+            "What immediate hidden directories are in the project root?",
+            "How many top-level directories are in this workspace?",
+        ):
+            with self.subTest(prompt=prompt):
+                messages = [{"role": "user", "content": prompt}]
+                contract = CORE.runtime_action_contract(messages)
+                self.assertEqual(contract["capability"], "runtime_action")
+                self.assertEqual(contract["preferred_tool"], "list_dir")
+                analysis = CORE.analyze_orchestrator_task(messages, Path("/tmp"))
+                self.assertEqual(CORE.coordinator_semantic_gate("adaptive", analysis, 0.01, False), "")
+        self.assertEqual(
+            CORE.runtime_action_contract([{"role": "user", "content": "inspect root"}])["capability"],
+            "runtime_action",
+        )
+
+    def test_explicit_tool_imperative_creates_an_agentic_contract(self) -> None:
+        prompt = "Use grep to find COBALT-NEEDLE-73 and report only relative-path:line-number."
+        contract = CORE.runtime_action_contract([{"role": "user", "content": prompt}])
+
+        self.assertEqual(contract["capability"], "runtime_action")
+        self.assertEqual(contract["preferred_tool"], "grep")
+
+    def test_hidden_reasoning_boundaries_are_removed_and_output_only_violations_retry(self) -> None:
+        leaked = "internal uncertainty\n</think>\n\nThe result is 2."
+        self.assertEqual(CORE.strip_reasoning_markup(leaked), "The result is 2.")
+        route_state = {
+            "prompt": "List the root and report only the number.",
+            "executor": "qwen3.5:9b",
+            "action_contract": {"capability": "runtime_action"},
+        }
+        provider = FakeProvider(response=completed_action_json())
+
+        assessment = CORE.assess_action_completion(
+            provider,
+            coordinator_config(semantic=False),
+            route_state,
+            [{"role": "user", "content": route_state["prompt"]}],
+            "There are **2** directories.\nThat is the final count.",
+        )
+
+        self.assertFalse(assessment["complete"])
+        self.assertEqual(assessment["confidence"], 1.0)
+        self.assertEqual(provider.calls, [])
 
     def test_website_follow_up_resolves_the_prior_public_target(self) -> None:
         decision = route(
@@ -417,7 +744,8 @@ class CoordinatorRoutingTests(unittest.TestCase):
         for prompt in ("Review runtime.py", "Build a website from the local project"):
             with self.subTest(prompt=prompt):
                 decision = route(FakeProvider(()), prompt, coordinator_config(semantic=False))
-                self.assertFalse(decision.get("action_contract"))
+                self.assertEqual(decision["action_contract"]["capability"], "runtime_action")
+                self.assertEqual(decision["signals"]["research"], 0.0)
 
     def test_final_request_fit_reserves_tools_and_keeps_latest_image(self) -> None:
         config = {**coordinator_config(semantic=False), "num_ctx": 8192, "context_budget_ratio": 0.82}
@@ -452,18 +780,51 @@ class CoordinatorRoutingTests(unittest.TestCase):
             {"role": "user", "content": "What folders are in root?"},
         ]
 
-        fitted, tools = CORE.fit_agent_request_context_messages(messages, config, CORE.agent_tool_schemas())
+        fitted, tools = CORE.fit_agent_request_context_messages(
+            CORE.canonicalize_messages(messages, ["ACTIVE_ROUTE_DIRECTIVE"]),
+            config,
+            CORE.agent_tool_schemas(),
+        )
 
         # Native tools stay active at the default context size; the schemas are
         # authoritative there, so the duplicate prose catalog is dropped.
         self.assertTrue(tools)
         self.assertIn(CORE.NATIVE_TOOL_DIRECTIVE, fitted[0]["content"])
         self.assertNotIn("Available tools:", fitted[0]["content"])
-        self.assertIn("Compatibility fallback only:", fitted[0]["content"])
+        self.assertNotIn("Compatibility fallback only:", fitted[0]["content"])
 
         compat, no_tools = CORE.fit_agent_request_context_messages(messages, config, None)
         self.assertEqual(no_tools, [])
         self.assertIn("Available tools:", compat[0]["content"])
+        self.assertIn(CORE.COMPATIBILITY_TOOL_DIRECTIVE, compat[0]["content"])
+
+    def test_required_macro_memory_survives_native_schema_fitting(self) -> None:
+        config = {**coordinator_config(semantic=False), "num_ctx": 4096, "context_budget_ratio": 0.82}
+        messages = [
+            {"role": "system", "content": CORE.system_prompt(Path("/tmp"), True, config)},
+            {
+                "role": "system",
+                "content": (
+                    "Persistent summary of earlier conversation:\n"
+                    "Memory-use rule: copy exact prior identifiers verbatim.\n"
+                    "User [1]: The exact codename is ORCHID-47.\n" + "Routine grounded event. " * 170
+                ),
+            },
+            {"role": "user", "content": "What was the exact codename from earlier?"},
+        ]
+
+        fitted, tools = CORE.fit_agent_request_context_messages(
+            CORE.canonicalize_messages(messages, ["ACTIVE_ROUTE_DIRECTIVE"]),
+            config,
+            CORE.agent_tool_schemas(),
+        )
+        rendered = "\n".join(str(message.get("content") or "") for message in fitted)
+
+        self.assertTrue(tools)
+        self.assertIn("ORCHID-47", rendered)
+        self.assertIn(CORE.NATIVE_TOOL_DIRECTIVE, rendered)
+        self.assertNotIn("Available tools:", rendered)
+        self.assertNotIn("temporarily omitted", rendered)
 
     def test_final_fitter_can_shrink_macro_memory_without_dropping_active_directives(self) -> None:
         config = {**coordinator_config(semantic=False), "num_ctx": 4096, "context_budget_ratio": 0.82}
@@ -520,6 +881,10 @@ class CoordinatorRoutingTests(unittest.TestCase):
 
         packed = [{"role": "user", "content": "x" * 40_000}]
         self.assertEqual(CORE.executor_response_allowance(packed, None, config), 256)
+
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]
+        self.assertEqual(CORE.executor_response_allowance(small, tools, config), 768)
+        self.assertEqual(CORE.executor_response_allowance(small, tools, {**config, "num_ctx": 8192}), 1024)
 
     def test_context_posture_directive_matches_window_tiers(self) -> None:
         tight = {**coordinator_config(semantic=False), "num_ctx": 4096, "context_budget_ratio": 0.82}
@@ -580,6 +945,82 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIsNotNone(CORE._executor_continuity([moderate, incumbent], previous, "adaptive", signals))
         self.assertIsNone(CORE._executor_continuity([moderate, incumbent], previous, "quality", signals))
 
+    def test_adaptive_warm_pool_avoids_a_low_value_cold_load(self) -> None:
+        cold = {
+            "model": "specialist:large",
+            "score": 0.804,
+            "resident": False,
+            "capabilities": {"efficiency": 0.62},
+        }
+        warm = {
+            "model": "general:small",
+            "score": 0.764,
+            "resident": True,
+            "capabilities": {"efficiency": 0.90},
+        }
+
+        choice = CORE._warm_pool_continuity([cold, warm], "adaptive", 0.54)
+
+        self.assertIsNotNone(choice)
+        self.assertEqual(choice["executor"], "general:small")
+        self.assertEqual(choice["source"], "warm pool")
+        self.assertIsNone(CORE._warm_pool_continuity([cold, warm], "quality", 0.54))
+        self.assertIsNone(CORE._warm_pool_continuity([cold, warm], "adaptive", 0.85))
+
+        # Semantic arbitration can make the efficient router warm immediately
+        # before execution. A modest specialist lead should not then pay a cold
+        # model load on ordinary Adaptive work.
+        observed_cold = {**cold, "score": 0.825}
+        observed_warm = {**warm, "score": 0.760}
+        observed = CORE._warm_pool_continuity([observed_cold, observed_warm], "adaptive", 0.587)
+        self.assertIsNotNone(observed)
+        self.assertEqual(observed["executor"], "general:small")
+
+        capable_cold = {
+            **observed_cold,
+            "capabilities": {"code": 0.92, "agent": 0.94, "efficiency": 0.62},
+        }
+        limited_warm = {
+            **observed_warm,
+            "capabilities": {"code": 0.70, "agent": 0.76, "efficiency": 0.90},
+        }
+        high_demand = {"code": 0.69, "agent": 0.82}
+        self.assertIsNone(
+            CORE._warm_pool_continuity(
+                [capable_cold, limited_warm],
+                "adaptive",
+                0.597,
+                high_demand,
+                "coding agent",
+            )
+        )
+
+        decisive = {**observed_cold, "score": 0.900}
+        self.assertIsNone(CORE._warm_pool_continuity([decisive, observed_warm], "adaptive", 0.587))
+
+    def test_adaptive_routine_code_inspection_keeps_the_efficient_resident_model(self) -> None:
+        provider = FakeProvider(
+            response=semantic_json(
+                intent="coding",
+                code=0.76,
+                agent=0.72,
+                reasoning=0.48,
+                general=0.42,
+                complexity=0.54,
+                requires_action=True,
+                confidence=0.95,
+                reason="small bounded code inspection",
+            )
+        )
+        decision = route(
+            provider,
+            "Inspect this small Python project, run its tests, identify the defect, and recommend the minimal fix.",
+        )
+
+        self.assertEqual(decision["executor"], "qwen3.5:9b")
+        if decision["continuity"]:
+            self.assertEqual(decision["continuity"]["source"], "warm pool")
+
     def test_final_request_fit_fails_locally_when_latest_turn_cannot_fit(self) -> None:
         config = {**coordinator_config(semantic=False), "num_ctx": 1024, "context_budget_ratio": 0.82}
         messages = [
@@ -631,6 +1072,21 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertFalse(any(message.get("tool_calls") for message in fitted))
         self.assertEqual(fitted[-1]["role"], "user")
         self.assertIn("Structured tool result:", fitted[-1]["content"])
+
+    def test_final_synthesis_does_not_pay_for_or_advertise_disabled_tool_protocol(self) -> None:
+        config = {**coordinator_config(semantic=False), "num_ctx": 4096, "context_budget_ratio": 0.82}
+        messages = [
+            {"role": "system", "content": CORE.system_prompt(Path("/tmp"), True)},
+            {"role": "user", "content": "Summarize the evidence already collected."},
+            {"role": "user", "content": "Structured tool result:\noutput:\nverified value"},
+        ]
+
+        fitted, request_tools = CORE.fit_agent_request_context_messages(messages, config, [], finalizing=True)
+        rendered = "\n".join(str(message.get("content") or "") for message in fitted)
+
+        self.assertEqual(request_tools, [])
+        self.assertNotIn(CORE.COMPATIBILITY_TOOL_DIRECTIVE, rendered)
+        self.assertIn("verified value", rendered)
 
     def test_active_context_keeps_native_tool_exchange_atomic(self) -> None:
         config = {**coordinator_config(semantic=False), "num_ctx": 2048, "context_budget_ratio": 0.82}
@@ -735,6 +1191,59 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIn("EVIDENCE_", rendered)
         self.assertEqual([message["role"] for message in active[-2:]], ["assistant", "tool"])
 
+    def test_whole_file_reads_keep_exact_coverage_and_requested_evidence_under_pressure(self) -> None:
+        config = {"num_ctx": 4096, "context_budget_ratio": 0.82, "agent": False}
+        task = (
+            "Read report.md from beginning to end using consecutive read_file windows of at most 120 lines. "
+            "Report the exact heading H2 and severity counts."
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": task},
+        ]
+
+        def add_window(start: int, end: int, body: str) -> None:
+            call = {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": {"path": "report.md", "start_line": start, "max_lines": 120},
+                },
+            }
+            messages.extend(
+                [
+                    {"role": "assistant", "content": "", "tool_calls": [call]},
+                    {
+                        "role": "tool",
+                        "tool_name": "read_file",
+                        "content": (
+                            "Structured tool result:\n"
+                            "tool: read_file\n"
+                            f"summary: read_file report.md:{start}+\n"
+                            "exit_code: 0\n"
+                            "output:\n"
+                            "report.md\n"
+                            f"lines {start}-{end} of 417\n"
+                            f"{body}\n"
+                            f"...[continue with start_line={end + 1}, max_lines=120]"
+                        ),
+                    },
+                ]
+            )
+
+        add_window(1, 29, "   13  | High | 9 |\n   14  | Medium | 22 |\n" + "x" * 5000)
+        add_window(30, 43, "   39  ### H2. Exact checkpoint heading\n" + "y" * 5000)
+        add_window(80, 89, "   80  ### H7. Later heading\n" + "z" * 5000)
+
+        active = CORE.active_context_messages(messages, "", config)
+        rendered = "\n".join(str(message.get("content") or "") for message in active)
+
+        self.assertIn(CORE.ACTIVE_READ_LEDGER_PREFIX, rendered)
+        self.assertIn("covered 1-43, 80-89 of 417; earliest unread line 44", rendered)
+        self.assertIn("start_line=44 and max_lines<=120", rendered)
+        self.assertIn("### H2. Exact checkpoint heading", rendered)
+        self.assertIn("| High | 9 |", rendered)
+
     def test_read_file_window_is_clamped_to_the_context_result_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -751,6 +1260,18 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIn("lines 101-120 of 400", output)
         self.assertIn("continue with start_line=121, max_lines=20", output)
         self.assertNotIn("  121  line 121", output)
+
+    def test_directory_listing_reports_typed_entry_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs").mkdir()
+            (root / "src").mkdir()
+            (root / "README.md").write_text("fixture", encoding="utf-8")
+
+            code, output = CORE.list_directory(root)
+
+        self.assertEqual(code, 0)
+        self.assertIn("entries: 3 total / 2 directories / 1 file", output)
 
     def test_large_read_after_compaction_is_rebounded_for_a_valid_continuation(self) -> None:
         config = {
@@ -1226,6 +1747,52 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIn(decision["task_kind"], {"coding", "coding agent"})
         self.assertGreaterEqual(decision["complexity"], 0.50)
 
+    def test_implementation_against_tests_is_deterministically_coding_agent_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            analysis = CORE.analyze_orchestrator_task(
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Implement the behavior required by the existing tests with a minimal change. "
+                            "Do not modify tests. Run the unittest test suite after editing."
+                        ),
+                    }
+                ],
+                root,
+            )
+
+        self.assertEqual(analysis["task_kind"], "coding agent")
+        self.assertGreaterEqual(analysis["signals"]["code"], 0.5)
+        self.assertGreaterEqual(analysis["signals"]["agent"], 0.5)
+        self.assertTrue(any(item.startswith("code:") for item in analysis["evidence"]))
+
+    def test_adaptive_substantive_coding_agent_uses_specialist_and_review(self) -> None:
+        provider = FakeProvider(
+            response=semantic_json(
+                intent="coding",
+                code=1.0,
+                agent=1.0,
+                complexity=0.7,
+                requires_action=True,
+                needs_plan=True,
+                needs_review=False,
+                confidence=0.95,
+                reason="implement and verify a code change",
+            )
+        )
+        decision = route(
+            provider,
+            "Implement the behavior required by the tests, run the unittest suite after editing, and report it.",
+        )
+
+        self.assertEqual(decision["task_kind"], "coding agent")
+        self.assertNotEqual(decision["executor"], "qwen3.5:9b")
+        self.assertTrue(decision["reviewer"])
+        self.assertIn(decision["strategy"], {"reviewed", "plan-review"})
+
     def test_semantic_general_label_cannot_suppress_corroborated_research(self) -> None:
         decision = route(
             FakeProvider(
@@ -1509,6 +2076,30 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertIn(resolved_task, directive)
         self.assertIn("Do not inspect, list, load, or discuss models", directive)
 
+    def test_explicit_capacity_request_survives_semantic_classifier_miss(self) -> None:
+        provider = FakeProvider(
+            response=semantic_json(
+                intent="reasoning",
+                reasoning=0.78,
+                general=0.82,
+                complexity=0.42,
+                confidence=0.96,
+                compute_preference="auto",
+                control_target="none",
+                reason="missed the explicit compute instruction",
+            )
+        )
+        decision = route(
+            provider,
+            "Use a larger, heavier model for this turn. Compare Dairack and Relay, then recommend one.",
+        )
+
+        self.assertEqual(decision["executor"], "qwen3.6:27b")
+        self.assertTrue(decision["routing_control"]["active"])
+        self.assertTrue(decision["routing_control"]["honored"])
+        self.assertEqual(decision["routing_control"]["preference"], "higher_capacity")
+        self.assertEqual(decision["execution_scope"], "direct-answer")
+
     def test_quality_request_can_raise_answer_depth_without_becoming_a_tool_task(self) -> None:
         provider = FakeProvider(
             response=semantic_json(
@@ -1638,7 +2229,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertGreaterEqual(decision["signals"]["code"], 0.35)
         self.assertEqual(decision["preference_role"], "coding")
 
-    def test_uncertain_or_contextless_capacity_control_is_ignored(self) -> None:
+    def test_uncertain_or_contextless_semantic_capacity_control_is_ignored(self) -> None:
         resolved_task = "Generate a better framework name."
         cases = (
             (
@@ -1664,7 +2255,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
                         reason="possible capacity instruction",
                     )
                 )
-                decision = route(provider, "Use a heavier model", history=history)
+                decision = route(provider, "Can you devote additional compute to that?", history=history)
 
                 self.assertEqual(decision["executor"], "qwen3.5:9b")
                 self.assertFalse(decision["routing_control"]["active"])
@@ -2143,6 +2734,35 @@ class CoordinatorRoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "could not verify"):
             CORE.native_tools_for(BrokenProvider(), "model", True, {"execution_scope": "agentic"})
 
+    def test_unsolicited_native_calls_are_ignored_without_supplied_schemas(self) -> None:
+        call = {"function": {"name": "list_dir", "arguments": {"path": "/"}}}
+
+        self.assertEqual(CORE.native_calls_for_request([call], []), [])
+        self.assertEqual(CORE.native_calls_for_request([call], CORE.agent_tool_schemas()), [call])
+
+    def test_request_parser_accepts_validated_fallback_only_when_tools_are_advertised(self) -> None:
+        payload = '<tool>{"name":"list_dir","arguments":{"path":"/"}}</tool>'
+        native_messages = [{"role": "system", "content": CORE.NATIVE_TOOL_DIRECTIVE}]
+        compat_messages = [{"role": "system", "content": CORE.COMPATIBILITY_TOOL_DIRECTIVE}]
+        toolless_messages = [{"role": "system", "content": CORE.TOOLLESS_REQUEST_DIRECTIVE}]
+
+        call, error = CORE.resolve_request_tool_response(
+            payload,
+            [],
+            CORE.agent_tool_schemas(),
+            native_messages,
+        )
+        self.assertFalse(error)
+        self.assertEqual(call["name"], "list_dir")
+
+        call, error = CORE.resolve_request_tool_response(payload, [], [], compat_messages)
+        self.assertFalse(error)
+        self.assertEqual(call["name"], "list_dir")
+
+        call, error = CORE.resolve_request_tool_response(payload, [], [], toolless_messages)
+        self.assertIsNone(call)
+        self.assertIn("without an active compatibility", error)
+
     def test_non_streaming_one_shot_prints_returned_response(self) -> None:
         class OneShotProvider:
             def chat(self, *_args: Any, **_kwargs: Any) -> str:
@@ -2164,7 +2784,9 @@ class CoordinatorRoutingTests(unittest.TestCase):
         )
 
         self.assertIn("audit requests are read-only", prompt)
-        self.assertIn("inspection, explanation, review, and audit remain read-only", directive)
+        self.assertIn("Preserve the user's requested scope", prompt)
+        self.assertIn("without a leading cd", prompt)
+        self.assertIn("Retain task ownership", directive)
 
     def test_action_completion_arbiter_rejects_a_future_promise(self) -> None:
         provider = FakeProvider(
@@ -2210,6 +2832,13 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertTrue(CORE.action_completion_required(route_state, 1, True))
         self.assertFalse(CORE.action_completion_required(route_state, 1, False))
         self.assertFalse(CORE.action_completion_required({"mode": "direct"}, 1, True))
+        self.assertTrue(
+            CORE.action_completion_required(
+                {"mode": "direct", "action_contract": {"capability": "runtime_action"}},
+                1,
+                True,
+            )
+        )
 
     def test_find_paths_locates_a_named_unreal_project_without_shell_syntax(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2241,6 +2870,126 @@ class CoordinatorRoutingTests(unittest.TestCase):
         self.assertEqual(CORE.response_incomplete_reason("Here are the steps:"), "")
         self.assertEqual(CORE.response_incomplete_reason("I was checking,"), "")
         self.assertEqual(CORE.response_incomplete_reason("first; second;"), "")
+
+    def test_final_response_must_acknowledge_a_denied_verification(self) -> None:
+        messages = [
+            {"role": "user", "content": "Fix the defect and run tests."},
+            {
+                "role": "tool",
+                "content": (
+                    "Action was not executed: by user. No further tool actions are available in this turn. "
+                    "Use the evidence already collected and return a complete final answer; identify anything "
+                    "unverified honestly."
+                ),
+            },
+        ]
+
+        reason = CORE.response_incomplete_reason("The code was fixed. To verify fully:", messages=messages)
+
+        self.assertIn("denied action was not run", reason)
+        self.assertEqual(
+            CORE.response_incomplete_reason(
+                "The edit was applied, but the denied test command did not run and remains unverified.",
+                messages=messages,
+            ),
+            "",
+        )
+
+    def test_exact_edit_rejects_invalid_structured_content_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "calculator.py"
+            original = "def average(values):\n    return sum(values) / len(values)\n"
+            source.write_text(original, encoding="utf-8")
+
+            code, output = CORE.apply_exact_edit(
+                {
+                    "name": "edit_file",
+                    "path": "calculator.py",
+                    "old_string": "    return sum(values) / len(values)",
+                    "new_string": "return sum(values) / len(values)",
+                },
+                root,
+            )
+
+            self.assertEqual(code, 1)
+            self.assertIn("rejected before writing", output)
+            self.assertIn("updated Python is invalid", output)
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+
+            code, output = CORE.apply_exact_edit(
+                {
+                    "name": "edit_file",
+                    "path": "calculator.py",
+                    "old_string": original,
+                    "new_string": "return sum(values) / len(values)\n",
+                },
+                root,
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("'return' outside function", output)
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+
+            code, output = CORE.apply_exact_edit(
+                {
+                    "name": "edit_file",
+                    "path": "calculator.py",
+                    "old_string": original,
+                    "new_string": "average = average\n",
+                },
+                root,
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("undefined module-level self-reference", output)
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+
+    def test_exact_edit_recovers_a_unique_read_preview_gutter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "calculator.py"
+            source.write_text(
+                "def average(values):\n    return sum(values) / (len(values) - 1)\n",
+                encoding="utf-8",
+            )
+
+            code, output = CORE.apply_exact_edit(
+                {
+                    "name": "edit_file",
+                    "path": "calculator.py",
+                    "old_string": "    2      return sum(values) / (len(values) - 1)",
+                    "new_string": "    2      return sum(values) / len(values)",
+                },
+                root,
+            )
+
+            self.assertEqual(code, 0, output)
+            self.assertIn("    return sum(values) / len(values)", source.read_text(encoding="utf-8"))
+
+    def test_exact_edit_failure_returns_the_longest_unique_existing_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "cart.py"
+            source.write_text(
+                "@dataclass\nclass Item:\n    amount: int\n\n\ndef subtotal(items):\n    return sum(i.amount for i in items)\n",
+                encoding="utf-8",
+            )
+            anchor = "def subtotal(items):\n    return sum(i.amount for i in items)"
+
+            code, output = CORE.apply_exact_edit(
+                {
+                    "name": "edit_file",
+                    "path": "cart.py",
+                    "old_string": anchor + "\n\n@dataclass\nclass Item:",
+                    "new_string": anchor
+                    + "\n\n\ndef total(items):\n    return subtotal(items)\n\n@dataclass\nclass Item:",
+                },
+                root,
+            )
+
+            self.assertEqual(code, 1)
+            self.assertIn("unique exact prefix", output)
+            self.assertIn("--- exact anchor ---\n" + anchor, output)
+            self.assertEqual(source.read_text(encoding="utf-8").count("class Item"), 1)
 
     def test_compaction_rebuilds_grounded_memory_without_calling_a_model(self) -> None:
         class NoCompactionModel:
@@ -2323,6 +3072,7 @@ class CoordinatorRoutingTests(unittest.TestCase):
         rendered = "\n".join(str(message.get("content") or "") for message in active)
 
         self.assertIn("Grounded memory of the earlier exchange", rendered)
+        self.assertIn("copy the matching value verbatim", rendered)
         self.assertIn("current request", rendered)
         self.assertNotIn("OLD_USER_SENTINEL", rendered)
         self.assertNotIn("OLD_ASSISTANT_SENTINEL", rendered)
@@ -2442,9 +3192,13 @@ class LoopResilienceTests(unittest.TestCase):
         tui = object.__new__(CORE.DairackTui)
         tui.pending_tool = {"name": "read_file", "path": "a.py"}
         tui.messages = []
+        tui._loop_guard = CORE.ActionLoopGuard()
         tui.append_action = Mock()
         tui.save_current_chat = Mock()
         tui.flush_queued_prompt = Mock()
+        tui.set_busy = Mock()
+        tui.start_worker = Mock()
+        tui.generate_worker = Mock()
         tui.input = object()
         tui.app = SimpleNamespace(
             layout=SimpleNamespace(focus=Mock()),
@@ -2454,7 +3208,10 @@ class LoopResilienceTests(unittest.TestCase):
         tui.deny_pending_tool()
 
         self.assertIsNone(tui.pending_tool)
-        tui.flush_queued_prompt.assert_called_once_with(False)
+        self.assertTrue(tui._loop_guard.force_synthesis)
+        self.assertIn("No further tool actions", tui.messages[-1]["content"])
+        tui.start_worker.assert_called_once_with(tui.generate_worker, "dairack-continue")
+        tui.flush_queued_prompt.assert_not_called()
 
     def test_truncate_middle_retains_head_and_tail(self) -> None:
         text = "start-" + "x" * 50000 + "-end"
@@ -2464,6 +3221,37 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertTrue(bounded.endswith("-end"))
         self.assertIn("omitted from the middle", bounded)
         self.assertEqual(CORE.truncate_middle("short", 100), "short")
+
+    def test_read_file_preview_preserves_sequence_under_a_character_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "report.md"
+            report.write_text(
+                "# Start\n## Next heading\n"
+                + "\n".join(f"paragraph {index} " + "detail " * 200 for index in range(20))
+                + "\nfinal detail\n",
+                encoding="utf-8",
+            )
+
+            code, first = CORE.open_file_preview(root, "report.md", max_lines=20, max_chars=700)
+
+            self.assertEqual(code, 0)
+            self.assertIn("chars omitted", first)
+            self.assertIn("## Next heading", first)
+            self.assertIn("character budget reached", first)
+            hint = first.splitlines()[-1]
+            continuation = int(hint.split("start_line=", 1)[1].split(",", 1)[0])
+            self.assertGreater(continuation, 2)
+
+            code, second = CORE.open_file_preview(
+                root,
+                "report.md",
+                start_line=continuation,
+                max_lines=20,
+                max_chars=700,
+            )
+            self.assertEqual(code, 0)
+            self.assertIn(f"lines {continuation}-", second)
 
     def test_action_loop_guard_blocks_the_third_identical_read(self) -> None:
         guard = CORE.ActionLoopGuard()
@@ -2477,6 +3265,17 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertTrue(guard.refusal(call))
         self.assertTrue(guard.force_synthesis)
 
+    def test_action_loop_guard_can_close_actions_with_an_explicit_reason(self) -> None:
+        guard = CORE.ActionLoopGuard()
+
+        guard.require_synthesis("The user denied the requested action")
+
+        self.assertTrue(guard.force_synthesis)
+        self.assertEqual(guard.synthesis_reason, "The user denied the requested action")
+        directive = CORE.agent_synthesis_directive(2, 12, unavailable_reason=guard.synthesis_reason)
+        self.assertIn("user denied", directive)
+        self.assertNotIn("budget is exhausted", directive)
+
     def test_action_loop_guard_resets_after_state_changing_actions(self) -> None:
         guard = CORE.ActionLoopGuard()
         read = {"name": "read_file", "path": "src/app.py", "reason": ""}
@@ -2488,6 +3287,16 @@ class LoopResilienceTests(unittest.TestCase):
         # Different parameters are always a fresh action.
         other = {"name": "read_file", "path": "src/other.py", "reason": ""}
         self.assertEqual(guard.refusal(other), "")
+
+    def test_action_loop_guard_does_not_treat_failed_edits_as_progress(self) -> None:
+        guard = CORE.ActionLoopGuard()
+        call = {"name": "edit_file", "path": "src/app.py", "old_string": "bad", "new_string": "new"}
+
+        self.assertEqual(guard.record(call, "old_string missing", succeeded=False), "")
+        note = guard.record(call, "old_string still missing", succeeded=False)
+
+        self.assertIn("rejected multiple edits", note)
+        self.assertIn("smallest unique exact anchor", note)
 
     def test_action_loop_guard_allows_changed_read_results(self) -> None:
         guard = CORE.ActionLoopGuard()
@@ -2515,6 +3324,13 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertTrue(CORE.transient_stream_error(TimeoutError()))
         self.assertFalse(CORE.transient_stream_error(CORE.OllamaError("Ollama returned HTTP 404: no such model")))
         self.assertFalse(CORE.transient_stream_error(ValueError("unrelated")))
+
+    @unittest.skipIf(os.name == "nt", "Unix pipeline semantics")
+    def test_shell_pipeline_preserves_an_earlier_command_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            code, _output = CORE.run_shell("false | cat", Path(directory))
+
+        self.assertNotEqual(code, 0)
 
     def test_plain_agent_retries_transport_and_repairs_one_malformed_action(self) -> None:
         class RecoveringProvider(FakeProvider):
@@ -2608,6 +3424,47 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertEqual(chat["last_route"]["review"]["verdict"], "pass")
         self.assertEqual(chat["last_route"]["review"]["round"], 2)
 
+    def test_review_receives_tool_role_evidence_and_completion_assessment(self) -> None:
+        provider = FakeProvider(response="VERDICT: PASS")
+        route_state = {
+            "reviewer": "qwen3.5:9b",
+            "executor": "devstral-small-2:latest",
+            "task_kind": "coding agent",
+            "action_completion": {
+                "complete": True,
+                "needs_action": False,
+                "confidence": 1.0,
+                "reason": "the edit and requested tests completed successfully",
+            },
+        }
+        messages = [
+            {"role": "user", "content": "Fix calculator.py, run pytest, and summarize."},
+            {
+                "role": "tool",
+                "content": "Patch tool result:\nsummary: edit_file calculator.py\nexit_code: 0",
+            },
+            {
+                "role": "tool",
+                "content": "Shell tool result:\ncommand: pytest -q\nexit_code: 0\noutput:\n2 passed",
+            },
+        ]
+
+        result = CORE.orchestrator_review(
+            provider,
+            route_state,
+            messages,
+            "Fixed the off-by-one error in calculator.py; all tests pass.",
+            coordinator_config(),
+        )
+
+        self.assertEqual(result["verdict"], "pass")
+        prompt = str(provider.calls[-1]["messages"][-1]["content"])
+        self.assertIn("edit_file calculator.py", prompt)
+        self.assertIn("2 passed", prompt)
+        self.assertIn("'complete': True", prompt)
+        self.assertNotIn("Recent tool evidence:\n(none)", prompt)
+        self.assertIn("does not need to reproduce commands", prompt)
+
     def test_plain_agent_executes_a_tool_then_delivers(self) -> None:
         class ToolThenAnswerProvider(FakeProvider):
             def __init__(self) -> None:
@@ -2644,6 +3501,48 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertIn("app.py defines the entry point.", text)
         tool_results = [m for m in messages if str(m.get("content") or "").startswith("Structured tool result:")]
         self.assertEqual(len(tool_results), 1)
+
+    def test_plain_agent_concludes_after_user_denies_an_action(self) -> None:
+        class DeniedThenAnswerProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.responses = [
+                    'shell{"cmd":"python optional_check.py","reason":"verify an optional detail"}',
+                    "The optional verification was denied, so I did not run it. No result is being claimed.",
+                ]
+
+            def chat(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> str:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                return self.responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = coordinator_config(semantic=False)
+            config.update(
+                {
+                    "model_mode": "direct",
+                    "model": "qwen3.5:9b",
+                    "agent": True,
+                    "auto_compact": False,
+                    "permission_mode": "ask",
+                }
+            )
+            chat: dict[str, Any] = {"summary": "", "project_root": "", "last_route": {}}
+            messages = [
+                {"role": "system", "content": "test"},
+                {"role": "user", "content": "Run the optional check and report honestly if I deny it."},
+            ]
+            provider = DeniedThenAnswerProvider()
+            output = io.StringIO()
+            with redirect_stdout(output), patch.object(CORE, "approve_tool", return_value=False):
+                CORE.chat_turn(provider, "qwen3.5:9b", messages, config, root, chat)
+
+        self.assertEqual(len(provider.calls), 2)
+        self.assertIsNone(provider.calls[-1]["kwargs"].get("tools"))
+        self.assertIn("optional verification was denied", output.getvalue())
+        self.assertEqual(messages[-1]["role"], "assistant")
+        self.assertIn("did not run", messages[-1]["content"])
 
 
 class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
@@ -2830,6 +3729,25 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                         if app.pending_tool is not None:
                             break
 
+                    self.assertIsNotNone(
+                        app.pending_tool,
+                        [
+                            {
+                                "model": call["model"],
+                                "native_tools": len(call["kwargs"].get("tools") or []),
+                                "system_chars": len(str(call["messages"][0].get("content") or "")),
+                                "action_requirements": str(call["messages"][0].get("content") or "").count(
+                                    "Coordinator action requirement:"
+                                ),
+                                "corrections": str(call["messages"][0].get("content") or "").count(
+                                    "Action correction:"
+                                ),
+                                "compatibility": CORE.COMPATIBILITY_TOOL_DIRECTIVE
+                                in str(call["messages"][0].get("content") or ""),
+                            }
+                            for call in provider.calls
+                        ],
+                    )
                     self.assertEqual(app.pending_tool["name"], "web_open")
                     self.assertIsInstance(app.screen, ui.ApprovalScreen)
                     await pilot.press("a")
@@ -3042,7 +3960,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
 
             async with app.run_test(size=(80, 26)) as pilot:
-                app.query_one("#composer", ui.Composer).load_text("Check the project")
+                app.query_one("#composer", ui.Composer).load_text("Explain this Python syntax example")
                 await pilot.press("enter")
                 for _ in range(200):
                     await pilot.pause(0.025)
@@ -3063,6 +3981,74 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 transcript = app.render_transcript_text()
                 self.assertIn("found no blocking issue", transcript)
                 self.assertNotIn("unfinished", transcript)
+
+    async def test_literal_output_separator_is_corrected_once(self) -> None:
+        class SequencedProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.responses = ["NORTH-QUAY / WEST-PIER", "NORTH-QUAY -> WEST-PIER"]
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                yield self.responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config()
+            config.update({"model_mode": "direct", "model": "qwen3.5:9b", "auto_compact": False})
+            provider = SequencedProvider()
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            async with app.run_test(size=(80, 26)) as pilot:
+                app.query_one("#composer", ui.Composer).load_text(
+                    "State the previous and current regions exactly. Answer only: PREVIOUS -> CURRENT"
+                )
+                await pilot.press("enter")
+                for _ in range(200):
+                    await pilot.pause(0.025)
+                    if not app.busy and len(provider.calls) == 2:
+                        break
+
+                self.assertFalse(app.busy)
+                self.assertEqual(len(provider.calls), 2)
+                self.assertIn("does not preserve", provider.calls[1]["messages"][0]["content"])
+                assistant_messages = [message for message in app.messages if message.get("role") == "assistant"]
+                self.assertEqual([message["content"] for message in assistant_messages], ["NORTH-QUAY -> WEST-PIER"])
+                retry = app.chat["last_route"]["completion_retry"]
+                self.assertTrue(retry["attempted"])
+                self.assertTrue(retry["recovered"])
+
+    def test_literal_output_rejects_template_field_labels(self) -> None:
+        route = {"prompt": "What exact codename and phrase did I give you? Answer only: CODENAME / SAFETY-PHRASE"}
+        self.assertIn(
+            "field labels",
+            CORE.output_constraint_violation(route, "CODENAME / ORCHID-47, AMBER-LATTICE"),
+        )
+        self.assertEqual(
+            CORE.output_constraint_violation(route, "ORCHID-47 / AMBER-LATTICE"),
+            "",
+        )
+
+    def test_exact_change_report_is_not_misread_as_literal_output_only(self) -> None:
+        route = {
+            "prompt": (
+                "Implement the required behavior, run the tests, then report exactly what changed and whether "
+                "the suite passed."
+            )
+        }
+
+        self.assertEqual(CORE.output_constraint_directive(route), "")
+        self.assertEqual(
+            CORE.output_constraint_violation(route, "Changed `cart.py`; all three tests passed."),
+            "",
+        )
 
     async def test_coordinator_recovers_once_with_the_next_ranked_executor_after_blank_retries(self) -> None:
         class RecoveryProvider(FakeProvider):
@@ -3246,6 +4232,9 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
                 self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
                 self.last_stats = {"done_reason": "stop"}
+                if is_completion_arbiter_request(messages):
+                    yield completed_action_json()
+                    return
                 self.round += 1
                 sink = kwargs.get("tool_call_sink")
                 if self.round == 1 and callable(sink):
@@ -3461,6 +4450,9 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     if callable(sink):
                         sink({"function": {"name": "list_dir", "arguments": {"path": "/"}}})
                     return
+                if self.round == 2:
+                    yield "I did not inspect root because the action was denied."
+                    return
                 yield "Second answer."
 
         with tempfile.TemporaryDirectory() as directory:
@@ -3502,17 +4494,28 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("escape")
                 for _ in range(160):
                     await pilot.pause(0.025)
-                    if not app.busy and provider.round == 2:
+                    if not app.busy and provider.round == 3:
                         break
 
-                self.assertEqual(provider.round, 2)
+                self.assertEqual(provider.round, 3)
                 self.assertEqual(app._queued_prompts, [])
-                self.assertTrue(
+                self.assertFalse(
                     any(
                         "second question" in str(message.get("content") or "")
                         for message in provider.calls[1]["messages"]
                     )
                 )
+                self.assertTrue(
+                    any(
+                        "second question" in str(message.get("content") or "")
+                        for message in provider.calls[-1]["messages"]
+                    )
+                )
+                assistant_messages = [
+                    message["content"] for message in app.messages if message.get("role") == "assistant"
+                ]
+                self.assertIn("I did not inspect root because the action was denied.", assistant_messages)
+                self.assertEqual(assistant_messages[-1], "Second answer.")
 
     async def test_approved_action_finishes_its_turn_before_releasing_the_prompt_queue(self) -> None:
         release = threading.Event()
@@ -3525,6 +4528,9 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
                 self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
                 self.last_stats = {"done_reason": "stop"}
+                if is_completion_arbiter_request(messages):
+                    yield completed_action_json()
+                    return
                 self.round += 1
                 if self.round == 1:
                     release.wait(timeout=5)
@@ -3580,7 +4586,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(
                     any(
                         "second question" in str(message.get("content") or "")
-                        for message in provider.calls[2]["messages"]
+                        for message in provider.calls[3]["messages"]
                     )
                 )
 
@@ -3593,6 +4599,9 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
                 self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
                 self.last_stats = {"done_reason": "stop"}
+                if is_completion_arbiter_request(messages):
+                    yield completed_action_json()
+                    return
                 self.round += 1
                 sink = kwargs.get("tool_call_sink")
                 if self.round == 1 and callable(sink):
@@ -3634,8 +4643,9 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                         break
 
                 self.assertFalse(app.busy)
-                # Both reads ran from a single response, then one synthesis generation followed.
+                # Both reads ran from one response, followed by synthesis and an independent completion check.
                 self.assertEqual(provider.round, 2)
+                self.assertEqual(len(provider.calls), 3)
                 tool_results = [
                     m for m in app.messages if str(m.get("content") or "").startswith("Structured tool result:")
                 ]
@@ -3779,6 +4789,9 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
 
             def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
                 self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                if is_completion_arbiter_request(messages):
+                    yield completed_action_json()
+                    return
                 yield self.responses.pop(0)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -3811,11 +4824,11 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause(0.025)
                     if isinstance(app.screen, ui.ApprovalScreen):
                         await pilot.press("a")
-                    if not app.busy and len(provider.calls) == 4:
+                    if not app.busy and len(provider.calls) == 5:
                         break
 
                 self.assertFalse(app.busy)
-                self.assertEqual(len(provider.calls), 4)
+                self.assertEqual(len(provider.calls), 5)
                 self.assertEqual(app.chat["project_root"], str(project.resolve()))
                 self.assertEqual(app.chat["last_route"]["tool_steps"], 3)
                 results = "\n".join(str(message.get("content") or "") for message in app.messages)
@@ -3858,7 +4871,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
 
             async with app.run_test(size=(80, 26)) as pilot:
-                app.query_one("#composer", ui.Composer).load_text("Inspect once and summarize")
+                app.query_one("#composer", ui.Composer).load_text("Inspect this project once and summarize")
                 await pilot.press("enter")
                 for _ in range(300):
                     await pilot.pause(0.025)
@@ -3918,12 +4931,37 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(CORE.NATIVE_TOOL_DIRECTIVE, request_messages[0]["content"])
                 self.assertIn("Dairack implementation path:", request_messages[0]["content"])
                 self.assertIn("ACTION REQUEST", app.blocks[-1]["text"])
+                provider.native_call = None
+                provider.response = "I could not inspect root because the action was denied."
                 await pilot.press("escape")
-                await pilot.pause(0.05)
-                self.assertEqual(app.messages[-1]["role"], "tool")
-                self.assertIn("not executed", app.messages[-1]["content"])
+                for _ in range(120):
+                    await pilot.pause(0.025)
+                    if not app.busy:
+                        break
+                denied = [
+                    message
+                    for message in app.messages
+                    if message.get("role") == "tool" and "not executed" in message.get("content", "")
+                ]
+                self.assertEqual(len(denied), 1)
+                self.assertIn("No further tool actions", denied[0]["content"])
+                self.assertEqual(app.messages[-1]["role"], "assistant")
+                self.assertIn("action was denied", app.messages[-1]["content"])
 
     async def test_deny_mode_blocks_model_actions_without_opening_approval(self) -> None:
+        class DenyThenConcludeProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__(response="")
+                self.responses = [
+                    'shell{"cmd":"touch denied.txt"}',
+                    "I could not create the file because actions are blocked by the permissions policy.",
+                ]
+
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                yield self.responses.pop(0)
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             CORE.CONFIG_PATH = root / "config.json"
@@ -3934,7 +4972,7 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
             CORE.APP_DATA_DIR = root
             config = coordinator_config()
             config.update({"model_mode": "direct", "model": "qwen3.5:9b", "permission_mode": "deny"})
-            provider = FakeProvider(response='shell{"cmd":"touch denied.txt"}')
+            provider = DenyThenConcludeProvider()
             app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
 
             with patch.object(CORE, "execute_tool_call") as execute:
@@ -3948,7 +4986,12 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
 
                     self.assertFalse(app.busy)
                     self.assertNotIsInstance(app.screen, ui.ApprovalScreen)
-                    self.assertIn("permissions policy", app.messages[-1]["content"])
+                    self.assertEqual(len(provider.calls), 2)
+                    self.assertIsNone(provider.calls[-1]["kwargs"].get("tools"))
+                    self.assertTrue(
+                        any("permissions policy" in str(message.get("content") or "") for message in app.messages)
+                    )
+                    self.assertIn("could not create", app.messages[-1]["content"])
             execute.assert_not_called()
             self.assertFalse((root / "denied.txt").exists())
 

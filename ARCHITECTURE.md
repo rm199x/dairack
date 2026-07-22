@@ -102,10 +102,13 @@ Planning, independent review, and specialist delegation are separate bounded sta
 interruptible by the user. The planner receives indexed project context so execution briefs name real files rather
 than guesses. Review verdicts apply only with usable grounded feedback, revisions are announced in the transcript,
 and the revised answer is re-checked once; a still-disputed answer is kept and marked unresolved in route state.
+Review receives the same recent tool-result evidence and deterministic completion assessment used by the action
+arbiter, while keeping those internal logs out of a concise user-facing answer.
 
 The action loop is bounded and self-correcting: model-emitted action requests are parsed generously (including
 call-style near-misses and unescaped Windows path backslashes), malformed requests get one correction pass and then a
-plain explanation, an identical read repeated with no intervening state change is refused with its prior result,
+plain explanation, and a validated text-form call may recover a turn only when a native or compatibility tool surface
+was actually offered. An identical read repeated with no intervening state change is refused with its prior result,
 persistent repetition forces final synthesis, bounded tool output keeps its beginning and end, a dropped model
 connection retries once silently, and an over-budget request omits project retrieval before failing. A blank or
 structurally incomplete continuation retries once on the same executor; Coordinator may then move once to the next
@@ -121,6 +124,12 @@ cancellable child process and shares the same generated-state exclusions. Prompt
 queued and dispatched when it ends. A pending approval holds that queue until the user allows or denies the action; an
 interrupted turn returns queued input to the composer instead of sending it.
 
+Writes remain exact and previewed. Structured-file edits are parsed or compiled before checkpointing, obvious
+undefined Python self-references are rejected, and an exact-string mismatch can return a bounded unique anchor from
+the current file without applying a fuzzy change. Failed writes do not reset no-progress accounting. Unix shell
+pipelines run with `pipefail` where Bash is available, so output limiting cannot turn a failed test command into exit
+zero.
+
 Context policy is derived from the active executor's effective runtime profile. The hard model window is divided into
 an input budget and answer reserve; request accounting includes the system foundation, grounded macro memory, the live
 task, tool schemas, and tokenizer/routing uncertainty. Covered history is replaced by deterministic grounded memory,
@@ -132,11 +141,18 @@ separate until final request fitting; optional retrieval is shed first, macro me
 evidence, and a completed action result is narrowed again when necessary so its continuation request remains valid.
 Compaction may run between model/action steps but never in the middle of a provider call.
 
+Whole-file tasks additionally keep a route-scoped coverage ledger: completed line ranges are merged, the next unread
+line is deterministic, and bounded requested evidence survives raw-message compaction. The completion arbiter cannot
+accept a whole-file result until coverage reaches the known final line, and exact requested headings must come from
+the preserved evidence rather than reconstruction.
+
 The answer reserve is enforced, not advisory: request fitting protects a generation floor that binds exactly when a
 raised budget ratio, a small window, thinking mode, or final synthesis would otherwise let a packed prompt starve the
 response, and every executor request caps `num_predict` at the true window residual so the provider can never
 context-shift the prompt away — truncation surfaces honestly through the turn ladder instead of silently corrupting
-the request. A context-posture directive tells the executor how to work at its tier: small windows get incremental
+the request. Tool-enabled passes have a smaller bounded generation ceiling because one native action should not spend
+the entire residual failing to terminate on constrained hardware; final synthesis retains the full safe residual. A
+context-posture directive tells the executor how to work at its tier: small windows get incremental
 guidance (windowed reads continued with `start_line`, narrow tool requests, section-by-section audits carrying only
 conclusions forward), generous windows get whole-file latitude, and the standard tier adds nothing. This mirrors the
 strategies large-context agent CLIs converged on — threshold-triggered compaction that genuinely replaces history,

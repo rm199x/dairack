@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
+import builtins
 import difflib
 import functools
 import hashlib
@@ -24,6 +26,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -57,6 +60,7 @@ from .coordinator.analysis import (
     extract_public_web_targets,
     is_direct_answer_route,
     public_web_action_contract,  # noqa: F401  (re-export)
+    runtime_action_contract,  # noqa: F401  (re-export)
 )
 from .coordinator.analysis import (
     merge_semantic_assessment as _merge_semantic_assessment,  # noqa: F401  (re-export)
@@ -102,6 +106,7 @@ from .coordinator.oversight import (
     format_route_history,
     format_route_report,
     observe_route_outcome,
+    output_constraint_directive,
     record_executor_recovery,
     record_route_feedback,
     routing_control_directive,  # noqa: F401  (re-export)
@@ -137,6 +142,7 @@ from .coordinator.selection import role_preference as _coordinator_role_preferen
 from .coordinator.selection import select_route as select_orchestrator_route
 from .coordinator.selection import semantic_router_model as _semantic_router_model  # noqa: F401  (re-export)
 from .coordinator.selection import specialist_model as _specialist_model  # noqa: F401  (re-export)
+from .coordinator.selection import warm_pool_continuity as _warm_pool_continuity  # noqa: F401  (re-export)
 from .coordinator.semantic import assessment as coordinator_semantic_assessment  # noqa: F401  (re-export)
 from .coordinator.semantic import reset_assessment_cache as reset_semantic_assessment_cache  # noqa: F401  (re-export)
 from .coordinator.tuning import DEFAULT_TUNING  # noqa: F401  (re-export)
@@ -222,6 +228,16 @@ NATIVE_TOOL_DIRECTIVE = (
     "Function tools are active through the provider API for this request. Return actions through the native "
     "tool_calls field; return no ordinary response text alongside a tool call, and do not print function names, "
     "arguments, or fallback markup as response content."
+)
+COMPATIBILITY_TOOL_DIRECTIVE = (
+    "Native function schemas were omitted to fit this request. For one action, output exactly one JSON envelope, "
+    'for example <tool>{"name":"read_file","arguments":{"path":"file.md","start_line":1,'
+    '"max_lines":40}}</tool>. The body must be valid JSON; never put function(...) syntax inside tool tags, and '
+    "return no prose with an action."
+)
+TOOLLESS_REQUEST_DIRECTIVE = (
+    "No action tools are active for this request. Answer only from the supplied context and evidence; do not emit "
+    "or describe tool calls, claim an action is running, or promise a later action."
 )
 MAX_TOOL_OUTPUT = MAX_TEXT_OUTPUT
 DEFAULT_AGENT_ACTION_LIMIT = 12
@@ -748,6 +764,35 @@ def assess_action_completion(
     contract = route.get("action_contract")
     if not candidate.strip():
         return {}
+    target = str(contract.get("target") or "") if isinstance(contract, dict) else ""
+    saved_progress = route.get("read_progress")
+    progress = complete_file_read_progress(
+        str(route.get("prompt") or ""),
+        messages,
+        target,
+        saved_progress if isinstance(saved_progress, dict) else None,
+    )
+    if progress and not progress["complete"]:
+        next_line = int(progress["next_line"])
+        return {
+            "complete": False,
+            "needs_action": True,
+            "confidence": 1.0,
+            "reason": (
+                f"whole-file coverage is incomplete at line {next_line} of {progress['total']}; "
+                f"call read_file for {progress['path']} with start_line={next_line} and continue consecutively"
+            ),
+            "model": "deterministic read ledger",
+        }
+    format_violation = output_constraint_violation(route, candidate)
+    if format_violation:
+        return {
+            "complete": False,
+            "needs_action": False,
+            "confidence": 1.0,
+            "reason": format_violation,
+            "model": "deterministic output contract",
+        }
     if not isinstance(contract, dict) or not contract.get("capability"):
         contract = {
             "capability": "agent_followthrough",
@@ -832,10 +877,13 @@ def assess_action_completion(
 
 
 def action_completion_required(route: dict[str, Any], action_steps: int, agent_enabled: bool) -> bool:
-    if not agent_enabled or str(route.get("mode") or "") != "orchestrator":
+    if not agent_enabled:
         return False
     contract = route.get("action_contract")
-    return action_steps > 0 or bool(isinstance(contract, dict) and contract.get("capability"))
+    has_contract = bool(isinstance(contract, dict) and contract.get("capability"))
+    if str(route.get("mode") or "") == "orchestrator":
+        return action_steps > 0 or has_contract
+    return has_contract
 
 
 def action_completion_directive(assessment: dict[str, Any]) -> str:
@@ -1093,18 +1141,39 @@ def config_float(config: dict[str, Any], key: str, default: float, minimum: floa
     return max(minimum, min(maximum, value))
 
 
-def agent_action_limit(config: dict[str, Any]) -> int:
-    return config_int(
+def agent_action_limit(config: dict[str, Any], route: dict[str, Any] | None = None) -> int:
+    base = config_int(
         config,
         "max_agent_steps",
         DEFAULT_AGENT_ACTION_LIMIT,
         1,
         MAX_AGENT_ACTION_LIMIT,
     )
+    contract = route.get("action_contract") if isinstance(route, dict) else None
+    prompt = str(route.get("prompt") or "") if isinstance(route, dict) else ""
+    if (
+        isinstance(contract, dict)
+        and contract.get("capability") == "runtime_action"
+        and COMPLETE_FILE_READ_PATTERN.search(prompt)
+    ):
+        return min(MAX_AGENT_ACTION_LIMIT, max(base, 32))
+    return base
 
 
-def agent_synthesis_directive(used: int, limit: int, retry: bool = False) -> str:
+def agent_synthesis_directive(
+    used: int,
+    limit: int,
+    retry: bool = False,
+    unavailable_reason: str = "",
+) -> str:
     lead = "Your previous response still attempted an action, but actions are unavailable. " if retry else ""
+    if unavailable_reason:
+        reason = unavailable_reason.strip().rstrip(".")
+        return (
+            f"{lead}{reason}. No further tool actions are available in this turn. "
+            "Produce the best complete final answer now from the evidence already collected. "
+            "State any unfinished verification briefly and concretely."
+        )
     return (
         f"{lead}The task action budget is exhausted after {used} of {limit} executed actions. "
         "Do not request or describe another tool action. Produce the best complete final answer now from the "
@@ -1528,6 +1597,273 @@ def _context_tool_evidence(content: str) -> str:
     return (label + suffix)[:520]
 
 
+READ_WINDOW_RANGE_PATTERN = re.compile(r"(?m)^lines\s+(\d+)-(\d+)\s+of\s+(\d+)\s*$")
+NUMBERED_PREVIEW_LINE_PATTERN = re.compile(r"(?m)^\s*(\d+)\s{2,}(.*)$")
+COMPLETE_FILE_READ_PATTERN = re.compile(
+    r"\b(?:from\s+(?:the\s+)?beginning\s+to\s+(?:the\s+)?end|"
+    r"(?:entire|whole|complete)\s+(?:file|document|report)|"
+    r"read\s+(?:all|everything)|(?:consecutive|sequential)\s+(?:read_file\s+)?(?:windows|chunks|parts))\b",
+    re.IGNORECASE,
+)
+READ_WINDOW_LIMIT_PATTERN = re.compile(r"\b(?:at\s+most|no\s+more\s+than|maximum(?:\s+of)?)\s+(\d+)\s+lines?\b", re.I)
+TASK_IDENTIFIER_PATTERN = re.compile(r"\b[A-Za-z]{1,12}\d{1,6}\b")
+ACTIVE_READ_LEDGER_PREFIX = "Active read ledger (deterministic runtime state):"
+
+
+def _latest_task_from_groups(groups: list[list[dict[str, Any]]]) -> str:
+    for group in reversed(groups):
+        for message in reversed(group):
+            content = str(message.get("content") or "").strip()
+            if message.get("role") == "user" and content and not content.startswith(TOOL_RESULT_PREFIXES):
+                return content
+    return ""
+
+
+def _read_result_window(content: str) -> tuple[str, int, int, int, list[tuple[int, str]]] | None:
+    metadata, separator, output = content.partition("\noutput:\n")
+    if not separator or not re.search(r"(?m)^tool:\s*read_file\s*$", metadata):
+        return None
+    range_match = READ_WINDOW_RANGE_PATTERN.search(output)
+    if not range_match:
+        return None
+    start, end, total = (int(value) for value in range_match.groups())
+    output_lines = [line.strip() for line in output.splitlines() if line.strip()]
+    path = output_lines[0] if output_lines else "unknown file"
+    numbered = [
+        (int(match.group(1)), match.group(2).strip())
+        for match in NUMBERED_PREVIEW_LINE_PATTERN.finditer(output)
+        if match.group(2).strip()
+    ]
+    return path, start, end, total, numbered
+
+
+def _merge_line_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def complete_file_read_progress(
+    task: str,
+    messages: list[dict[str, Any]],
+    target: str = "",
+    saved_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return exact consecutive coverage for an explicit whole-file read task."""
+    if not task or not COMPLETE_FILE_READ_PATTERN.search(task):
+        return None
+    target_name = Path(target).name.casefold() if target else ""
+    ranges: list[tuple[int, int]] = []
+    total = 0
+    result_path = target
+    task_digest = hashlib.sha256(task.strip().encode("utf-8")).hexdigest()[:16]
+    if isinstance(saved_state, dict) and saved_state.get("task_digest") == task_digest:
+        saved_path = str(saved_state.get("path") or "")
+        if not target_name or Path(saved_path).name.casefold() == target_name:
+            try:
+                saved_total = int(saved_state.get("total") or 0)
+            except (TypeError, ValueError):
+                saved_total = 0
+            if 0 < saved_total <= 10_000_000:
+                for item in saved_state.get("ranges") or []:
+                    if not isinstance(item, (list, tuple)) or len(item) != 2:
+                        continue
+                    try:
+                        start, end = int(item[0]), int(item[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if 1 <= start <= end <= saved_total:
+                        ranges.append((start, end))
+                if ranges:
+                    result_path = saved_path or target
+                    total = saved_total
+    for message in messages:
+        content = str(message.get("content") or "")
+        if message.get("role") != "tool" and not content.startswith(TOOL_RESULT_PREFIXES):
+            continue
+        window = _read_result_window(content)
+        if not window:
+            continue
+        path, start, end, result_total, _numbered = window
+        if target_name and Path(path).name.casefold() != target_name:
+            continue
+        result_path = path
+        ranges.append((start, end))
+        total = max(total, result_total)
+    if not ranges or not total:
+        return None
+    merged = _merge_line_ranges(ranges)
+    cursor = 1
+    for start, end in merged:
+        if start > cursor:
+            break
+        cursor = max(cursor, end + 1)
+    return {
+        "path": result_path,
+        "ranges": merged,
+        "total": total,
+        "next_line": cursor,
+        "complete": cursor > total,
+    }
+
+
+def update_complete_file_read_state(
+    route: dict[str, Any] | None,
+    call: dict[str, str],
+    code: int,
+    result: str,
+) -> None:
+    """Persist bounded whole-file progress so context compaction cannot rewind it."""
+    if not isinstance(route, dict) or code != 0 or call.get("name") != "read_file":
+        return
+    task = str(route.get("prompt") or "")
+    if not task or not COMPLETE_FILE_READ_PATTERN.search(task):
+        return
+    history = tool_history_message(call, code, result)
+    window = _read_result_window(str(history.get("content") or ""))
+    if not window:
+        return
+    path, start, end, total, numbered = window
+    contract = route.get("action_contract")
+    target = str(contract.get("target") or "") if isinstance(contract, dict) else ""
+    if target and Path(path).name.casefold() != Path(target).name.casefold():
+        return
+    task_digest = hashlib.sha256(task.strip().encode("utf-8")).hexdigest()[:16]
+    previous = route.get("read_progress")
+    previous = previous if isinstance(previous, dict) and previous.get("task_digest") == task_digest else {}
+    ranges: list[tuple[int, int]] = [(start, end)]
+    for item in previous.get("ranges") or []:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        try:
+            ranges.append((int(item[0]), int(item[1])))
+        except (TypeError, ValueError):
+            continue
+    identifiers = {value.lower() for value in TASK_IDENTIFIER_PATTERN.findall(task)}
+    evidence: dict[int, str] = {}
+    for item in previous.get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            line_number = int(item.get("line") or 0)
+        except (TypeError, ValueError):
+            continue
+        text = str(item.get("text") or "").strip()
+        if 0 < line_number <= total and text:
+            evidence[line_number] = truncate(text, 500)
+    for line_number, line in numbered:
+        lowered = line.lower()
+        identifier_match = any(re.search(rf"\b{re.escape(identifier)}\b", lowered) for identifier in identifiers)
+        numeric_table_row = line.startswith("|") and bool(re.search(r"\|\s*\**\d+\**\s*\|", line))
+        if identifier_match or numeric_table_row:
+            evidence[line_number] = truncate(line, 500)
+    route["read_progress"] = {
+        "task_digest": task_digest,
+        "path": path,
+        "ranges": [[range_start, range_end] for range_start, range_end in _merge_line_ranges(ranges)],
+        "total": total,
+        "evidence": [{"line": line_number, "text": text} for line_number, text in sorted(evidence.items())[-80:]],
+    }
+
+
+def complete_file_read_directive(route: dict[str, Any] | None) -> str:
+    if not isinstance(route, dict):
+        return ""
+    task = str(route.get("prompt") or "")
+    contract = route.get("action_contract")
+    target = str(contract.get("target") or "") if isinstance(contract, dict) else ""
+    state = route.get("read_progress")
+    progress = complete_file_read_progress(task, [], target, state if isinstance(state, dict) else None)
+    if not progress:
+        return ""
+    ranges = ", ".join(f"{start}-{end}" for start, end in progress["ranges"])
+    status = (
+        f"complete consecutive coverage 1-{progress['total']}; do not read this file again"
+        if progress["complete"]
+        else f"covered {ranges} of {progress['total']}; next read_file must use start_line={progress['next_line']}"
+    )
+    rows = ["Persistent whole-file task ledger (authoritative across compaction):", f"- {progress['path']}: {status}."]
+    evidence = state.get("evidence") if isinstance(state, dict) else []
+    if isinstance(evidence, list) and evidence:
+        rows.append("- Preserved exact requested evidence:")
+        for item in evidence[-24:]:
+            if isinstance(item, dict):
+                rows.append(f"  line {item.get('line')}: {truncate(str(item.get('text') or ''), 500)}")
+    return truncate_middle("\n".join(rows), 2400)
+
+
+def _active_read_ledger(groups: list[list[dict[str, Any]]], budget: int) -> str:
+    """Preserve deterministic whole-file progress across micro-context shedding."""
+    task = _latest_task_from_groups(groups)
+    if not task or not COMPLETE_FILE_READ_PATTERN.search(task):
+        return ""
+    windows: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for message in group:
+            content = str(message.get("content") or "")
+            if message.get("role") != "tool" and not content.startswith(TOOL_RESULT_PREFIXES):
+                continue
+            window = _read_result_window(content)
+            if not window:
+                continue
+            path, start, end, total, numbered = window
+            record = windows.setdefault(path, {"ranges": [], "total": total, "lines": []})
+            record["ranges"].append((start, end))
+            record["total"] = max(int(record["total"]), total)
+            record["lines"].extend(numbered)
+    if not windows:
+        return ""
+
+    identifiers = {value.lower() for value in TASK_IDENTIFIER_PATTERN.findall(task)}
+    max_lines_match = READ_WINDOW_LIMIT_PATTERN.search(task)
+    requested_limit = int(max_lines_match.group(1)) if max_lines_match else 0
+    rows = [ACTIVE_READ_LEDGER_PREFIX, "Use returned line ranges, never requested window sizes, to calculate progress."]
+    evidence: list[tuple[int, str]] = []
+    for path, record in windows.items():
+        merged = _merge_line_ranges(record["ranges"])
+        total = int(record["total"])
+        cursor = 1
+        for start, end in merged:
+            if start > cursor:
+                break
+            cursor = max(cursor, end + 1)
+        ranges_text = ", ".join(f"{start}-{end}" for start, end in merged)
+        if cursor > total:
+            state = f"complete coverage 1-{total}"
+        else:
+            state = f"covered {ranges_text} of {total}; earliest unread line {cursor}"
+        rows.append(f"- {path}: {state}.")
+        if cursor <= total:
+            limit_note = f" and max_lines<={requested_limit}" if requested_limit else ""
+            rows.append(
+                f"- Complete consecutive coverage is required. The next read_file for this file must use "
+                f"start_line={cursor}{limit_note}; do not skip ahead."
+            )
+        for line_number, line in record["lines"]:
+            lowered = line.lower()
+            identifier_match = any(re.search(rf"\b{re.escape(identifier)}\b", lowered) for identifier in identifiers)
+            numeric_table_row = line.startswith("|") and bool(re.search(r"\|\s*\**\d+\**\s*\|", line))
+            if identifier_match or numeric_table_row:
+                evidence.append((line_number, line))
+
+    if evidence:
+        rows.append("Preserved task evidence (copy exact requested text from here):")
+        seen: set[tuple[int, str]] = set()
+        for line_number, line in sorted(evidence):
+            item = (line_number, line)
+            if item in seen:
+                continue
+            seen.add(item)
+            rows.append(f"- line {line_number}: {truncate(line, 360)}")
+
+    max_chars = max(900, min(2400, int(budget * 0.7)))
+    return truncate_middle("\n".join(rows), max_chars)
+
+
 def _omitted_tool_ledger(
     groups: list[list[dict[str, Any]]],
     kept_indices: set[int],
@@ -1572,11 +1908,25 @@ def active_context_messages(
         summary_text = truncate(summary.strip(), max(1200, budget * 2))
         summary_message = {
             "role": "system",
-            "content": "Persistent summary of earlier conversation:\n" + summary_text,
+            "content": (
+                "Persistent summary of earlier conversation:\n"
+                "Memory-use rule: treat attributed entries as evidence. For exact prior identifiers, names, paths, "
+                "or quoted text, copy the matching value verbatim; never substitute an invented value. If the value "
+                "is absent, say so.\n" + summary_text
+            ),
         }
         running += estimate_message_tokens(summary_message)
 
     groups = _context_message_groups(messages[1:])
+    existing_read_ledger = any(
+        message.get("role") == "system" and str(message.get("content") or "").startswith(ACTIVE_READ_LEDGER_PREFIX)
+        for group in groups
+        for message in group
+    )
+    read_ledger = "" if existing_read_ledger else _active_read_ledger(groups, budget)
+    read_ledger_message = {"role": "system", "content": read_ledger} if read_ledger else None
+    if read_ledger_message:
+        running += estimate_message_tokens(read_ledger_message)
     task_group = -1
     for index, group in enumerate(groups):
         if any(
@@ -1623,6 +1973,8 @@ def active_context_messages(
         selected = [system]
         if summary_message:
             selected.append(summary_message)
+        if read_ledger_message:
+            selected.append(read_ledger_message)
         ledger = _omitted_tool_ledger(groups, kept_indices, budget) if include_context_notices else ""
         if ledger:
             selected.append({"role": "system", "content": ledger})
@@ -1753,17 +2105,19 @@ def fit_request_context_messages(
 
 
 def strip_tool_catalog_for_native(content: str) -> str:
-    """Drop the prose tool catalog when native schemas accompany the request.
+    """Drop the prose tool bootstrap when native schemas accompany the request.
 
-    The catalog exists for the compatibility text protocol; with native tools the
-    schemas are authoritative and the duplicate listing wastes context budget.
+    The native directive and schemas replace the generic agent-mode contract,
+    compatibility grammar, and catalog. Tool-selection and safety policy after
+    that block remain active.
     Unmatched markers leave the content unchanged.
     """
-    start = content.find("Available tools:")
-    end = content.find("Compatibility fallback only:")
-    if start == -1 or end == -1 or end <= start:
+    start = content.find("Agent mode is enabled.")
+    fallback_end_marker = "Never mix an action request with ordinary response text."
+    fallback_end = content.find(fallback_end_marker, start)
+    if start == -1 or fallback_end == -1 or fallback_end <= start:
         return content
-    return content[:start] + content[end:]
+    return content[:start] + content[fallback_end + len(fallback_end_marker) :]
 
 
 def strip_native_system_catalog(message: dict[str, Any]) -> dict[str, Any]:
@@ -1779,6 +2133,37 @@ def strip_native_system_catalog(message: dict[str, Any]) -> dict[str, Any]:
     return {
         **message,
         "content": strip_tool_catalog_for_native(str(message.get("content") or "")),
+    }
+
+
+def strip_tool_bootstrap_for_toolless(content: str) -> str:
+    """Remove agent-only instructions from a request with no active tool protocol."""
+    start = content.find("Agent mode is enabled.")
+    end_marker = "model loads."
+    end = content.find(end_marker, start)
+    if start == -1 or end == -1 or end <= start:
+        return content
+    end += len(end_marker)
+    windows_end_marker = "Do not use deprecated wmic."
+    windows_end = content.find(windows_end_marker, end)
+    if windows_end != -1:
+        end = windows_end + len(windows_end_marker)
+    return content[:start] + content[end:]
+
+
+def strip_toolless_system(message: dict[str, Any]) -> dict[str, Any]:
+    """Preserve budget-aware system sections while removing inactive tool policy."""
+    parts = message.get(SYSTEM_PARTS_KEY)
+    if isinstance(parts, list):
+        stripped_parts = [strip_tool_bootstrap_for_toolless(str(part)) for part in parts]
+        return {
+            **message,
+            "content": "\n\n".join(part for part in stripped_parts if part.strip()),
+            SYSTEM_PARTS_KEY: stripped_parts,
+        }
+    return {
+        **message,
+        "content": strip_tool_bootstrap_for_toolless(str(message.get("content") or "")),
     }
 
 
@@ -1815,24 +2200,49 @@ def fit_agent_request_context_messages(
     config: dict[str, Any],
     tools: list[dict[str, Any]] | None,
     finalizing: bool = False,
+    allow_compatibility_tools: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fit a request, preferring native tools but retaining the compatibility protocol when space is tight."""
     posture = context_posture_directive(config)
     posture_directives = [posture] if posture else []
     native_tools = list(tools or [])
+    # Callers may already have canonicalized all system sections into one
+    # message, so detect the durable marker anywhere in its rendered content.
+    persistent_memory_required = any(
+        str(message.get("role") or "") == "system" and "Memory-use rule:" in str(message.get("content") or "")
+        for message in messages
+    )
     if native_tools:
         native_request = canonicalize_messages(messages, [NATIVE_TOOL_DIRECTIVE, *posture_directives])
         if native_request and native_request[0].get("role") == "system":
             native_request[0] = strip_native_system_catalog(native_request[0])
         try:
-            return (
-                fit_request_context_messages(native_request, config, native_tools, finalizing=finalizing),
-                native_tools,
-            )
+            fitted_native = fit_request_context_messages(native_request, config, native_tools, finalizing=finalizing)
+            rendered_native = "\n".join(str(message.get("content") or "") for message in fitted_native)
+            if not persistent_memory_required or "Memory-use rule:" in rendered_native:
+                return fitted_native, native_tools
         except RequestContextError:
             pass
-    compat = canonicalize_messages(compatibility_tool_history_messages(messages), posture_directives)
+    compatibility_source = compatibility_tool_history_messages(messages)
+    compatibility_directives = [*posture_directives]
+    if not finalizing and allow_compatibility_tools:
+        compatibility_directives.insert(0, COMPATIBILITY_TOOL_DIRECTIVE)
+    else:
+        compatibility_source = [
+            strip_toolless_system(message) if message.get("role") == "system" else message
+            for message in compatibility_source
+        ]
+        compatibility_directives.insert(0, TOOLLESS_REQUEST_DIRECTIVE)
+    compat = canonicalize_messages(compatibility_source, compatibility_directives)
     return fit_request_context_messages(compat, config, finalizing=finalizing), []
+
+
+def native_calls_for_request(
+    native_calls: list[dict[str, Any]],
+    request_tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Accept provider-native calls only when schemas were supplied for this request."""
+    return native_calls if request_tools else []
 
 
 def context_report(
@@ -1907,7 +2317,12 @@ def _summary_context_message(summary: str, config: dict[str, Any]) -> dict[str, 
     budget = context_budget(config)
     return {
         "role": "system",
-        "content": "Persistent summary of earlier conversation:\n" + truncate(summary.strip(), max(1200, budget * 2)),
+        "content": (
+            "Persistent summary of earlier conversation:\n"
+            "Memory-use rule: treat attributed entries as evidence. For exact prior identifiers, names, paths, or "
+            "quoted text, copy the matching value verbatim; never substitute an invented value. If the value is "
+            "absent, say so.\n" + truncate(summary.strip(), max(1200, budget * 2))
+        ),
     }
 
 
@@ -1915,10 +2330,13 @@ def _request_payload_estimates(
     source: list[dict[str, Any]],
     summary: str,
     config: dict[str, Any],
+    *,
+    allow_tools: bool = True,
 ) -> tuple[int, int]:
     """Estimate native and compatibility payloads with per-turn routing headroom."""
     summary_message = _summary_context_message(summary, config) if summary.strip() else None
-    compatibility = compatibility_tool_history_messages(source)
+    compatibility_directives = [COMPATIBILITY_TOOL_DIRECTIVE] if allow_tools else []
+    compatibility = canonicalize_messages(compatibility_tool_history_messages(source), compatibility_directives)
     if summary_message:
         compatibility.insert(min(1, len(compatibility)), summary_message)
 
@@ -1932,7 +2350,7 @@ def _request_payload_estimates(
     common_reserve = tokenizer_headroom + routing_headroom + response_token_reserve(config)
     compatibility_estimate = sum(estimate_message_tokens(message) for message in compatibility) + common_reserve
     native_estimate = compatibility_estimate
-    if config_bool(config, "agent", True):
+    if config_bool(config, "agent", True) and allow_tools:
         native_estimate = (
             sum(estimate_message_tokens(message) for message in native)
             + estimate_tokens(json.dumps(agent_tool_schemas(), sort_keys=True))
@@ -1973,18 +2391,24 @@ def executor_response_allowance(
     tools: list[dict[str, Any]] | None,
     config: dict[str, Any],
 ) -> int:
-    """Generation cap for one executor request: the true window residual.
+    """Generation cap for one executor request within the true window residual.
 
     Passed as num_predict so the provider stops at the boundary instead of
     context-shifting the prompt away; truncation stays honest and recoverable
-    through the turn ladder rather than silently corrupting the request.
+    through the turn ladder rather than silently corrupting the request. Native
+    action turns are additionally bounded because one tool call should not spend
+    several thousand tokens failing to terminate on constrained local hardware.
     """
     tokenizer_headroom, _routing_headroom = context_request_headroom(config)
     prompt_tokens = sum(estimate_message_tokens(message) for message in request_messages)
     if tools:
         prompt_tokens += estimate_tokens(json.dumps(tools, sort_keys=True))
     num_ctx = int(config.get("num_ctx") or 4096)
-    return max(256, num_ctx - prompt_tokens - tokenizer_headroom)
+    residual = max(256, num_ctx - prompt_tokens - tokenizer_headroom)
+    if tools:
+        action_cap = max(768, min(1024, int(num_ctx * 0.125)))
+        return min(residual, action_cap)
+    return residual
 
 
 def executor_keep_alive(config: dict[str, Any]) -> str | None:
@@ -2030,11 +2454,22 @@ def context_state(
     )
     source = summarized_context_source(messages, chat or {})
     active = active_context_messages(source, summary, runtime, summary_required=bool(summary.strip()))
+    route = (chat or {}).get("last_route")
+    direct_answer = is_direct_answer_route(route if isinstance(route, dict) else None)
     requested_tools = (
-        list(tools) if tools is not None else agent_tool_schemas() if config_bool(runtime, "agent", True) else []
+        list(tools)
+        if tools is not None
+        else agent_tool_schemas()
+        if config_bool(runtime, "agent", True) and not direct_answer
+        else []
     )
     try:
-        fitted, fitted_tools = fit_agent_request_context_messages(active, runtime, requested_tools)
+        fitted, fitted_tools = fit_agent_request_context_messages(
+            active,
+            runtime,
+            requested_tools,
+            allow_compatibility_tools=config_bool(runtime, "agent", True) and not direct_answer,
+        )
     except RequestContextError:
         fitted = active
         fitted_tools = []
@@ -2053,7 +2488,13 @@ def context_state(
     micro_tokens = max(0, message_tokens - foundation_tokens - macro_tokens)
     budget = context_budget(runtime)
     request_tokens = message_tokens + tool_tokens + headroom_tokens
-    mode = "native" if fitted_tools else "compatibility" if config_bool(runtime, "agent", True) else "conversation"
+    mode = (
+        "native"
+        if fitted_tools
+        else "compatibility"
+        if config_bool(runtime, "agent", True) and not direct_answer
+        else "conversation"
+    )
     num_ctx = int(runtime.get("num_ctx") or 4096)
     return {
         "runtime": runtime,
@@ -2090,15 +2531,24 @@ def token_aware_compaction_range(
     selected_summary = ""
     selected_mode = "constrained"
     selected_estimate = 0
+    route = chat.get("last_route")
+    allow_tools = config_bool(config, "agent", True) and not is_direct_answer_route(
+        route if isinstance(route, dict) else None
+    )
 
     while end > start:
         summary = grounded_memory_summary(messages, end, config, chat)
         source = [messages[0], *messages[end:]]
-        native_estimate, compatibility_estimate = _request_payload_estimates(source, summary, config)
+        native_estimate, compatibility_estimate = _request_payload_estimates(
+            source,
+            summary,
+            config,
+            allow_tools=allow_tools,
+        )
         selected_summary = summary
-        if not config_bool(config, "agent", True) or native_estimate <= target:
-            selected_mode = "native" if config_bool(config, "agent", True) else "conversation"
-            selected_estimate = native_estimate if config_bool(config, "agent", True) else compatibility_estimate
+        if not allow_tools or native_estimate <= target:
+            selected_mode = "native" if allow_tools else "conversation"
+            selected_estimate = native_estimate if allow_tools else compatibility_estimate
             break
         selected_mode = "compatibility" if compatibility_estimate <= target else "constrained"
         selected_estimate = compatibility_estimate
@@ -2140,9 +2590,18 @@ def should_auto_compact(
 
     source = summarized_context_source(messages, chat)
     summary = str(chat.get("summary") or "")
-    native_estimate, compatibility_estimate = _request_payload_estimates(source, summary, config)
+    route = chat.get("last_route")
+    allow_tools = config_bool(config, "agent", True) and not is_direct_answer_route(
+        route if isinstance(route, dict) else None
+    )
+    native_estimate, compatibility_estimate = _request_payload_estimates(
+        source,
+        summary,
+        config,
+        allow_tools=allow_tools,
+    )
     budget = context_budget(config)
-    request_tokens = native_estimate if config_bool(config, "agent", True) else compatibility_estimate
+    request_tokens = native_estimate if allow_tools else compatibility_estimate
     trigger_ratio = config_float(config, "auto_compact_trigger_ratio", 0.88, 0.50, 1.50)
     trigger_tokens = int(budget * trigger_ratio)
     if pressure_compactable > 0 and request_tokens >= trigger_tokens:
@@ -2814,6 +3273,9 @@ def system_prompt(cwd: Path, agent: bool, config: dict[str, Any] | None = None) 
             return one <tool> JSON envelope that conforms to the same tool schema.
             Never mix an action request with ordinary response text.
 
+            Shell tools already start in the active project directory. Request the
+            command itself without a leading cd or directory-changing wrapper.
+
             Use hardware_status only when the authoritative machine map needs to be
             restated; do not run shell commands for ordinary hardware identity questions.
             To locate a named file, directory, or project outside the active workspace,
@@ -3046,7 +3508,10 @@ def _run_process(
 def shell_invocation(cmd: str) -> tuple[str | list[str], bool]:
     """Return the user's platform shell invocation without relying on shell=True on Windows."""
     if os.name != "nt":
-        return cmd, True
+        bash = shutil.which("bash")
+        if bash:
+            return [bash, "-o", "pipefail", "-c", cmd], False
+        return ["/bin/sh", "-c", cmd], False
     powershell = shutil.which("pwsh") or shutil.which("powershell")
     if powershell:
         return [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], False
@@ -3100,10 +3565,7 @@ def tool_result_char_budget(
         resolve_runtime=False,
     )
     budget = int(state["budget"])
-    free_tokens = max(0, budget - int(state["request_tokens"]))
     target_tokens = max(384, min(MAX_TOOL_OUTPUT // 4, int(budget * 0.18)))
-    if free_tokens:
-        target_tokens = min(target_tokens, max(384, free_tokens - max(96, int(budget * 0.02))))
     return max(1536, min(MAX_TOOL_OUTPUT, target_tokens * 4))
 
 
@@ -3162,6 +3624,7 @@ REPEATABLE_READ_TOOLS = frozenset(
     {"read_file", "list_dir", "find_paths", "grep", "hardware_status", "search_project", "web_search", "web_open"}
 )
 STATE_PRESERVING_TOOLS = REPEATABLE_READ_TOOLS | {"consult_specialist", "analyze_image"}
+FILE_MUTATION_TOOLS = frozenset({"patch", "edit_file", "write_file"})
 
 
 def tool_call_signature(call: dict[str, str]) -> str:
@@ -3175,16 +3638,28 @@ class ActionLoopGuard:
     def __init__(self) -> None:
         self._counts: dict[str, int] = {}
         self._digests: dict[str, str] = {}
+        self._failed_mutations: dict[str, int] = {}
         self.repeat_stops = 0
+        self._synthesis_reason = ""
 
     def reset(self) -> None:
         self._counts.clear()
         self._digests.clear()
+        self._failed_mutations.clear()
         self.repeat_stops = 0
+        self._synthesis_reason = ""
 
     @property
     def force_synthesis(self) -> bool:
-        return self.repeat_stops >= 2
+        return bool(self._synthesis_reason) or self.repeat_stops >= 2
+
+    @property
+    def synthesis_reason(self) -> str:
+        return self._synthesis_reason
+
+    def require_synthesis(self, reason: str) -> None:
+        """Close the action surface and require a bounded final response for this turn."""
+        self._synthesis_reason = reason.strip() or "Tool actions are unavailable"
 
     def refusal(self, call: dict[str, str]) -> str:
         """Return a refusal reason when this exact read already ran twice with no state change since."""
@@ -3200,11 +3675,22 @@ class ActionLoopGuard:
             "different action."
         )
 
-    def record(self, call: dict[str, str], result: str) -> str:
+    def record(self, call: dict[str, str], result: str, succeeded: bool = True) -> str:
         """Record an executed action; return a note when a repeated read returned identical output."""
         name = str(call.get("name") or "")
         if name not in STATE_PRESERVING_TOOLS:
-            self.reset()
+            if succeeded:
+                self.reset()
+            elif name in FILE_MUTATION_TOOLS:
+                target = str(call.get("path") or call.get("patch") or "")
+                key = name + "\x00" + target
+                self._failed_mutations[key] = self._failed_mutations.get(key, 0) + 1
+                if self._failed_mutations[key] >= 2:
+                    return (
+                        "\n[write recovery: this target has rejected multiple edits. Stop guessing surrounding "
+                        "text; re-read once, use the smallest unique exact anchor shown in the error, or switch "
+                        "to a verified patch/write method.]"
+                    )
             return ""
         self.repeat_stops = 0
         if name not in REPEATABLE_READ_TOOLS:
@@ -3261,7 +3747,102 @@ def strip_tool_markup(text: str) -> str:
     return strip_tool_protocol(text)
 
 
-def response_incomplete_reason(text: str, stats: dict[str, Any] | None = None) -> str:
+THINK_BLOCK_PATTERN = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def strip_reasoning_markup(text: str) -> str:
+    """Remove model-internal think blocks, including a streamed orphan closing boundary."""
+    cleaned = THINK_BLOCK_PATTERN.sub("", text)
+    lowered = cleaned.lower()
+    closing = lowered.rfind("</think>")
+    if closing >= 0:
+        suffix = cleaned[closing + len("</think>") :]
+        cleaned = suffix if suffix.strip() else cleaned[:closing]
+    cleaned = re.sub(r"</?think\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def exact_read_evidence_violation(route: dict[str, Any], candidate: str) -> str:
+    """Require requested heading identifiers to be copied from completed read evidence."""
+    task = str(route.get("prompt") or "")
+    state = route.get("read_progress")
+    if not task or not isinstance(state, dict):
+        return ""
+    contract = route.get("action_contract")
+    target = str(contract.get("target") or "") if isinstance(contract, dict) else ""
+    progress = complete_file_read_progress(task, [], target, state)
+    if not progress or not progress["complete"]:
+        return ""
+    requested = {value.upper() for value in TASK_IDENTIFIER_PATTERN.findall(task)}
+    if not requested:
+        return ""
+    expected: dict[str, str] = {}
+    for item in state.get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        match = re.match(r"^###\s+([A-Za-z]{1,12}\d{1,6})\.\s+(.+)$", text)
+        if match and match.group(1).upper() in requested:
+            expected[match.group(1).upper()] = match.group(2).strip()
+    if not expected:
+        return ""
+    visible = strip_reasoning_markup(strip_tool_markup(candidate))
+    plain = re.sub(r"[*_`]", "", visible)
+    missing = [identifier for identifier, heading in expected.items() if heading not in plain]
+    if missing:
+        return "the final answer does not copy the preserved heading text verbatim for " + ", ".join(missing)
+    return ""
+
+
+def output_constraint_violation(route: dict[str, Any], candidate: str) -> str:
+    evidence_violation = exact_read_evidence_violation(route, candidate)
+    if evidence_violation:
+        return evidence_violation
+    if not output_constraint_directive(route):
+        return ""
+    visible = strip_reasoning_markup(strip_tool_markup(candidate)).strip()
+    raw_prompt = re.sub(r"\s+", " ", str(route.get("prompt") or "")).strip()
+    prompt = raw_prompt.lower()
+    one_line = bool(
+        re.search(
+            r"\b(?:only|exactly)\s+(?:the\s+)?(?:value|number|path|line|word|words)\b|"
+            r"\b(?:answer|reply|respond|return)\s+(?:with\s+)?(?:only|exactly)\b|"
+            r"\bformat\s+only\b",
+            prompt,
+        )
+    )
+    if not visible:
+        return "the final answer is empty"
+    if re.search(r"```|^\s*[-*]\s|\*\*|^\s*#{1,6}\s", visible, re.MULTILINE):
+        return "the user requested only the literal result, but the answer adds Markdown formatting"
+    if one_line and len(visible.splitlines()) > 1:
+        return "the user requested a single literal result, but the answer adds multiple lines"
+    if len(visible) > 500:
+        return "the user requested only the result, but the answer adds substantial commentary"
+    if ":" in raw_prompt:
+        instruction, template = raw_prompt.rsplit(":", 1)
+        if output_constraint_directive({"prompt": instruction}):
+            fields = list(re.finditer(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*\b", template))
+            if any(re.search(rf"\b{re.escape(field.group(0))}\b", visible) for field in fields):
+                return "the final answer repeats output-template field labels instead of returning only their values"
+            separators = [
+                template[left.end() : right.start()].strip() for left, right in zip(fields, fields[1:], strict=False)
+            ]
+            separators = [separator for separator in separators if separator and not separator.isalnum()]
+            offset = 0
+            for separator in separators:
+                position = visible.find(separator, offset)
+                if position < 0:
+                    return f"the final answer does not preserve the requested {separator!r} separator"
+                offset = position + len(separator)
+    return ""
+
+
+def response_incomplete_reason(
+    text: str,
+    stats: dict[str, Any] | None = None,
+    messages: list[dict[str, Any]] | None = None,
+) -> str:
     """Return structural evidence that a model response ended before completion."""
     done_reason = str((stats or {}).get("done_reason") or "").strip().lower().replace("-", "_")
     if done_reason in {"length", "max_tokens", "token_limit"}:
@@ -3275,6 +3856,33 @@ def response_incomplete_reason(text: str, stats: dict[str, Any] | None = None) -
     fence_markers = re.findall(r"(?m)^\s*(?:```|~~~)", visible)
     if len(fence_markers) % 2:
         return "response ended with an unclosed Markdown code fence"
+    if messages:
+        task_start = 0
+        for index, message in enumerate(messages):
+            content = str(message.get("content") or "").strip()
+            if message.get("role") == "user" and content and not content.startswith(TOOL_RESULT_PREFIXES):
+                task_start = index
+        actions_closed = any(
+            "No further tool actions are available in this turn" in str(message.get("content") or "")
+            for message in messages[task_start + 1 :]
+        )
+        honesty_markers = (
+            "denied",
+            "blocked",
+            "could not",
+            "did not run",
+            "not run",
+            "was not run",
+            "not executed",
+            "unverified",
+            "could not verify",
+            "unable to verify",
+            "cannot be run",
+            "can't be run",
+            "unconfirmed",
+        )
+        if actions_closed and not any(marker in visible.lower() for marker in honesty_markers):
+            return "the final answer does not acknowledge that the denied action was not run and remains unverified"
     # Trailing commas, semicolons, and colons are common in legitimate complete answers
     # ("Here are the steps:"), so only unambiguous structural danglers force a retry.
     dangling = {
@@ -3287,6 +3895,24 @@ def response_incomplete_reason(text: str, stats: dict[str, Any] | None = None) -
 
 
 def completion_retry_directive(reason: str) -> str:
+    if "denied action was not run" in reason:
+        return (
+            "The previous final answer did not state the verification boundary. Return a complete replacement that "
+            "summarizes only confirmed work and explicitly says which denied action did not run and remains unverified. "
+            "Do not promise another action or end with an unfinished lead-in."
+        )
+    if "preserved heading text" in reason:
+        return (
+            f"The previous output violated an exact-evidence requirement: {reason}. "
+            "Copy every requested heading title verbatim from the persistent whole-file task ledger. "
+            "Do not shorten, paraphrase, normalize punctuation, or use an ellipsis. Then include the requested counts."
+        )
+    if "final answer" in reason or "user requested" in reason:
+        return (
+            f"The previous output violated the user's literal output format: {reason}. "
+            "Replace every uppercase template field with its actual value, preserve each requested separator exactly, "
+            "and return only those values. Add no field names, labels, Markdown, or commentary."
+        )
     return (
         f"The previous output was structurally incomplete: {reason}. "
         "Produce one complete replacement response from the same evidence. Start from the beginning, finish all "
@@ -3326,6 +3952,28 @@ def resolve_tool_request(
     if call:
         call["_protocol"] = "compat"
     return call, error
+
+
+def resolve_request_tool_response(
+    text: str,
+    native_calls: list[dict[str, Any]],
+    request_tools: list[dict[str, Any]],
+    request_messages: list[dict[str, Any]],
+) -> tuple[dict[str, str] | None, str]:
+    """Resolve only the tool protocols explicitly active for one provider request."""
+    accepted_native = native_calls_for_request(native_calls, request_tools)
+    if accepted_native:
+        return resolve_tool_request(text, accepted_native)
+    compatibility_active = any(
+        message.get("role") == "system" and COMPATIBILITY_TOOL_DIRECTIVE in str(message.get("content") or "")
+        for message in request_messages
+    )
+    if compatibility_active or bool(request_tools):
+        return resolve_tool_request(text, [])
+    _call, _error, recognized = decode_text_tool_call(text)
+    if recognized:
+        return None, "action markup was returned without an active compatibility tool protocol"
+    return None, ""
 
 
 def read_only_batch(
@@ -3400,6 +4048,75 @@ def normalize_coordinator_tool_call(call: dict[str, str]) -> dict[str, str]:
         normalized.pop("max_lines", None)
         normalized.pop("query", None)
     return normalized
+
+
+def align_tool_call_with_action_contract(
+    call: dict[str, str] | None,
+    route: dict[str, Any] | None,
+    messages: list[dict[str, Any]] | None = None,
+) -> dict[str, str] | None:
+    """Apply deterministic path and whole-file progress invariants to a model action."""
+    if not call or not isinstance(route, dict):
+        return call
+    contract = route.get("action_contract")
+    if not isinstance(contract, dict) or contract.get("capability") != "runtime_action":
+        return call
+    target = str(contract.get("target") or "").strip()
+    name = str(call.get("name") or "")
+    path = str(call.get("path") or "").strip()
+    if name not in {"read_file", "edit_file", "grep"} or not path:
+        return call
+
+    aligned = dict(call)
+    corrections = route.setdefault("contract_corrections", [])
+
+    def correct(field: str, value: str, reason: str) -> None:
+        previous = str(aligned.get(field) or "")
+        if previous == value:
+            return
+        aligned[field] = value
+        if not isinstance(corrections, list):
+            return
+        corrections.append(
+            {
+                "tool": name,
+                "field": field,
+                "from": previous,
+                "to": value,
+                "reason": reason,
+            }
+        )
+
+    if target and Path(path).name.casefold() == Path(target).name.casefold():
+        correct("path", target, "aligned with exact user-supplied target")
+
+    task = latest_user_task(messages or [])
+    if name != "read_file" or not task or not COMPLETE_FILE_READ_PATTERN.search(task):
+        return aligned
+
+    current_path = str(aligned.get("path") or path)
+    saved_progress = route.get("read_progress")
+    progress = complete_file_read_progress(
+        task,
+        messages or [],
+        current_path,
+        saved_progress if isinstance(saved_progress, dict) else None,
+    )
+    total = int(progress["total"]) if progress else 0
+    cursor = int(progress["next_line"]) if progress else 1
+    if not total or cursor <= total:
+        correct("start_line", str(cursor), "continued from the earliest unread returned line")
+        aligned.pop("line", None)
+
+    limit_match = READ_WINDOW_LIMIT_PATTERN.search(task)
+    if limit_match:
+        requested_limit = max(1, min(260, int(limit_match.group(1))))
+        try:
+            proposed_limit = int(aligned.get("max_lines") or requested_limit)
+        except (TypeError, ValueError):
+            proposed_limit = requested_limit
+        correct("max_lines", str(min(requested_limit, max(1, proposed_limit))), "honored the user's window limit")
+    return aligned
 
 
 def patch_stats(patch_text: str) -> tuple[int, int, int]:
@@ -3546,6 +4263,7 @@ def open_file_preview(
     line: int | None = None,
     max_lines: int = 260,
     start_line: int | None = None,
+    max_chars: int | None = None,
 ) -> tuple[int, str]:
     path = resolve_user_path(cwd, value)
     if not path.exists():
@@ -3581,14 +4299,38 @@ def open_file_preview(
         start = 1
         end = min(total, max_lines)
 
+    requested_end = end
     rendered = [f"{path}"]
     if total:
+        selected: list[str] = []
+        if max_chars is None:
+            selected = [f"{idx:>5}  {lines[idx - 1]}" for idx in range(start, end + 1)]
+        else:
+            max_chars = max(512, max_chars)
+            body_budget = max(160, max_chars - len(str(path)) - 180)
+            visible_slots = max(4, min(max_lines, 12))
+            per_line_limit = max(120, min(1000, body_budget // visible_slots))
+            used = 0
+            for idx in range(start, end + 1):
+                value = lines[idx - 1]
+                if len(value) > per_line_limit:
+                    omitted = len(value) - per_line_limit
+                    value = value[:per_line_limit] + f" ...[{omitted} chars omitted]"
+                row = f"{idx:>5}  {value}"
+                if selected and used + len(row) + 1 > body_budget:
+                    break
+                selected.append(row)
+                used += len(row) + 1
+            end = start + len(selected) - 1
         rendered.append(f"lines {start}-{end} of {total}")
-        rendered.extend(f"{idx:>5}  {lines[idx - 1]}" for idx in range(start, end + 1))
+        rendered.extend(selected)
     else:
         rendered.append("(empty file)")
     if end < total:
-        rendered.append(f"...[{total - end} lines remain; continue with start_line={end + 1}, max_lines={max_lines}]")
+        reason = "character budget reached; " if end < requested_end else ""
+        rendered.append(
+            f"...[{reason}{total - end} lines remain; continue with start_line={end + 1}, max_lines={max_lines}]"
+        )
     return 0, "\n".join(rendered)
 
 
@@ -3660,7 +4402,14 @@ def list_directory(cwd: Path, value: str = ".") -> tuple[int, str]:
         entries = sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
     except Exception as exc:
         return 1, f"could not list {path}: {exc}"
-    lines = [str(path)]
+    directory_count = sum(1 for entry in entries if entry.is_dir())
+    file_count = len(entries) - directory_count
+    directory_label = "directory" if directory_count == 1 else "directories"
+    file_label = "file" if file_count == 1 else "files"
+    lines = [
+        str(path),
+        f"entries: {len(entries)} total / {directory_count} {directory_label} / {file_count} {file_label}",
+    ]
     for entry in entries[:240]:
         marker = "/" if entry.is_dir() else ""
         try:
@@ -4799,6 +5548,9 @@ def request_context_messages(
         else ""
     )
     context_parts: list[str] = []
+    read_ledger = complete_file_read_directive(chat.get("last_route"))
+    if read_ledger:
+        context_parts.append(read_ledger)
     if project_root != cwd.resolve():
         context_parts.append(
             f"Active project root: {project_root}\n"
@@ -5175,16 +5927,139 @@ def _exact_edit_content(target: Path, old_string: str, new_string: str) -> tuple
         return None, f"could not read {target}: {exc}"
     occurrences = content.count(old_string)
     if occurrences == 0:
+        preview_old = strip_read_preview_gutter(old_string)
+        if preview_old != old_string and content.count(preview_old) == 1:
+            old_string = preview_old
+            new_string = strip_read_preview_gutter(new_string)
+            occurrences = 1
+    if occurrences == 0:
+        anchor = exact_edit_anchor_hint(content, old_string)
         return None, (
             "old_string was not found in the file. Re-read the file and copy the exact "
-            "current text, including whitespace and indentation."
+            "current text, including whitespace and indentation." + (f"\n{anchor}" if anchor else "")
         )
     if occurrences > 1:
         return None, (
             f"old_string matches {occurrences} places in the file. Include more surrounding "
             "lines so it matches exactly once."
         )
-    return content.replace(old_string, new_string, 1), ""
+    updated = content.replace(old_string, new_string, 1)
+    validation_error = structured_edit_validation_error(target, content, updated)
+    if validation_error:
+        return None, validation_error
+    return updated, ""
+
+
+def exact_edit_anchor_hint(content: str, old_string: str, limit: int = 1200) -> str:
+    """Return the longest bounded, unique line-prefix that really exists."""
+    boundaries = [match.end() for match in re.finditer(r"\n", old_string)]
+    if not old_string.endswith("\n"):
+        boundaries.append(len(old_string))
+    for boundary in reversed(boundaries):
+        candidate = old_string[:boundary].rstrip("\r\n")
+        if len(candidate) > limit or len(candidate.strip()) < 24:
+            continue
+        if content.count(candidate) == 1:
+            return (
+                "A unique exact prefix does exist. Use only this existing anchor as old_string, preserve it in "
+                "new_string, and add the desired adjacent text without guessed surrounding lines:\n"
+                "--- exact anchor ---\n"
+                f"{candidate}\n"
+                "--- end anchor ---"
+            )
+    return ""
+
+
+def strip_read_preview_gutter(value: str) -> str:
+    """Remove read_file's numbered display gutter when every nonblank line carries it."""
+    lines = value.splitlines(keepends=True)
+    if not lines:
+        return value
+    stripped: list[str] = []
+    saw_numbered = False
+    for line in lines:
+        ending = "\n" if line.endswith("\n") else ""
+        body = line[:-1] if ending else line
+        if not body.strip():
+            stripped.append(line)
+            continue
+        match = re.match(r"^ {0,6}\d+ {2}(.*)$", body)
+        if not match:
+            return value
+        saw_numbered = True
+        stripped.append(match.group(1) + ending)
+    return "".join(stripped) if saw_numbered else value
+
+
+def undefined_python_self_assignment(source: str) -> str:
+    """Find an unbound top-level ``name = name`` assignment."""
+    tree = ast.parse(source)
+    bound = set(dir(builtins))
+
+    def target_names(node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return {name for item in node.elts for name in target_names(item)}
+        return set()
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add(alias.asname or alias.name.split(".", 1)[0])
+            continue
+        if isinstance(node, ast.Assign):
+            names = {name for target in node.targets for name in target_names(target)}
+            if isinstance(node.value, ast.Name) and node.value.id in names and node.value.id not in bound:
+                return node.value.id
+            bound.update(names)
+            continue
+        if isinstance(node, ast.AnnAssign):
+            names = target_names(node.target)
+            if isinstance(node.value, ast.Name) and node.value.id in names and node.value.id not in bound:
+                return node.value.id
+            bound.update(names)
+    return ""
+
+
+def structured_edit_validation_error(target: Path, original: str, updated: str) -> str:
+    """Reject edits that break a structured file which was valid before the edit."""
+
+    def compile_python(source: str) -> None:
+        compile(source, str(target), "exec")
+
+    parsers: dict[str, tuple[str, Callable[[str], Any]]] = {
+        ".py": ("Python", compile_python),
+        ".json": ("JSON", json.loads),
+        ".toml": ("TOML", tomllib.loads),
+    }
+    parser_entry = parsers.get(target.suffix.lower())
+    if parser_entry is None:
+        return ""
+    label, parser = parser_entry
+    try:
+        parser(original)
+    except (SyntaxError, ValueError, RecursionError):
+        return ""
+    try:
+        parser(updated)
+    except SyntaxError as exc:
+        location = f"line {exc.lineno}" + (f", column {exc.offset}" if exc.offset else "")
+        return f"edit rejected before writing: updated {label} is invalid at {location}: {exc.msg}"
+    except (ValueError, RecursionError) as exc:
+        return f"edit rejected before writing: updated {label} is invalid: {exc}"
+    if target.suffix.lower() == ".py":
+        original_self_reference = undefined_python_self_assignment(original)
+        updated_self_reference = undefined_python_self_assignment(updated)
+        if updated_self_reference and updated_self_reference != original_self_reference:
+            return (
+                "edit rejected before writing: updated Python introduces an undefined module-level self-reference "
+                f"({updated_self_reference} = {updated_self_reference})"
+            )
+    return ""
 
 
 def apply_exact_edit(call: dict[str, str], cwd: Path) -> tuple[int, str]:
@@ -5296,7 +6171,14 @@ def execute_tool_call(
         target = resolve_user_path(scope, call.get("path", "."))
         if enforce_project_scope and not path_within(target, scope):
             return 1, f"read-auto scope blocked: {target}"
-        return open_file_preview(scope, str(target), line=line, max_lines=max_lines, start_line=start_line)
+        return open_file_preview(
+            scope,
+            str(target),
+            line=line,
+            max_lines=max_lines,
+            start_line=start_line,
+            max_chars=output_limit,
+        )
     if call.get("name") == "list_dir":
         target = resolve_user_path(scope, call.get("path", "."))
         if enforce_project_scope and not path_within(target, scope):
@@ -5366,14 +6248,26 @@ def tool_history_message(call: dict[str, str], code: int, result: str) -> dict[s
     return {"role": "user", "content": content}
 
 
-def denied_tool_history_message(call: dict[str, str], detail: str) -> dict[str, Any]:
+def denied_tool_history_message(
+    call: dict[str, str],
+    detail: str,
+    *,
+    close_actions: bool = False,
+) -> dict[str, Any]:
+    detail = detail.strip().rstrip(".")
+    suffix = (
+        " No further tool actions are available in this turn. Use the evidence already collected and "
+        "return a complete final answer; identify anything unverified honestly."
+        if close_actions
+        else ""
+    )
     if call.get("_protocol") == "native":
         return {
             "role": "tool",
             "tool_name": str(call.get("name") or "tool"),
-            "content": f"Action was not executed: {detail}",
+            "content": f"Action was not executed: {detail}.{suffix}",
         }
-    return {"role": "user", "content": f"Tool request denied {detail}."}
+    return {"role": "user", "content": f"Tool request denied {detail}.{suffix}"}
 
 
 def diff_style_for_line(line: str) -> str:
@@ -6529,7 +7423,7 @@ class DairackTui:
             worker.join(timeout=remaining)
 
     def reserve_agent_action(self) -> bool:
-        limit = agent_action_limit(self.config)
+        limit = agent_action_limit(self.config, self._active_route)
         if self._agent_steps_used >= limit:
             return False
         self._agent_steps_used += 1
@@ -6553,7 +7447,7 @@ class DairackTui:
                     previous_route=self.chat.get("last_route"),
                 )
                 self._active_route["tool_steps"] = self._agent_steps_used
-                self._active_route["tool_limit"] = agent_action_limit(self.config)
+                self._active_route["tool_limit"] = agent_action_limit(self.config, self._active_route)
                 executor = str(self._active_route.get("executor") or self.config.get("model") or "")
                 if not executor:
                     raise RuntimeError("no compute model is available for this route")
@@ -6592,7 +7486,7 @@ class DairackTui:
                     return
                 if not self.maybe_auto_compact(runtime, str(route["executor"])):
                     return
-                action_limit = agent_action_limit(self.config)
+                action_limit = agent_action_limit(self.config, route)
                 finalizing = self._agent_steps_used >= action_limit or self._loop_guard.force_synthesis
                 if finalizing:
                     synthesis_attempts += 1
@@ -6643,6 +7537,7 @@ class DairackTui:
                             self._agent_steps_used,
                             action_limit,
                             retry=synthesis_attempts > 1,
+                            unavailable_reason=self._loop_guard.synthesis_reason,
                         )
                     )
                 request_messages = canonicalize_messages(request_messages, directives)
@@ -6659,6 +7554,7 @@ class DairackTui:
                         runtime,
                         native_tools,
                         finalizing=finalizing,
+                        allow_compatibility_tools=bool(self.config.get("agent")) and not is_direct_answer_route(route),
                     )
                 except RequestContextError:
                     reduced = request_context_messages(
@@ -6673,6 +7569,7 @@ class DairackTui:
                         runtime,
                         native_tools,
                         finalizing=finalizing,
+                        allow_compatibility_tools=bool(self.config.get("agent")) and not is_direct_answer_route(route),
                     )
                     route["context_degraded"] = "project retrieval omitted to fit the context window"
                 if finalizing:
@@ -6692,7 +7589,7 @@ class DairackTui:
                             cancel_event=self.cancel_event,
                             extra_options=ollama_options(runtime),
                             tools=native_tools or None,
-                            tool_call_sink=native_calls.append,
+                            tool_call_sink=native_calls.append if native_tools else None,
                         ):
                             if self.cancel_event.is_set():
                                 break
@@ -6733,14 +7630,22 @@ class DairackTui:
                         self.save_current_chat()
                         continue
                     raise generation_error
+                assistant_text = strip_reasoning_markup(assistant_text)
+                accepted_native_calls = native_calls_for_request(native_calls, native_tools)
                 if not self.cancel_event.is_set() and self.maybe_run_read_batch(
-                    native_calls,
+                    accepted_native_calls,
                     assistant_text,
                     finalizing=finalizing,
                 ):
                     self.set_busy(True, "continuing")
                     continue
-                call, parse_error = resolve_tool_request(assistant_text, native_calls)
+                call, parse_error = resolve_request_tool_response(
+                    assistant_text,
+                    native_calls,
+                    native_tools,
+                    request_messages,
+                )
+                call = align_tool_call_with_action_contract(call, route, self.messages)
                 visible_text = strip_tool_markup(assistant_text)
                 internal_call = bool(call and is_internal_coordinator_call(normalize_coordinator_tool_call(call)))
                 if call and not internal_call:
@@ -6764,14 +7669,16 @@ class DairackTui:
                     self.save_current_chat()
                     return
                 assistant_message: dict[str, Any] = {"role": "assistant", "content": assistant_text}
-                if native_calls:
-                    assistant_message["tool_calls"] = native_calls
+                if accepted_native_calls:
+                    assistant_message["tool_calls"] = accepted_native_calls
                 self.messages.append(assistant_message)
                 self.save_current_chat()
                 stats = dict(getattr(self.provider, "last_stats", {}) or {})
                 incomplete_reason = ""
                 if not call and not parse_error:
-                    incomplete_reason = response_incomplete_reason(assistant_text, stats)
+                    incomplete_reason = response_incomplete_reason(assistant_text, stats, self.messages)
+                    if not incomplete_reason:
+                        incomplete_reason = output_constraint_violation(route, assistant_text)
                 agent_enabled = bool(self.config.get("agent"))
                 state = TurnState(
                     action_limit=action_limit,
@@ -7058,14 +7965,16 @@ class DairackTui:
             return "continue"
         mode = str(self.config.get("permission_mode") or "ask")
         if mode == "deny":
-            self.messages.append(denied_tool_history_message(call, "by permissions policy"))
+            self._loop_guard.require_synthesis("The permissions policy denied the requested action")
+            self.messages.append(denied_tool_history_message(call, "by permissions policy", close_actions=True))
             display = tool_denied_display(call, "permissions policy", "BLOCKED")
             append_action = getattr(self, "append_action", None)
             if callable(append_action):
                 append_action(display)
             else:
                 self.append_system(display)
-            return "stop"
+            self.save_current_chat()
+            return "continue"
         if mode == "read-auto" and is_auto_approvable_tool_call(
             call,
             self.cwd,
@@ -7135,7 +8044,7 @@ class DairackTui:
             self.messages.append(denied_tool_history_message(call, "because the task action budget is exhausted"))
             display = tool_denied_display(
                 call,
-                f"task action budget reached ({self._agent_steps_used}/{agent_action_limit(self.config)})",
+                f"task action budget reached ({self._agent_steps_used}/{agent_action_limit(self.config, self._active_route)})",
                 "NOT RUN",
             )
             append_action = getattr(self, "append_action", None)
@@ -7145,7 +8054,7 @@ class DairackTui:
                 self.append_system(display)
             self.save_current_chat()
             return
-        step_label = f"{self._agent_steps_used}/{agent_action_limit(self.config)}"
+        step_label = f"{self._agent_steps_used}/{agent_action_limit(self.config, self._active_route)}"
         begin_action = getattr(self, "begin_tool_action", None)
         finish_action = getattr(self, "finish_tool_action", None)
         if callable(begin_action):
@@ -7196,8 +8105,11 @@ class DairackTui:
             except Exception as exc:
                 code, output = 1, f"action failed: {exc}"
             result = bounded_tool_output(output, result_limit)
-            result += self._loop_guard.record(call, result)
+            result += self._loop_guard.record(call, result, code == 0)
             result = fit_tool_result_for_context(self.messages, self.chat, runtime, call, code, result, self.cwd)
+            update_complete_file_read_state(self._active_route, call, code, result)
+            if self._active_route is not None:
+                self.chat["last_route"] = self._active_route
             elapsed = time.monotonic() - started
             if call.get("name") == "consult_specialist":
                 # Delegation is internal evidence. Live model/phase feedback belongs in
@@ -7244,7 +8156,8 @@ class DairackTui:
             return
         call = self.pending_tool
         self.pending_tool = None
-        self.messages.append(denied_tool_history_message(call, "by user"))
+        self._loop_guard.require_synthesis("The user denied the requested action")
+        self.messages.append(denied_tool_history_message(call, "by user", close_actions=True))
         display = tool_denied_display(call, "denied by user")
         append_action = getattr(self, "append_action", None)
         if callable(append_action):
@@ -7254,7 +8167,8 @@ class DairackTui:
         self.save_current_chat()
         self.app.layout.focus(self.input)
         self.app.invalidate()
-        self.flush_queued_prompt(False)
+        self.set_busy(True, "concluding without action")
+        self.start_worker(self.generate_worker, "dairack-continue")
 
     def handle_command(self, line: str) -> None:
         try:
@@ -8505,7 +9419,7 @@ def chat_turn(
     project_root = project_scope_for_chat(chat, cwd)
     route = select_orchestrator_route(provider, config, messages, project_root, previous_route=chat.get("last_route"))
     route["tool_steps"] = 0
-    route["tool_limit"] = agent_action_limit(config)
+    route["tool_limit"] = agent_action_limit(config, route)
     executor = str(route.get("executor") or model)
     require_vision_support(provider, executor, messages)
     runtime = runtime_config_for_model(config, executor)
@@ -8550,18 +9464,27 @@ def chat_turn(
                     state.action_steps,
                     state.action_limit,
                     retry=synthesis_retry,
+                    unavailable_reason=loop_guard.synthesis_reason,
                 )
             )
         request_tools = [] if finalizing else native_tools
         selected = request_context_messages(messages, chat, runtime, cwd, provider=provider)
         try:
             return fit_agent_request_context_messages(
-                canonicalize_messages(selected, directives), runtime, request_tools, finalizing=finalizing
+                canonicalize_messages(selected, directives),
+                runtime,
+                request_tools,
+                finalizing=finalizing,
+                allow_compatibility_tools=bool(config.get("agent")) and not is_direct_answer_route(route),
             )
         except RequestContextError:
             reduced = request_context_messages(messages, chat, runtime, cwd, include_retrieval=False)
             fitted = fit_agent_request_context_messages(
-                canonicalize_messages(reduced, directives), runtime, request_tools, finalizing=finalizing
+                canonicalize_messages(reduced, directives),
+                runtime,
+                request_tools,
+                finalizing=finalizing,
+                allow_compatibility_tools=bool(config.get("agent")) and not is_direct_answer_route(route),
             )
             route["context_degraded"] = "project retrieval omitted to fit the context window"
             return fitted
@@ -8577,12 +9500,13 @@ def chat_turn(
             num_ctx=int(runtime.get("num_ctx") or 4096),
             extra_options=ollama_options(runtime),
         )
+        response = strip_reasoning_markup(response)
         if route.get("reviewer"):
             route["review"] = {"verdict": "skipped", "feedback": "", "reason": "plain streaming mode"}
         messages.append({"role": "assistant", "content": response})
         return
 
-    state = TurnState(action_limit=agent_action_limit(config))
+    state = TurnState(action_limit=agent_action_limit(config, route))
     revision_feedback = ""
     action_feedback = ""
     loop_guard = ActionLoopGuard()
@@ -8621,7 +9545,7 @@ def chat_turn(
                     keep_alive=executor_keep_alive(runtime),
                     extra_options=ollama_options(runtime),
                     tools=request_tools or None,
-                    tool_call_sink=native_calls.append,
+                    tool_call_sink=native_calls.append if request_tools else None,
                 )
                 break
             except Exception as exc:
@@ -8648,17 +9572,28 @@ def chat_turn(
                 chat["last_route"] = route
                 continue
             raise generation_error
+        response = strip_reasoning_markup(response)
         action_feedback = ""
-        call, parse_error = resolve_tool_request(response, native_calls)
+        accepted_native_calls = native_calls_for_request(native_calls, request_tools)
+        call, parse_error = resolve_request_tool_response(
+            response,
+            native_calls,
+            request_tools,
+            request_messages,
+        )
+        call = align_tool_call_with_action_contract(call, route, messages)
         assistant_message: dict[str, Any] = {"role": "assistant", "content": response}
-        if native_calls:
-            assistant_message["tool_calls"] = native_calls
+        if accepted_native_calls:
+            assistant_message["tool_calls"] = accepted_native_calls
         incomplete_reason = ""
         if not call and not parse_error:
             incomplete_reason = response_incomplete_reason(
                 response,
                 dict(getattr(provider, "last_stats", {}) or {}),
+                messages,
             )
+            if not incomplete_reason:
+                incomplete_reason = output_constraint_violation(route, response)
         facts = ResponseFacts(
             has_call=bool(call),
             parse_error=parse_error or "",
@@ -8830,13 +9765,15 @@ def chat_turn(
             continue
         auto_approved = internal or (mode == "read-auto" and is_auto_approvable_tool_call(call, cwd, project_root))
         if mode == "deny" and not internal:
-            messages.append(denied_tool_history_message(call, "by permissions policy"))
+            loop_guard.require_synthesis("The permissions policy denied the requested action")
+            messages.append(denied_tool_history_message(call, "by permissions policy", close_actions=True))
             print(f"blocked by permissions: {tool_summary(call)}")
-            return
+            continue
         if not auto_approved and not approve_tool(call, project_root):
-            messages.append(denied_tool_history_message(call, "by user"))
+            loop_guard.require_synthesis("The user denied the requested action")
+            messages.append(denied_tool_history_message(call, "by user", close_actions=True))
             print("denied")
-            return
+            continue
 
         repeat_refusal = loop_guard.refusal(call)
         if repeat_refusal:
@@ -8845,6 +9782,7 @@ def chat_turn(
             continue
 
         state.action_steps += 1
+        state.action_completion_repairs = 0
         route["tool_steps"] = state.action_steps
         route["tool_limit"] = state.action_limit
         chat["last_route"] = route
@@ -8875,8 +9813,10 @@ def chat_turn(
         if call.get("name") == "consult_specialist":
             result_limit = tool_result_char_budget(messages, chat, runtime)
         result = bounded_tool_output(output, result_limit)
-        result += loop_guard.record(call, result)
+        result += loop_guard.record(call, result, code == 0)
         result = fit_tool_result_for_context(messages, chat, runtime, call, code, result, cwd)
+        update_complete_file_read_state(route, call, code, result)
+        chat["last_route"] = route
         print(f"\n{tool_summary(call)}")
         print(result)
         print(f"[exit {code}]")

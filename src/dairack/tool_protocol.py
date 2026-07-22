@@ -182,7 +182,7 @@ TOOL_REGISTRY = ToolRegistry(
             "Run one shell command in the current working directory after permission review.",
             {"cmd": {"type": "string", "description": "Exact shell command to run."}},
             required=("cmd",),
-            aliases=("bash", "execute", "run_command", "terminal"),
+            aliases=("bash", "execute", "run", "run_command", "terminal"),
             field_aliases={"command": "cmd", "input": "cmd"},
             body_field="cmd",
             display_name="Command",
@@ -682,6 +682,45 @@ def _decode_call_style(
     return call, error, True
 
 
+def _decode_named_envelope_tail(
+    text: str,
+    registry: ToolRegistry,
+) -> tuple[dict[str, str] | None, str, bool]:
+    """Decode a trailing ``<tool_name>fields</tool_name>`` near-miss envelope."""
+    pattern = re.compile(
+        r"<\s*(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\b(?P<attrs>[^>]*)>"
+        r"(?P<body>.*?)</\s*(?P=name)\s*>\s*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    match = pattern.search(text)
+    if not match:
+        return None, "", False
+    raw_name = match.group("name").lower()
+    if registry.canonical_name(raw_name) not in registry.known_names:
+        return None, "", False
+    body = match.group("body").strip()
+    data: dict[str, Any] = {
+        "name": raw_name,
+        **_tool_attributes(match.group("attrs")),
+    }
+    if body.startswith("{"):
+        try:
+            nested = _loads_tool_json(body)
+        except (ValueError, RecursionError) as exc:
+            return None, f"action request contains invalid JSON: {getattr(exc, 'msg', str(exc))}", True
+        if not isinstance(nested, Mapping):
+            return None, "action request JSON must be an object", True
+        data.update(nested)
+        body = ""
+    else:
+        body_attributes = _tool_attributes(body)
+        if body_attributes:
+            data.update(body_attributes)
+            body = ""
+    call, error = registry.validate(data, body)
+    return call, error, True
+
+
 def _known_call_style_tail(text: str, registry: ToolRegistry) -> str:
     """Return a trailing angle-wrapped near-miss action expression, if one ends the text."""
     tail = re.search(r"<\s*[A-Za-z_][A-Za-z0-9_-]*[^<]*>\s*$", text, re.DOTALL)
@@ -742,6 +781,9 @@ def _tool_envelope(text: str) -> tuple[str | None, str, str]:
         body_start = opening_end + 1
         closing_start = closing.start()
         body = text[body_start:closing_start].strip()
+        # Small models sometimes serialize boundary whitespace as the literal
+        # characters ``\n`` after an otherwise complete JSON payload.
+        body = re.sub(r"(?:\\[nrt])+\s*$", "", body).rstrip()
         envelope_end = closing.end()
     if re.search(rf"<{TOOL_TAG_PATTERN}\b", text[envelope_end:], re.IGNORECASE):
         return None, "", "multiple action requests were returned; exactly one is required"
@@ -830,6 +872,9 @@ def decode_text_tool_call(
     if envelope_error:
         return None, envelope_error, True
     if raw_attrs is None:
+        call, error, recognized = _decode_named_envelope_tail(text, registry)
+        if recognized:
+            return call, error, True
         call, error, recognized = _decode_shorthand(text, registry)
         if recognized:
             return call, error, True
@@ -855,6 +900,9 @@ def decode_text_tool_call(
 
     if not body:
         return None, "action request has no payload", True
+    call, error, recognized = _decode_shorthand(body, registry)
+    if recognized:
+        return call, error, True
     try:
         data = _loads_tool_json(body)
     except (ValueError, RecursionError) as exc:
@@ -911,6 +959,11 @@ def _strip_near_miss_markup(text: str, registry: ToolRegistry) -> str:
     if "<" not in text:
         return text
     names = "|".join(sorted(re.escape(name) for name in registry.known_names))
+    paired = re.compile(
+        rf"<\s*(?P<name>{names})\b[^>]*>.*?</\s*(?P=name)\s*>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    text = paired.sub("", text)
     pattern = re.compile(rf"<\s*(?:{names})\b", re.IGNORECASE)
     parts: list[str] = []
     cursor = 0

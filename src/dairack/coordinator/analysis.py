@@ -82,6 +82,71 @@ COORDINATOR_FAST_FACT_PATTERN = re.compile(
 COORDINATOR_JUDGMENT_PATTERN = re.compile(
     r"\b(?:best|better|should|recommend|compare|versus|vs\.?|trade-?offs?|evaluate|analy[sz]e|design|diagnose)\b"
 )
+DIRECT_RESPONSE_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:reply|respond|answer|say)\b"
+    r"(?:(?!\b(?:after|once)\s+(?:you\s+)?(?:run|check|inspect|open|search|read)\b).)*$",
+    re.IGNORECASE | re.DOTALL,
+)
+LOCAL_ACTION_REQUEST_PATTERN = re.compile(
+    r"(?:^\s*|[.;!?]\s+|\b(?:please|then|also|and\s+then)\s+)"
+    r"(?:please\s+)?"
+    r"(?:(?:can|could|would|will)\s+(?:you|u)\s+|"
+    r"(?:i(?:'d|\s+would)?\s+like|i\s+need)\s+(?:you|u)\s+to\s+)?"
+    r"(?P<verb>run|execute|build|edit|modify|change|fix|implement|create|write|apply|delete|remove|"
+    r"rename|move|install|configure|deploy|commit|test|read|inspect|open|list|find|search|grep|review|audit|check)\b",
+    re.IGNORECASE,
+)
+LOCAL_ACTION_EXPLANATION_PATTERN = re.compile(
+    r"^\s*(?:how|what|why|when|where|explain|describe|tell\s+me\s+how|show\s+me\s+how|should\s+i)\b",
+    re.IGNORECASE,
+)
+LOCAL_RESOURCE_QUERY_PATTERN = re.compile(
+    r"^\s*(?:(?:what|which|how\s+many)\s+(?:[a-z0-9_-]+\s+){0,3}"
+    r"(?:files?|folders?|directories?|paths?|projects?|repositories|repos?|entries|items)\b"
+    r".*\b(?:in|inside|under|within|at)\b|"
+    r"where\s+(?:is|are)\b.*\b(?:files?|folders?|directories?|paths?|projects?|repositories|repos?)\b)",
+    re.IGNORECASE,
+)
+LOCAL_TOOL_USE_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?use\s+(?:the\s+)?(?:available\s+)?"
+    r"(?P<tool>read_file|list_dir|find_paths|grep|hardware_status|search_project|index_project|shell|patch|tools?)\b",
+    re.IGNORECASE,
+)
+LOCAL_RESOURCE_PATTERN = re.compile(
+    r"\b(?:file|folder|directory|project|repository|repo|codebase|source|tests?|suite|path|diff|logs?|"
+    r"script|command|app|application|program|bug|workspace|read_file|list_dir|find_paths|search_project)\b|"
+    r"(?:^|[\s`'\"])(?:\.{0,2}[/\\]|[a-z]:[/\\])|"
+    r"\b[\w.-]+\.(?:py|js|ts|tsx|jsx|rs|go|java|c|cc|cpp|h|hpp|sh|ps1|md|txt|json|ya?ml|toml|ini|log)\b",
+    re.IGNORECASE,
+)
+LOCAL_ROOT_RESOURCE_PATTERN = re.compile(
+    r"(?<!square\s)(?<!cube\s)\broot\b(?!\s+(?:cause|canal))",
+    re.IGNORECASE,
+)
+LOCAL_FILE_TARGET_PATTERN = re.compile(
+    r"(?P<target>(?:[a-z]:)?(?:\.{0,2}[/\\])?[a-z0-9_.-]+(?:[/\\][a-z0-9_. -]+)*\."
+    r"(?:py|js|ts|tsx|jsx|rs|go|java|c|cc|cpp|h|hpp|sh|ps1|md|txt|json|ya?ml|toml|ini|log))",
+    re.IGNORECASE,
+)
+RESOURCE_REQUIRED_ACTIONS = frozenset(
+    {
+        "build",
+        "create",
+        "implement",
+        "write",
+        "test",
+        "read",
+        "inspect",
+        "open",
+        "list",
+        "find",
+        "search",
+        "grep",
+        "review",
+        "audit",
+        "check",
+    }
+)
 
 
 def signal_hits(text: str, terms: tuple[str, ...]) -> list[str]:
@@ -98,6 +163,11 @@ def signal_hits(text: str, terms: tuple[str, ...]) -> list[str]:
         if matched:
             hits.append(term)
     return hits
+
+
+def is_direct_response_request(prompt: str) -> bool:
+    """Identify explicit response formatting that cannot require external work."""
+    return bool(DIRECT_RESPONSE_PATTERN.fullmatch(str(prompt or "").strip()))
 
 
 def dominant_role(signals: dict[str, float]) -> str:
@@ -150,6 +220,8 @@ def task_kind(signals: dict[str, float]) -> str:
 def task_role(signals: dict[str, float]) -> str:
     if signals.get("vision", 0.0) >= 0.25:
         return "vision"
+    if signals.get("agent", 0.0) >= 0.50 and signals.get("code", 0.0) >= 0.38:
+        return "agent"
     return dominant_role(signals)
 
 
@@ -229,6 +301,56 @@ def public_web_action_contract(messages: list[dict[str, Any]]) -> dict[str, str]
     return {}
 
 
+def runtime_action_contract(messages: list[dict[str, Any]]) -> dict[str, str]:
+    """Derive a conservative local-runtime requirement from explicit request grammar."""
+    web_contract = public_web_action_contract(messages)
+    if web_contract:
+        return web_contract
+    prompt = latest_user_task(messages).strip()
+    if not prompt or is_direct_response_request(prompt):
+        return {}
+    resource_query = LOCAL_RESOURCE_QUERY_PATTERN.search(prompt)
+    if resource_query:
+        target_match = LOCAL_FILE_TARGET_PATTERN.search(prompt)
+        return {
+            "capability": "runtime_action",
+            "preferred_tool": "find_paths" if prompt.lstrip().lower().startswith("where") else "list_dir",
+            "target": str(target_match.group("target") or "") if target_match else "",
+            "reason": "explicit local resource query",
+        }
+    if LOCAL_ACTION_EXPLANATION_PATTERN.search(prompt):
+        return {}
+    explicit_tool = LOCAL_TOOL_USE_PATTERN.search(prompt)
+    if explicit_tool:
+        requested_tool = str(explicit_tool.group("tool") or "auto").lower()
+        if requested_tool in {"tool", "tools"}:
+            requested_tool = "auto"
+        target_match = LOCAL_FILE_TARGET_PATTERN.search(prompt)
+        return {
+            "capability": "runtime_action",
+            "preferred_tool": requested_tool,
+            "target": str(target_match.group("target") or "") if target_match else "",
+            "reason": "explicit local tool action",
+        }
+    match = LOCAL_ACTION_REQUEST_PATTERN.search(prompt)
+    if not match:
+        return {}
+    verb = str(match.group("verb") or "").lower()
+    resource_context = prompt[: match.start("verb")] + prompt[match.end("verb") :]
+    has_local_resource = bool(
+        LOCAL_RESOURCE_PATTERN.search(resource_context) or LOCAL_ROOT_RESOURCE_PATTERN.search(resource_context)
+    )
+    if verb in RESOURCE_REQUIRED_ACTIONS and not has_local_resource:
+        return {}
+    target_match = LOCAL_FILE_TARGET_PATTERN.search(resource_context)
+    return {
+        "capability": "runtime_action",
+        "preferred_tool": "auto",
+        "target": str(target_match.group("target") or "") if target_match else "",
+        "reason": "explicit local runtime action",
+    }
+
+
 def execution_scope(
     kind: str,
     signals: dict[str, Any],
@@ -238,6 +360,8 @@ def execution_scope(
     """Convert semantic demand into a capability contract for the executor."""
     if isinstance(action_contract, dict) and action_contract.get("capability"):
         return "agentic"
+    if bool(signals.get("direct_response")):
+        return "direct-answer"
     if isinstance(routing_control, dict) and routing_control.get("active"):
         action_demand = max(
             (float(signals.get(name) or 0) for name in ("code", "agent", "research")),
@@ -247,21 +371,32 @@ def execution_scope(
             return "direct-answer"
     if kind == "quick answer" and float(signals.get("simple") or 0) >= 0.55:
         return "direct-answer"
+    if (
+        kind in {"general", "reasoning", "deep reasoning", "coding", "visual analysis"}
+        and max(
+            float(signals.get("agent") or 0),
+            float(signals.get("research") or 0),
+        )
+        < 0.34
+    ):
+        return "direct-answer"
     return "agentic"
 
 
 def is_direct_answer_route(route: dict[str, Any] | None) -> bool:
     """Return whether the route contract excludes tools and delegation."""
-    if str((route or {}).get("mode") or "") != "orchestrator":
-        return False
     explicit = str((route or {}).get("execution_scope") or "")
     if explicit:
         return explicit == "direct-answer"
+    if str((route or {}).get("mode") or "") != "orchestrator":
+        return False
     signals = (route or {}).get("signals")
+    if not isinstance(signals, dict):
+        return False
     return (
         execution_scope(
             str((route or {}).get("task_kind") or "general"),
-            signals if isinstance(signals, dict) else {},
+            signals,
             (route or {}).get("action_contract") if isinstance((route or {}).get("action_contract"), dict) else None,
             (route or {}).get("routing_control") if isinstance((route or {}).get("routing_control"), dict) else None,
         )
@@ -272,8 +407,9 @@ def is_direct_answer_route(route: dict[str, Any] | None) -> bool:
 def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dict[str, Any]:
     prompt = latest_user_task(messages)
     image_paths = latest_user_images(messages)
-    action_contract = public_web_action_contract(messages)
+    action_contract = runtime_action_contract(messages)
     text = prompt.lower()
+    direct_response = is_direct_response_request(prompt)
     code_hits = signal_hits(
         text,
         (
@@ -293,6 +429,12 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
             "sql",
             "api",
             "test",
+            "tests",
+            "test suite",
+            "pytest",
+            "unittest",
+            "implementation",
+            "source code",
             "refactor",
             "repository",
             "repo",
@@ -311,6 +453,7 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
             "install",
             "implement",
             "edit",
+            "editing",
             "change",
             "fix",
             "build",
@@ -418,8 +561,9 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
     research = min(1.0, 0.22 + 0.18 * (len(research_hits) - 1)) if research_hits else 0.0
     risk = min(1.0, 0.20 + 0.16 * (len(risk_hits) - 1)) if risk_hits else 0.0
     if action_contract:
-        research = max(research, 0.72)
         agent = max(agent, 0.48)
+        if action_contract.get("capability") == "public_web":
+            research = max(research, 0.72)
     vision = 1.0 if image_paths else 0.0
     simple = 0.92 if word_count <= 24 else 0.72 if word_count <= 55 else 0.38 if word_count <= 120 else 0.12
     task_difficulty = max(code, agent, reasoning, research, risk, vision * 0.35)
@@ -452,9 +596,12 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
     if not evidence:
         evidence.append("short conversational request" if simple >= 0.55 else "general language request")
     if action_contract:
-        preferred_tool = str(action_contract.get("preferred_tool") or "web_open")
-        target = str(action_contract.get("target") or "")
-        evidence.append(f"public web action: {preferred_tool}" + (f" {target}" if target else ""))
+        if action_contract.get("capability") == "public_web":
+            preferred_tool = str(action_contract.get("preferred_tool") or "web_open")
+            target = str(action_contract.get("target") or "")
+            evidence.append(f"public web action: {preferred_tool}" + (f" {target}" if target else ""))
+        else:
+            evidence.append("explicit local runtime action")
     if image_paths:
         evidence.insert(0, f"vision input: {len(image_paths)} image{'s' if len(image_paths) != 1 else ''}")
     if cwd is not None and (cwd / ".git").exists() and (code >= 0.35 or agent >= 0.35):
@@ -470,7 +617,10 @@ def analyze_task(messages: list[dict[str, Any]], cwd: Path | None = None) -> dic
         "vision": round(vision, 3),
         "risk": round(risk, 3),
         "simple": round(simple, 3),
+        "direct_response": 1.0 if direct_response else 0.0,
     }
+    if direct_response:
+        evidence.insert(0, "explicit response-only instruction")
     return {
         "prompt": prompt,
         "task_kind": task_kind(signals),
@@ -523,6 +673,7 @@ def referenced_task_analysis(messages: list[dict[str, Any]], cwd: Path) -> dict[
 def semantic_gate(policy: str, analysis: dict[str, Any], score_gap: float, has_context: bool) -> str:
     prompt = str(analysis.get("prompt") or "")
     signals = analysis.get("signals") or {}
+    action_contract = analysis.get("action_contract")
     word_count = len(re.findall(r"\b\w+\b", prompt))
     normalized = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s?.]", " ", prompt.lower().replace("'", ""))).strip()
     domain_strength = max(
@@ -532,6 +683,14 @@ def semantic_gate(policy: str, analysis: dict[str, Any], score_gap: float, has_c
     structural_steps = len(re.findall(r"(?:^|\n)\s*(?:[-*]|\d+[.)])\s+|[;\n]", prompt))
     semantic_mode = policy_for(policy).semantic_mode
     if semantic_mode == "off" or COORDINATOR_FAST_CONVERSATION_PATTERN.fullmatch(normalized):
+        return ""
+    if (
+        isinstance(action_contract, dict)
+        and action_contract.get("capability") == "runtime_action"
+        and action_contract.get("reason") == "explicit local resource query"
+        and not float(signals.get("vision") or 0)
+        and not float(signals.get("risk") or 0)
+    ):
         return ""
     if has_context and depends_on_conversation_context(prompt):
         return "conversation-dependent follow-up"
@@ -569,8 +728,15 @@ def merge_semantic_assessment(
     if not assessment:
         return analysis
     original_analysis = analysis
-    control = assessment.get("routing_control")
-    control = dict(control) if isinstance(control, dict) else {}
+    deterministic_signals = original_analysis.get("signals")
+    deterministic_signals = dict(deterministic_signals) if isinstance(deterministic_signals, dict) else {}
+    existing_control = analysis.get("routing_control")
+    existing_control = dict(existing_control) if isinstance(existing_control, dict) else {}
+    semantic_control = assessment.get("routing_control")
+    semantic_control = dict(semantic_control) if isinstance(semantic_control, dict) else {}
+    # A conservative deterministic parse exists only for explicit compute
+    # directives. Do not let classifier variance erase that user instruction.
+    control = existing_control if existing_control.get("active") else semantic_control
     control_authority_signals: dict[str, Any] = {}
     if control.get("active") and control.get("applies_to_previous") and control.get("resolved_task"):
         resolved = analyze_task([{"role": "user", "content": str(control["resolved_task"])}])
@@ -641,6 +807,15 @@ def merge_semantic_assessment(
         not (isinstance(action_contract, dict) and action_contract.get("capability"))
         and bool(assessment.get("requires_action"))
         and confidence >= 0.60
+        and not bool(signals.get("direct_response"))
+        and not (
+            float(deterministic_signals.get("vision") or 0) > 0
+            and max(
+                float(deterministic_signals.get("agent") or 0),
+                float(deterministic_signals.get("research") or 0),
+            )
+            < 0.18
+        )
     ):
         action_contract = {
             "capability": "runtime_action",
@@ -650,6 +825,10 @@ def merge_semantic_assessment(
         }
         merged["action_contract"] = action_contract
         signals["agent"] = round(max(0.48, float(signals.get("agent") or 0)), 3)
+    if signals.get("direct_response"):
+        # Response-format instructions such as "reply exactly ..." cannot
+        # acquire tool authority from a mistaken semantic assessment.
+        signals["agent"] = round(min(0.18, float(signals.get("agent") or 0)), 3)
     if isinstance(action_contract, dict) and action_contract.get("capability") == "public_web":
         signals["research"] = round(max(0.72, float(signals.get("research") or 0)), 3)
         signals["agent"] = round(max(0.48, float(signals.get("agent") or 0)), 3)

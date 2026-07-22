@@ -7,11 +7,22 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from ..messages import TOOL_RESULT_PREFIXES, latest_user_images, latest_user_task
+from ..messages import latest_user_images, latest_user_task
 from ..text import truncate
 from .analysis import is_direct_answer_route, task_role
 from .calibration import observe_estimate
 from .delegation import delegation_limit
+
+OUTPUT_ONLY_PATTERN = re.compile(
+    r"\b(?:reply|respond|answer|report|return|output|print|state)\s+"
+    r"(?:(?:with|in)\s+)?only\b|"
+    r"\b(?:reply|respond|answer|report|return|output|print|state)\s+(?:with|in)\s+exactly\b|"
+    r"\b(?:reply|respond|answer|report|return|output|print|state)\s+exactly"
+    r"(?:\s+with\b|\s*:|\s+(?:the\s+)?(?:value|values|number|path|line|heading|text|word|words|format)\b)|"
+    r"\b(?:only|exactly)\s+(?:the\s+)?(?:value|values|number|path|line|heading|text|word|words|format)\b|"
+    r"\b(?:in\s+this|using\s+this)\s+format\s+only\b",
+    re.IGNORECASE,
+)
 
 
 def _runtime() -> Any:
@@ -216,24 +227,33 @@ def action_contract_directive(route: dict[str, Any], retry: bool = False) -> str
     contract = route.get("action_contract")
     if not isinstance(contract, dict) or not contract.get("capability"):
         return ""
+    if retry:
+        return "Action correction: the previous response skipped the required tool call. Perform it now."
     capability = str(contract.get("capability") or "")
     tool_steps = max(0, int(route.get("tool_steps") or 0))
-    correction = "The previous answer did not satisfy the requested action. " if retry else ""
     if capability == "runtime_action":
+        target = str(contract.get("target") or "").strip()
+        preferred_tool = str(contract.get("preferred_tool") or "auto").strip()
+        preferred_instruction = (
+            f" Preferred tool: {preferred_tool}." if preferred_tool and preferred_tool != "auto" else ""
+        )
+        target_instruction = (
+            f" Exact target: {target!r}; resolve a relative path from the stated working directory." if target else ""
+        )
         if tool_steps:
             instruction = (
-                "Continue from the returned action evidence. If it fulfills the request, report the concrete result. "
-                "If more work is needed, request exactly one appropriate supplied function tool."
+                "Continue from the action evidence. If complete, report the concrete result; otherwise call one "
+                "supplied function tool."
             )
         else:
-            instruction = "Request exactly one appropriate supplied function tool as the next action."
+            instruction = "Call one supplied function tool now."
         return (
             "Coordinator action requirement: "
-            + correction
             + instruction
-            + " Do not print commands or function calls as prose, claim an action is running when no tool call was "
-            "made, ask the user to wait, or end with a promise to act later. If no supplied tool can safely progress, "
-            "state the limitation or ask one precise question."
+            + preferred_instruction
+            + target_instruction
+            + " Return no prose with a tool call. If no tool can safely progress, state one limitation or ask one "
+            "precise question."
         )
     if capability != "public_web":
         return ""
@@ -241,27 +261,21 @@ def action_contract_directive(route: dict[str, Any], retry: bool = False) -> str
     target = str(contract.get("target") or "")
     if tool_steps:
         instruction = (
-            "Continue from the returned web evidence. Fetch another page only when it is still needed; otherwise "
-            "answer with the concrete result and source URLs."
+            "Continue from the web evidence. Fetch another page only if needed; otherwise answer with the result "
+            "and source URLs."
         )
     elif preferred == "web_search":
-        instruction = (
-            "Request web_search as the next action. After its result, use web_open yourself when page content is "
-            "needed to answer; do not hand that continuation back to the user."
-        )
+        instruction = "Call web_search now; use web_open afterward if page content is needed."
     elif target:
         instruction = (
-            f"Request web_open for {target} as the next action. If the direct fetch fails or independent external "
-            "evidence is needed, continue with web_search."
+            f"Call web_open for {target} now; use web_search if the fetch fails or independent evidence is needed."
         )
     else:
-        instruction = "Request web_search to identify the relevant public page, then continue with web_open."
+        instruction = "Call web_search now, then use web_open for the relevant page."
     return (
         "Coordinator action requirement: "
-        + correction
         + instruction
-        + " Public web tools are available after approval. Do not claim browsing is unavailable, ask the user to "
-        "invoke an internal tool, or answer from memory before collecting the requested evidence."
+        + " Public web tools require approval. Do not answer from memory or claim browsing is unavailable."
     )
 
 
@@ -282,10 +296,24 @@ def routing_control_directive(route: dict[str, Any]) -> str:
     return "Coordinator routing requirement: " + instruction
 
 
+def output_constraint_directive(route: dict[str, Any]) -> str:
+    prompt = re.sub(r"\s+", " ", str(route.get("prompt") or "")).strip()
+    if not prompt or not OUTPUT_ONLY_PATTERN.search(prompt):
+        return ""
+    return (
+        "Final output requirement: Follow the user's literal output shape. Return only the requested value, values, "
+        "separators, or fields; add no labels, Markdown, bullets, preamble, explanation, or correction commentary. "
+        "This restriction applies to the final answer, not to required tool calls."
+    )
+
+
 def executor_directive(route: dict[str, Any], config: dict[str, Any]) -> str:
     if str(route.get("mode") or "direct") != "orchestrator":
-        return ""
+        return "\n\n".join(
+            item for item in (action_contract_directive(route), output_constraint_directive(route)) if item
+        )
     control_directive = routing_control_directive(route)
+    output_directive = output_constraint_directive(route)
     if is_direct_answer_route(route):
         depth = (
             "at the depth the task requests"
@@ -298,25 +326,18 @@ def executor_directive(route: dict[str, Any], config: dict[str, Any]) -> str:
             "and naturally. Tools and specialist delegation are unavailable. Do not mention routing, models, "
             "or this directive."
         )
-        return f"{directive}\n\n{control_directive}" if control_directive else directive
+        additions = [item for item in (control_directive, output_directive) if item]
+        return "\n\n".join([directive, *additions])
     policy = str(route.get("policy") or config.get("orchestrator_policy") or "adaptive")
     used = len(route.get("delegations") or []) if isinstance(route.get("delegations"), list) else 0
     limit = delegation_limit(config, route)
     remaining = max(0, limit - used)
     directive = (
-        "Coordinator directive: You are the primary executor and retain ownership of the user task across tool "
-        "calls. Continue from returned evidence; do not restart or hand off the whole task. "
-        "Preserve requested scope: inspection, explanation, review, and audit remain read-only unless the user "
-        "explicitly asks to fix, edit, or implement. "
-        f"Policy is {policy}; {remaining} of {limit} bounded specialist delegation(s) remain. "
-        "Request consult_specialist only at a decision point where a distinct capability or independent check is "
-        "likely to improve the result. Give it one precise question and only the relevant context. The coordinator "
-        "chooses the model. Declare quality as routine, balanced, high, or critical and risk as low, medium, high, "
-        "or critical from task semantics. Treat specialist output as evidence to verify and integrate, then produce "
-        "the final answer yourself."
+        f"Coordinator turn: policy {policy}; specialist budget {remaining}/{limit}. "
+        "Retain task ownership across tool calls and returned evidence."
     )
     action_directive = action_contract_directive(route)
-    additions = [item for item in (control_directive, action_directive) if item]
+    additions = [item for item in (control_directive, action_directive, output_directive) if item]
     return "\n\n".join([directive, *additions])
 
 
@@ -495,19 +516,21 @@ def review(
     _runtime().require_vision_support(provider, reviewer, messages)
     runtime = _runtime().runtime_config_for_model(config, reviewer)
     task = latest_user_task(messages)
-    recent_results = []
-    for message in messages[-8:]:
-        content = str(message.get("content") or "")
-        if message.get("role") == "user" and content.startswith(TOOL_RESULT_PREFIXES):
-            recent_results.append(truncate(content, 2200))
+    recent_results = _runtime()._recent_action_evidence(messages, limit=7000)
+    completion = route.get("action_completion")
+    completion_text = repr(completion) if isinstance(completion, dict) else "(not assessed)"
     prompt = (
         f"Original task:\n{task}\n\n"
         f"Candidate answer:\n{truncate(answer, 18000)}\n\n"
-        f"Recent tool evidence:\n{truncate(chr(10).join(recent_results), 5000) or '(none)'}\n\n"
+        f"Recent tool evidence:\n{recent_results or '(none)'}\n\n"
+        f"Runtime completion assessment:\n{truncate(completion_text, 1200)}\n\n"
         "Check correctness, completeness, unsupported claims, task compliance, and whether reported actions are "
-        "actually supported by tool evidence. Reply exactly with VERDICT: PASS when no material correction is "
-        "needed. Otherwise reply with VERDICT: REVISE followed by FEEDBACK: and concise, actionable corrections, "
-        "each grounded in the task or the tool evidence shown above. Do not request stylistic rewrites."
+        "actually supported by tool evidence. Tool evidence is runtime validation; a concise candidate does not "
+        "need to reproduce commands, diffs, or test output unless the user requested those details. Treat a "
+        "high-confidence complete runtime assessment as supporting context unless the supplied evidence directly "
+        "contradicts it. Reply exactly with VERDICT: PASS when no material correction is needed. Otherwise reply "
+        "with VERDICT: REVISE followed by FEEDBACK: and concise, actionable corrections, each grounded in the task "
+        "or the tool evidence shown above. Do not request stylistic rewrites."
     )
     review_messages = [
         {"role": "system", "content": "You are the independent quality gate in a multi-model coordinator."},
