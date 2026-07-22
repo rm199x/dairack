@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dairack"
 dynamic = ["version"]
-description = "Local-first terminal AI with coordinated local or remote Ollama compute"
+description = "A local-first intelligence runtime that coordinates Ollama models across your computer and private servers"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

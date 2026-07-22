@@ -12,20 +12,26 @@
   <a href="#quick-start">Quick Start</a> &nbsp;&middot;&nbsp;
   <a href="#remote-compute">Remote Compute</a> &nbsp;&middot;&nbsp;
   <a href="#coordinator">Coordinator</a> &nbsp;&middot;&nbsp;
+  <a href="#context-and-continuity">Context</a> &nbsp;&middot;&nbsp;
   <a href="#permissions">Permissions</a>
 </p>
 
-Dairack is a local-first terminal agent for Ollama. The interface and agent runtime stay on the client; inference can
-run locally or through a trusted Dairack server.
+Dairack is a local-first intelligence runtime with a first-class terminal client. It coordinates Ollama models across
+your computer and private servers while files, shell access, approvals, chats, project indexes, and checkpoints remain
+on the client.
+
+Coordinator turns available models into one adaptive system. It selects execution paths by capability, context,
+latency, hardware fit, and model residency, then adds tools, vision, planning, or review when they materially improve
+the task.
+
+- Run inference locally or through a private authenticated Dairack compute server.
+- Keep client files, commands, Git state, approvals, memory, and recovery under local control.
+- Coordinate general, coding, reasoning, research, and vision models without manual switching.
+- Use files, web research, images, project context, patches, tests, and persistent chats in one workflow.
 
 <p align="center">
   <img src="docs/assets/dairack-terminal.png" alt="Dairack terminal interface in a new local intelligence session" width="100%">
 </p>
-
-- Keep files, chats, approvals, project indexes, and checkpoints on your machine.
-- Review shell commands, file access, network requests, and patches before they run.
-- Resume chats and bring project, web, and image context into one workflow.
-- Use one model directly or let Coordinator choose among installed models.
 
 > **Status:** Alpha. Dairack is functional and locally verified on Linux. CI covers Linux, Windows, and macOS. Public
 > configuration and extension APIs may change before 1.0.
@@ -81,8 +87,9 @@ Setup supports NVIDIA, Apple Silicon/Metal, ROCm, Windows hardware probes, and C
 
 ## Remote Compute
 
-The same Dairack package runs on the client and the model server. On Linux, install the authenticated bridge as a
-restartable user service on the machine with Ollama:
+The same Dairack package runs on the client and the model server. The server supplies model inference; the client
+retains authority over its own environment. On Linux, install the authenticated bridge as a restartable user service
+on the machine with Ollama:
 
 **On the model server**
 
@@ -147,12 +154,26 @@ progress, cancellation, profile inspection, and confirmed removal. See
   <img src="docs/assets/model-selector.png" alt="Dairack operating mode and model selector" width="670">
 </p>
 
-One model is enough. With several installed, Coordinator can choose a suitable model for conversation, code, reasoning,
-research, or images and fall back when a preferred model is unavailable. Its active model and any planning or review
-stage remain visible while work is running. Use `/coordinator` to inspect or change the policy.
+One model is enough. With several installed, Coordinator selects an execution path rather than merely a model: direct
+response, specialist execution, vision analysis, planning, tool use, independent review, or revision. Decisions account
+for task fit, model capability, context limits, latency, hardware fit, and model-loading cost. The active model and any
+planning or review stage remain visible while work is running. Use `/coordinator` to inspect or change the policy.
 
 Requests such as "use a deeper model" or "keep this lightweight" apply only to that turn. They do not silently change
 your saved configuration.
+
+## Context and Continuity
+
+Dairack treats context as a managed resource. It keeps the active task, current evidence, file windows, tool state, and
+next executable step available while compacting older covered material before the model's request window becomes
+unsafe.
+
+Context handling follows the active model's generated or overridden runtime profile. Dairack reserves answer and
+protocol headroom, compacts covered history into grounded memory, and retains a small evidence ledger when an active
+tool workflow outgrows its raw transcript. Large files are read through bounded, continuable line windows; each
+completed result is fitted again before the model continues, so smaller contexts retain the active task and a precise
+next range instead of stalling after compaction. `/context` shows the current macro memory, live working set, tool
+interface, reserves, and estimated next request.
 
 ## Terminal Workflow
 
@@ -164,13 +185,6 @@ your saved configuration.
 - <kbd>Esc</kbd> closes dialogs. <kbd>Esc</kbd> or <kbd>Ctrl</kbd>+<kbd>C</kbd> interrupts work when the active operation
   supports cancellation. Prompts typed while a response is running queue and send when it completes; an approval holds
   that queue until the action is allowed or denied.
-
-Context handling follows the active model's generated or overridden runtime profile. Dairack reserves answer and
-protocol headroom, compacts covered history into grounded memory before the request becomes unsafe, and retains a
-small evidence ledger when an active tool workflow outgrows its raw transcript. Large files are read through bounded,
-continuable line windows; each completed result is fitted again before the model continues, so smaller contexts retain
-the active task and a precise next range instead of stalling after compaction. `/context` shows the current macro
-memory, live working set, tool interface, reserves, and estimated next request.
 
 The interface adapts to compact terminals and uses short event-driven transitions, with no animation timer retained
 while idle. Set `DAIRACK_REDUCED_MOTION=1` when all non-essential movement should remain disabled.
