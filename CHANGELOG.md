@@ -83,6 +83,9 @@ semantic versioning after 1.0.
 - `@`-path completion in the composer: a trailing `@fragment` ghost-suggests matching project file paths, preferring
   path prefixes, then basename prefixes, from a briefly cached bounded scan.
 - Searchable model-library sections with concise installed-model rows and progressively disclosed profile details.
+- Bounded malformed-tool recovery: a rejected native tool stream retries through the compatibility protocol on the
+  same executor before Coordinator considers one pre-ranked alternate. Advisory planning failures now degrade to
+  direct execution, while exhausted backend syntax diagnostics stay in `/route` instead of leaking into transcripts.
 - Route-scoped whole-file coverage and evidence ledgers that survive compaction, resume at the exact unread line, and
   preserve requested headings or identifiers for the final response.
 - Plain-language file audits and reviews now establish whole-file coverage unless the user names a narrower scope.

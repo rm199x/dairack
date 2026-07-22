@@ -5165,6 +5165,7 @@ class DairackTextualBase(App[None]):
                 )
                 execution_started = time.monotonic()
                 stream_retry_used = False
+                protocol_retry_used = False
                 response_allowance = self.core.executor_response_allowance(request_messages, native_tools, runtime)
                 if audit_phase == "checkpoint":
                     response_allowance = min(
@@ -5203,6 +5204,32 @@ class DairackTextualBase(App[None]):
                                 self.invalidate()
                         break
                     except Exception as exc:
+                        if native_tools and not protocol_retry_used and self.core.recoverable_model_protocol_error(exc):
+                            protocol_retry_used = True
+                            self.core.record_protocol_recovery(route, executor, exc)
+                            request_messages, native_tools = self.core.fit_agent_request_context_messages(
+                                request_messages,
+                                runtime,
+                                [],
+                                finalizing=request_finalizing,
+                                allow_compatibility_tools=bool(self.config.get("agent"))
+                                and not self.core.is_direct_answer_route(route)
+                                and not audit_phase,
+                            )
+                            response_allowance = self.core.executor_response_allowance(
+                                request_messages,
+                                native_tools,
+                                runtime,
+                            )
+                            assistant_text = ""
+                            native_calls.clear()
+                            thinking_parts.clear()
+                            first_chunk = True
+                            self.replace_last_assistant_text("")
+                            self.set_busy(True, f"recovering protocol / {executor}")
+                            self.chat["last_route"] = route
+                            self.save_current_chat()
+                            continue
                         if stream_retry_used or self.cancel_event.is_set() or not self.core.transient_stream_error(exc):
                             generation_error = exc
                             break

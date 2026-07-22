@@ -3586,6 +3586,7 @@ class LoopResilienceTests(unittest.TestCase):
         self.assertTrue(CORE.transient_stream_error(CORE.OllamaError("could not reach Ollama at host: refused")))
         self.assertTrue(CORE.transient_stream_error(CORE.OllamaError("Ollama returned HTTP 502: Bad Gateway")))
         self.assertTrue(CORE.transient_stream_error(TimeoutError()))
+        self.assertFalse(CORE.transient_stream_error(CORE.OllamaError("XML syntax error in native tool output")))
         self.assertFalse(CORE.transient_stream_error(CORE.OllamaError("Ollama returned HTTP 404: no such model")))
         self.assertFalse(CORE.transient_stream_error(ValueError("unrelated")))
 
@@ -3649,6 +3650,100 @@ class LoopResilienceTests(unittest.TestCase):
                 for message in messages
             )
         )
+
+    def test_plain_agent_retries_malformed_native_tools_through_compatibility(self) -> None:
+        class CompatibilityRecoveryProvider(FakeProvider):
+            def chat(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> str:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                if kwargs.get("tools"):
+                    raise CORE.OllamaError(
+                        'Ollama returned HTTP 500: {"error":"XML syntax error: '
+                        'element <parameter> closed by </function>"}'
+                    )
+                return "Compatibility recovery completed the response."
+
+        route = {
+            "mode": "orchestrator",
+            "policy": "adaptive",
+            "task_kind": "reasoning",
+            "executor": "qwen3.5:9b",
+            "planner": "",
+            "reviewer": "",
+            "strategy": "single",
+            "execution_scope": "agentic",
+            "action_contract": {},
+            "candidates": [{"model": "qwen3.5:9b", "score": 0.9}],
+            "signals": {},
+            "evidence": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = coordinator_config(semantic=False)
+            config.update({"agent": True, "auto_compact": False})
+            messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "Check it more deeply"}]
+            chat: dict[str, Any] = {"summary": "", "project_root": "", "last_route": route}
+            provider = CompatibilityRecoveryProvider(response="")
+            output = io.StringIO()
+
+            with (
+                redirect_stdout(output),
+                patch.object(
+                    CORE,
+                    "select_orchestrator_route",
+                    return_value=route,
+                ),
+            ):
+                CORE.chat_turn(provider, "qwen3.5:9b", messages, config, root, chat)
+
+        self.assertEqual(len(provider.calls), 2)
+        self.assertTrue(provider.calls[0]["kwargs"].get("tools"))
+        self.assertFalse(provider.calls[1]["kwargs"].get("tools"))
+        self.assertIn("Compatibility recovery completed", output.getvalue())
+        self.assertNotIn("XML syntax error", output.getvalue())
+        self.assertEqual(len(route.get("protocol_recoveries") or []), 1)
+
+    def test_plain_agent_skips_a_failed_advisory_plan(self) -> None:
+        class AnsweringProvider(FakeProvider):
+            def chat(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> str:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                return "Planning was skipped; the executor still answered."
+
+        route = {
+            "mode": "orchestrator",
+            "policy": "adaptive",
+            "task_kind": "reasoning",
+            "executor": "qwen3.5:9b",
+            "planner": "qwen3.5:9b",
+            "reviewer": "",
+            "strategy": "planned",
+            "execution_scope": "conversation",
+            "action_contract": {},
+            "candidates": [{"model": "qwen3.5:9b", "score": 0.9}],
+            "signals": {},
+            "evidence": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = coordinator_config(semantic=False)
+            config.update({"agent": True, "auto_compact": False})
+            messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "Check it more deeply"}]
+            chat: dict[str, Any] = {"summary": "", "project_root": "", "last_route": route}
+            provider = AnsweringProvider(response="")
+            output = io.StringIO()
+            plan_error = CORE.OllamaError("Ollama returned HTTP 500: XML syntax error in planning output")
+
+            with (
+                redirect_stdout(output),
+                patch.object(CORE, "select_orchestrator_route", return_value=route),
+                patch.object(CORE, "orchestrator_plan", side_effect=plan_error),
+            ):
+                CORE.chat_turn(provider, "qwen3.5:9b", messages, config, root, chat)
+
+        self.assertIn("Planning was skipped", output.getvalue())
+        self.assertNotIn("XML syntax error", output.getvalue())
+        self.assertIn("XML syntax error", str(route.get("plan_error") or ""))
 
     def test_plain_agent_review_revises_once_then_delivers(self) -> None:
         class ReviewingProvider(FakeProvider):
@@ -4631,6 +4726,134 @@ class TextualInteractionTests(unittest.IsolatedAsyncioTestCase):
                     transcript = app.render_transcript_text()
                     self.assertIn("Recovered after malformed tool output", transcript)
                     self.assertNotIn("XML syntax error", transcript)
+
+    async def test_malformed_native_tools_retry_compatibility_on_the_same_executor(self) -> None:
+        class CompatibilityRecoveryProvider(FakeProvider):
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                if kwargs.get("tools"):
+                    raise CORE.OllamaError(
+                        'Ollama returned HTTP 500: {"error":"XML syntax error on line 20: '
+                        'element <parameter> closed by </function>"}'
+                    )
+                yield "Recovered through the compatibility protocol."
+
+        route = {
+            "mode": "orchestrator",
+            "policy": "adaptive",
+            "task_kind": "reasoning",
+            "executor": "qwen3.5:9b",
+            "planner": "",
+            "reviewer": "",
+            "strategy": "single",
+            "execution_scope": "agentic",
+            "action_contract": {},
+            "candidates": [{"model": "qwen3.5:9b", "score": 0.9}],
+            "signals": {},
+            "evidence": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"agent": True, "auto_compact": False})
+            provider = CompatibilityRecoveryProvider(response="")
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            with patch.object(CORE, "select_orchestrator_route", return_value=deepcopy(route)):
+                async with app.run_test(size=(80, 26)) as pilot:
+                    app.query_one("#composer", ui.Composer).load_text("Check the earlier analysis more deeply")
+                    await pilot.press("enter")
+                    for _ in range(160):
+                        await pilot.pause(0.025)
+                        if not app.busy and len(provider.calls) == 2:
+                            break
+
+                    self.assertFalse(app.busy)
+                    self.assertEqual([call["model"] for call in provider.calls], ["qwen3.5:9b", "qwen3.5:9b"])
+                    self.assertTrue(provider.calls[0]["kwargs"].get("tools"))
+                    self.assertFalse(provider.calls[1]["kwargs"].get("tools"))
+                    retry_system = str(provider.calls[1]["messages"][0].get("content") or "")
+                    self.assertIn(CORE.COMPATIBILITY_TOOL_DIRECTIVE, retry_system)
+                    self.assertNotIn(CORE.NATIVE_TOOL_DIRECTIVE, retry_system)
+                    transcript = app.render_transcript_text()
+                    self.assertIn("Recovered through the compatibility protocol", transcript)
+                    self.assertNotIn("XML syntax error", transcript)
+                    recoveries = app.chat["last_route"].get("protocol_recoveries") or []
+                    self.assertEqual(len(recoveries), 1)
+                    self.assertEqual(recoveries[0]["model"], "qwen3.5:9b")
+
+    async def test_exhausted_protocol_recovery_keeps_raw_xml_out_of_transcript(self) -> None:
+        class ExhaustedProtocolProvider(FakeProvider):
+            def chat_stream(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+                self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+                self.last_stats = {"done_reason": "stop"}
+                raise CORE.OllamaError(
+                    'Ollama returned HTTP 500: {"error":"XML syntax error on line 20: '
+                    'element <parameter> closed by </function>"}'
+                )
+                yield  # pragma: no cover
+
+        route = {
+            "mode": "orchestrator",
+            "policy": "adaptive",
+            "task_kind": "reasoning",
+            "executor": "qwen3.5:9b",
+            "planner": "",
+            "reviewer": "",
+            "strategy": "single",
+            "execution_scope": "agentic",
+            "action_contract": {},
+            "candidates": [
+                {"model": "qwen3.5:9b", "score": 0.9},
+                {"model": "qwen3.6:27b", "score": 0.8},
+            ],
+            "signals": {},
+            "evidence": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            CORE.CONFIG_PATH = root / "config.json"
+            CORE.HISTORY_PATH = root / "history"
+            CORE.CHAT_DIR = root / "chats"
+            CORE.INDEX_DB_PATH = root / "index.sqlite3"
+            CORE.CHECKPOINT_DIR = root / "checkpoints"
+            CORE.APP_DATA_DIR = root
+            config = coordinator_config(semantic=False)
+            config.update({"agent": True, "auto_compact": False})
+            provider = ExhaustedProtocolProvider(response="")
+            app = ui.build_textual_app(CORE, CORE.DairackTui, provider, "test", config, root)
+
+            with patch.object(CORE, "select_orchestrator_route", return_value=deepcopy(route)):
+                async with app.run_test(size=(80, 26)) as pilot:
+                    app.query_one("#composer", ui.Composer).load_text("Check the earlier analysis more deeply")
+                    await pilot.press("enter")
+                    for _ in range(240):
+                        await pilot.pause(0.025)
+                        if not app.busy and len(provider.calls) == 4:
+                            break
+
+                    self.assertFalse(app.busy)
+                    self.assertEqual(
+                        [call["model"] for call in provider.calls],
+                        ["qwen3.5:9b", "qwen3.5:9b", "qwen3.6:27b", "qwen3.6:27b"],
+                    )
+                    self.assertEqual(
+                        [bool(call["kwargs"].get("tools")) for call in provider.calls],
+                        [True, False, True, False],
+                    )
+                    transcript = app.render_transcript_text()
+                    self.assertIn("exhausted bounded protocol and executor recovery", transcript)
+                    self.assertNotIn("XML syntax error", transcript)
+                    last_route = app.chat["last_route"]
+                    self.assertEqual(len(last_route.get("protocol_recoveries") or []), 2)
+                    self.assertIn("XML syntax error", str(last_route.get("runtime_error") or ""))
 
     async def test_thinking_stream_is_shown_dim_when_think_is_enabled(self) -> None:
         class ThinkingProvider(FakeProvider):

@@ -110,7 +110,10 @@ call-style near-misses and unescaped Windows path backslashes), malformed reques
 plain explanation, and a validated text-form call may recover a turn only when a native or compatibility tool surface
 was actually offered. An identical read repeated with no intervening state change is refused with its prior result,
 persistent repetition forces final synthesis, bounded tool output keeps its beginning and end, a dropped model
-connection retries once silently, and an over-budget request omits project retrieval before failing. A blank or
+connection retries once silently, and an over-budget request omits project retrieval before failing. A malformed
+native tool stream switches the same executor to the validated compatibility protocol before Coordinator may try one
+pre-ranked alternate; advisory planning failures are recorded and skipped because a plan is not an execution
+prerequisite. Raw backend syntax remains in route diagnostics rather than the user transcript. A blank or
 structurally incomplete continuation retries once on the same executor; Coordinator may then move once to the next
 pre-ranked eligible executor, while direct mode never switches implicitly. The decision
 ladder that chooses each agent turn's next action lives in one frontend-agnostic core (`turn.py`) used by each

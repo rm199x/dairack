@@ -2413,6 +2413,25 @@ def strip_toolless_system(message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _without_request_protocol_directives(message: dict[str, Any]) -> dict[str, Any]:
+    """Remove request-scoped protocol instructions before selecting a new protocol."""
+    if str(message.get("role") or "") != "system":
+        return dict(message)
+    directives = (NATIVE_TOOL_DIRECTIVE, COMPATIBILITY_TOOL_DIRECTIVE, TOOLLESS_REQUEST_DIRECTIVE)
+    cleaned = dict(message)
+    parts = message.get(SYSTEM_PARTS_KEY)
+    if isinstance(parts, list):
+        cleaned_parts = [str(part) for part in parts if str(part).strip() not in directives]
+        cleaned[SYSTEM_PARTS_KEY] = cleaned_parts
+        cleaned["content"] = "\n\n".join(part for part in cleaned_parts if part.strip())
+        return cleaned
+    content = str(message.get("content") or "")
+    for directive in directives:
+        content = content.replace(directive, "")
+    cleaned["content"] = re.sub(r"\n{3,}", "\n\n", content).strip()
+    return cleaned
+
+
 def compatibility_tool_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Convert native tool history into the text protocol before schemas are shed.
 
@@ -2421,7 +2440,8 @@ def compatibility_tool_history_messages(messages: list[dict[str, Any]]) -> list[
     messages, preserving evidence without violating the provider protocol.
     """
     compatible: list[dict[str, Any]] = []
-    for message in canonicalize_messages(messages):
+    for raw_message in canonicalize_messages(messages):
+        message = _without_request_protocol_directives(raw_message)
         role = str(message.get("role") or "")
         if role == "assistant" and message.get("tool_calls"):
             content = str(message.get("content") or "").strip()
@@ -3991,7 +4011,6 @@ def transient_stream_error(exc: BaseException) -> bool:
                 "http 502",
                 "http 503",
                 "http 504",
-                "xml syntax error",
             )
         )
     return isinstance(exc, (TimeoutError, ConnectionError))
@@ -4010,6 +4029,47 @@ def recoverable_model_protocol_error(exc: BaseException) -> bool:
             and any(marker in text for marker in ("parse", "malformed", "unexpected eof"))
         )
     )
+
+
+def record_protocol_recovery(route: dict[str, Any] | None, model: str, error: Exception | str) -> None:
+    """Record one native-to-compatibility fallback without exposing backend syntax."""
+    if not isinstance(route, dict):
+        return
+    recoveries = route.setdefault("protocol_recoveries", [])
+    if not isinstance(recoveries, list):
+        recoveries = []
+        route["protocol_recoveries"] = recoveries
+    recoveries.append(
+        {
+            "model": model,
+            "from": "native tools",
+            "to": "compatibility tools",
+            "reason": truncate(re.sub(r"\s+", " ", str(error)).strip(), 180),
+            "at": now_iso(),
+        }
+    )
+    del recoveries[:-4]
+
+
+def runtime_failure_display(error: Exception | str) -> str:
+    """Return a concise user-facing failure while retaining raw detail in route state."""
+    if recoverable_model_protocol_error(error if isinstance(error, BaseException) else OllamaError(str(error))):
+        return (
+            "The model returned malformed action data. Dairack exhausted bounded protocol and executor recovery; "
+            "no unverified action was run. Retry the turn or inspect /route for diagnostics."
+        )
+    raw = re.sub(r"\s+", " ", str(error)).strip()
+    overflow = re.search(
+        r"request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)",
+        raw,
+        re.IGNORECASE,
+    )
+    if overflow:
+        return (
+            f"The request exceeded the active model context ({overflow.group(1)}/{overflow.group(2)} tokens). "
+            "Dairack could not recover this turn; use /compact or retry with a larger-context model."
+        )
+    return truncate(raw, 1200) or "The model request failed."
 
 
 def strip_tool_markup(text: str) -> str:
@@ -7474,7 +7534,15 @@ class DairackTui:
         self.append_system(text, "error")
 
     def record_runtime_failure(self, error: Exception | str, phase: str = "model response") -> None:
-        self.append_error(str(error))
+        route = self._active_route
+        if isinstance(route, dict):
+            route["runtime_error"] = {
+                "phase": phase,
+                "detail": truncate(re.sub(r"\s+", " ", str(error)).strip(), 1200),
+                "at": now_iso(),
+            }
+            self.chat["last_route"] = route
+        self.append_error(runtime_failure_display(error))
         self.messages.append(runtime_failure_message(error, phase))
         self.save_current_chat()
 
@@ -7726,14 +7794,21 @@ class DairackTui:
                 self.chat["last_route"] = self._active_route
                 if self._active_route.get("planner"):
                     self.set_busy(True, f"planning / {self._active_route['planner']}")
-                    self._route_plan = orchestrator_plan(
-                        self.provider,
-                        self._active_route,
-                        self.messages,
-                        project_root,
-                        self.config,
-                        self.cancel_event,
-                    )
+                    try:
+                        self._route_plan = orchestrator_plan(
+                            self.provider,
+                            self._active_route,
+                            self.messages,
+                            project_root,
+                            self.config,
+                            self.cancel_event,
+                        )
+                    except Exception as exc:
+                        self._active_route["plan_error"] = truncate(
+                            re.sub(r"\s+", " ", str(exc)).strip(),
+                            1200,
+                        )
+                        self._route_plan = ""
                 self.save_current_chat()
             route = self._active_route
             runtime = self._route_config
@@ -7857,6 +7932,7 @@ class DairackTui:
                         response_allowance, max(256, min(512, int(runtime.get("num_ctx") or 4096) // 12))
                     )
                 generation_error: Exception | None = None
+                protocol_retry_used = False
                 while True:
                     try:
                         for chunk in self.provider.chat_stream(
@@ -7880,6 +7956,31 @@ class DairackTui:
                             self.append_assistant_chunk(chunk)
                         break
                     except Exception as exc:
+                        if native_tools and not protocol_retry_used and recoverable_model_protocol_error(exc):
+                            protocol_retry_used = True
+                            record_protocol_recovery(route, executor, exc)
+                            request_messages, native_tools = fit_agent_request_context_messages(
+                                request_messages,
+                                runtime,
+                                [],
+                                finalizing=request_finalizing,
+                                allow_compatibility_tools=bool(self.config.get("agent"))
+                                and not is_direct_answer_route(route)
+                                and not audit_phase,
+                            )
+                            response_allowance = executor_response_allowance(
+                                request_messages,
+                                native_tools,
+                                runtime,
+                            )
+                            assistant_text = ""
+                            native_calls.clear()
+                            first_chunk = True
+                            self.replace_last_assistant_text("")
+                            self.set_busy(True, f"recovering protocol / {executor}")
+                            self.chat["last_route"] = route
+                            self.save_current_chat()
+                            continue
                         if stream_retry_used or self.cancel_event.is_set() or not transient_stream_error(exc):
                             generation_error = exc
                             break
@@ -9759,7 +9860,10 @@ def chat_turn(
         print(f"[auto compact skipped] {exc}")
     plan = ""
     if route.get("planner"):
-        plan = orchestrator_plan(provider, route, messages, project_root, config)
+        try:
+            plan = orchestrator_plan(provider, route, messages, project_root, config)
+        except Exception as exc:
+            route["plan_error"] = truncate(re.sub(r"\s+", " ", str(exc)).strip(), 1200)
     native_tools = native_tools_for(provider, executor, bool(config.get("agent")), route)
     action_feedback = ""
 
@@ -9867,6 +9971,7 @@ def chat_turn(
                 max(256, min(512, int(runtime.get("num_ctx") or 4096) // 12)),
             )
         generation_error: Exception | None = None
+        protocol_retry_used = False
         while True:
             try:
                 response = provider.chat(
@@ -9883,6 +9988,21 @@ def chat_turn(
                 )
                 break
             except Exception as exc:
+                if request_tools and not protocol_retry_used and recoverable_model_protocol_error(exc):
+                    protocol_retry_used = True
+                    record_protocol_recovery(route, executor, exc)
+                    request_messages, request_tools = fit_agent_request_context_messages(
+                        request_messages,
+                        runtime,
+                        [],
+                        finalizing=is_final or audit_phase == "synthesize",
+                        allow_compatibility_tools=bool(config.get("agent"))
+                        and not is_direct_answer_route(route)
+                        and not audit_phase,
+                    )
+                    response_allowance = executor_response_allowance(request_messages, request_tools, runtime)
+                    native_calls.clear()
+                    continue
                 if request_retry_used or not transient_stream_error(exc):
                     generation_error = exc
                     break
@@ -10394,7 +10514,7 @@ def one_shot(args: argparse.Namespace, config: dict[str, Any], prompt: str) -> i
             eprint("Interrupted.")
             return 130
         except Exception as exc:
-            eprint(f"error: {exc}")
+            eprint(f"error: {runtime_failure_display(exc)}")
             return 1
         return 0
 
@@ -10410,7 +10530,11 @@ def one_shot(args: argparse.Namespace, config: dict[str, Any], prompt: str) -> i
     runtime = runtime_config_for_model(config, model)
     request_messages = messages
     if route.get("planner"):
-        plan = orchestrator_plan(provider, route, messages, cwd, config)
+        try:
+            plan = orchestrator_plan(provider, route, messages, cwd, config)
+        except Exception as exc:
+            route["plan_error"] = truncate(re.sub(r"\s+", " ", str(exc)).strip(), 1200)
+            plan = ""
         if plan:
             request_messages = canonicalize_messages(
                 messages,
@@ -10433,7 +10557,7 @@ def one_shot(args: argparse.Namespace, config: dict[str, Any], prompt: str) -> i
         eprint("Interrupted.")
         return 130
     except Exception as exc:
-        eprint(f"error: {exc}")
+        eprint(f"error: {runtime_failure_display(exc)}")
         return 1
     return 0
 
